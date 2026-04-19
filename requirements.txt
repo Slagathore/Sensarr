@@ -1,0 +1,32 @@
+# Core dependencies for PlexResetButton
+# Install with: pip install -r requirements.txt
+#
+# NOTE: opencv — install ONLY ONE of the three variants below.
+#   opencv-contrib-python and opencv-python-headless conflict with the
+#   standard opencv-python .pyd on Windows. The default below is correct
+#   for a desktop machine with a display.
+
+# Telegram bot framework
+python-telegram-bot==22.5
+
+# Screen automation (soft-reset tray icon click, asset matching)
+pyautogui==0.9.54
+
+# Image processing — required by pyautogui, pystray, and opencv
+Pillow==10.1.0
+
+# Process inspection and management (hard reset, Plex process detection)
+psutil==7.0.0
+
+# .env file loading
+python-dotenv==1.1.1
+
+# Windows system-tray icon
+pystray==0.19.5
+
+# Image matching confidence (locateOnScreen backend)
+# Pin the minor version; patch releases on opencv are safe to update.
+opencv-python==4.13.0.92
+
+# Required by opencv-python; keep in sync with the opencv build
+numpy>=1.26.0,<3.0.0

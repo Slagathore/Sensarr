@@ -1,0 +1,48 @@
+# -----------------------------------------------------------------------
+# Secrets & credentials — never commit these
+# -----------------------------------------------------------------------
+.env
+
+# -----------------------------------------------------------------------
+# Personal data / runtime state
+# -----------------------------------------------------------------------
+# SQLite databases contain user request history and library index
+*.db
+# PyAutoGUI debug screenshots may capture personal screen content
+debug_screenshot.png
+debug_tray_corner.png
+# Log files may contain token fragments or personal file paths
+*.log
+pyinstaller_check.log
+
+# -----------------------------------------------------------------------
+# AI assistant context (may contain personal info / conversation history)
+# -----------------------------------------------------------------------
+.claude/
+
+# -----------------------------------------------------------------------
+# Python artefacts
+# -----------------------------------------------------------------------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+*.egg-info/
+.eggs/
+
+# -----------------------------------------------------------------------
+# Build outputs
+# -----------------------------------------------------------------------
+build/
+dist/
+
+# -----------------------------------------------------------------------
+# Editor / OS noise
+# -----------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+Thumbs.db
+.DS_Store

@@ -1,0 +1,423 @@
+import os
+import sqlite3
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+import config
+
+_DB_LOCK = threading.Lock()
+
+
+@dataclass(frozen=True)
+class LibraryEntry:
+    name: str
+    path: str
+    root_path: str
+    size_bytes: int
+    modified_at: float
+
+
+@dataclass(frozen=True)
+class LibraryIndexSummary:
+    indexed_files: int
+    configured_paths: list[str]
+    missing_paths: list[str]
+
+
+@dataclass(frozen=True)
+class ReindexResult:
+    indexed_files: int
+    scanned_roots: list[str]
+    missing_roots: list[str]
+
+
+@dataclass(frozen=True)
+class RootLibraryMetrics:
+    root_path: str
+    file_count: int
+    total_size_bytes: int
+    recent_7d: int
+    recent_30d: int
+
+
+@dataclass(frozen=True)
+class LibraryMetrics:
+    total_files: int
+    total_size_bytes: int
+    recent_7d: int
+    recent_30d: int
+    roots: list[RootLibraryMetrics]
+    missing_paths: list[str]
+
+
+def _db_path() -> Path:
+    path = Path(config.APP_DB_PATH)
+    if path.is_absolute():
+        return path
+    return config.APP_DIR / path
+
+
+def _configured_library_paths() -> tuple[list[Path], list[str]]:
+    valid: list[Path] = []
+    missing: list[str] = []
+
+    for raw_path in config.PLEX_LIBRARY_PATHS:
+        path = Path(raw_path).expanduser()
+        if path.is_dir():
+            valid.append(path)
+        else:
+            missing.append(str(path))
+
+    return valid, missing
+
+
+def initialize_library_index_db() -> None:
+    db_path = _db_path()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with _DB_LOCK, sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS library_files (
+                path TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                root_path TEXT NOT NULL,
+                search_name TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                modified_at REAL NOT NULL,
+                indexed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_library_files_search_name
+            ON library_files (search_name)
+            """
+        )
+        conn.commit()
+
+
+def rebuild_library_index() -> ReindexResult:
+    initialize_library_index_db()
+    valid_paths, missing_paths = _configured_library_paths()
+    extensions = set(config.LIBRARY_INDEX_EXTENSIONS)
+
+    with _DB_LOCK, sqlite3.connect(_db_path()) as conn:
+        conn.execute("DELETE FROM library_files")
+
+        batch: list[tuple[str, str, str, str, int, float]] = []
+        indexed_count = 0
+
+        for root_path in valid_paths:
+            for current_root, _dirs, files in os.walk(root_path):
+                for name in files:
+                    suffix = Path(name).suffix.lower()
+                    if extensions and suffix not in extensions:
+                        continue
+
+                    file_path = Path(current_root) / name
+                    try:
+                        stat = file_path.stat()
+                    except OSError:
+                        continue
+
+                    batch.append(
+                        (
+                            str(file_path),
+                            name,
+                            str(root_path),
+                            name.casefold(),
+                            int(stat.st_size),
+                            float(stat.st_mtime),
+                        )
+                    )
+                    indexed_count += 1
+
+                    if len(batch) >= 500:
+                        conn.executemany(
+                            """
+                            INSERT OR REPLACE INTO library_files
+                            (path, name, root_path, search_name, size_bytes, modified_at)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                            """,
+                            batch,
+                        )
+                        batch.clear()
+
+        if batch:
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO library_files
+                (path, name, root_path, search_name, size_bytes, modified_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                batch,
+            )
+
+        conn.commit()
+
+    return ReindexResult(
+        indexed_files=indexed_count,
+        scanned_roots=[str(path) for path in valid_paths],
+        missing_roots=missing_paths,
+    )
+
+
+def indexed_file_count() -> int:
+    initialize_library_index_db()
+    with _DB_LOCK, sqlite3.connect(_db_path()) as conn:
+        row = conn.execute("SELECT COUNT(*) FROM library_files").fetchone()
+    return int(row[0]) if row is not None else 0
+
+
+def library_index_summary() -> LibraryIndexSummary:
+    valid_paths, missing_paths = _configured_library_paths()
+    return LibraryIndexSummary(
+        indexed_files=indexed_file_count(),
+        configured_paths=[str(path) for path in valid_paths],
+        missing_paths=missing_paths,
+    )
+
+
+def format_library_summary_message() -> str:
+    try:
+        from plex_api import get_plex_library_sections
+
+        plex_sections = get_plex_library_sections()
+    except RuntimeError:
+        plex_sections = []
+
+    if plex_sections:
+        visible_sections = [section for section in plex_sections if not section.hidden]
+        hidden_sections = [section for section in plex_sections if section.hidden]
+        lines = [
+            f"Plex library sections: {len(visible_sections)} visible"
+            + (f", {len(hidden_sections)} hidden" if hidden_sections else ""),
+            "",
+        ]
+        for section in visible_sections:
+            count_label = "unavailable" if section.item_count < 0 else f"{section.item_count} item(s)"
+            lines.append(f"- {section.title} [{section.section_type}]: {count_label}")
+            for location in section.locations:
+                lines.append(f"  {location}")
+
+        if hidden_sections:
+            lines.extend(["", "Hidden sections:"])
+            for section in hidden_sections:
+                count_label = "unavailable" if section.item_count < 0 else f"{section.item_count} item(s)"
+                lines.append(f"- {section.title} [{section.section_type}]: {count_label}")
+
+        if config.PLEX_LIBRARY_PATHS:
+            lines.extend(
+                [
+                    "",
+                    "Filesystem index is also configured.",
+                    "Use /reindex only for offline/fallback folder search.",
+                ]
+            )
+        return "\n".join(lines)
+
+    summary = library_index_summary()
+    if not summary.configured_paths and not summary.missing_paths:
+        return (
+            "No Plex library paths are configured yet.\n"
+            "Set PLEX_LIBRARY_PATHS in your .env file for offline folder indexing, "
+            "or configure PLEX_TOKEN for Plex-native library data."
+        )
+
+    lines = [
+        f"Indexed library files: {summary.indexed_files}",
+        "",
+        "Configured library paths:",
+    ]
+    lines.extend(f"- {path}" for path in summary.configured_paths)
+
+    if summary.missing_paths:
+        lines.extend(["", "Missing/unavailable paths:"])
+        lines.extend(f"- {path}" for path in summary.missing_paths)
+
+    return "\n".join(lines)
+
+
+def search_library(query: str, *, limit: int | None = None) -> list[LibraryEntry]:
+    clean_query = " ".join(query.split()).casefold()
+    if not clean_query:
+        return []
+
+    try:
+        from plex_api import search_plex_library
+
+        plex_results = search_plex_library(query, limit=limit or config.LIBRARY_SEARCH_RESULT_LIMIT)
+    except RuntimeError:
+        plex_results = []
+
+    if plex_results:
+        return [
+            LibraryEntry(
+                name=result.name,
+                path=result.path,
+                root_path=f"{result.section_title} [{result.media_type}]",
+                size_bytes=result.size_bytes,
+                modified_at=float(result.added_at),
+            )
+            for result in plex_results
+        ]
+
+    initialize_library_index_db()
+    max_results = limit or config.LIBRARY_SEARCH_RESULT_LIMIT
+
+    with _DB_LOCK, sqlite3.connect(_db_path()) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT name, path, root_path, size_bytes, modified_at
+            FROM library_files
+            WHERE search_name LIKE ?
+            ORDER BY name ASC
+            LIMIT ?
+            """,
+            (f"%{clean_query}%", max_results),
+        ).fetchall()
+
+    return [
+        LibraryEntry(
+            name=row["name"],
+            path=row["path"],
+            root_path=row["root_path"],
+            size_bytes=row["size_bytes"],
+            modified_at=row["modified_at"],
+        )
+        for row in rows
+    ]
+
+
+def format_search_results_message(query: str, *, limit: int | None = None) -> str:
+    results = search_library(query, limit=limit)
+    if not results:
+        return (
+            f'No Plex or indexed library matches for "{query}".\n'
+            "If Plex search is unavailable and you just changed your folders, run /reindex first."
+        )
+
+    lines = [f'Search results for "{query}" ({len(results)} shown):']
+    for entry in results:
+        lines.append(f"- {entry.name} [{entry.root_path}]")
+        lines.append(f"  {entry.path}")
+    return "\n".join(lines)
+
+
+def format_reindex_result_message(result: ReindexResult) -> str:
+    lines = [
+        f"Library reindex complete. Indexed {result.indexed_files} file(s).",
+    ]
+    if result.scanned_roots:
+        lines.append("Scanned paths:")
+        lines.extend(f"- {path}" for path in result.scanned_roots)
+    if result.missing_roots:
+        lines.append("Missing/unavailable paths:")
+        lines.extend(f"- {path}" for path in result.missing_roots)
+    return "\n".join(lines)
+
+
+def _format_bytes(size_bytes: int) -> str:
+    units = ["B", "KB", "MB", "GB", "TB"]
+    size = float(size_bytes)
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(size)} {unit}"
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size_bytes} B"
+
+
+def library_metrics() -> LibraryMetrics:
+    initialize_library_index_db()
+    _valid_paths, missing_paths = _configured_library_paths()
+    now = time.time()
+    cutoff_7d = now - (7 * 24 * 60 * 60)
+    cutoff_30d = now - (30 * 24 * 60 * 60)
+
+    with _DB_LOCK, sqlite3.connect(_db_path()) as conn:
+        summary_row = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS total_files,
+                COALESCE(SUM(size_bytes), 0) AS total_size_bytes,
+                COALESCE(SUM(CASE WHEN modified_at >= ? THEN 1 ELSE 0 END), 0) AS recent_7d,
+                COALESCE(SUM(CASE WHEN modified_at >= ? THEN 1 ELSE 0 END), 0) AS recent_30d
+            FROM library_files
+            """,
+            (cutoff_7d, cutoff_30d),
+        ).fetchone()
+
+        root_rows = conn.execute(
+            """
+            SELECT
+                root_path,
+                COUNT(*) AS file_count,
+                COALESCE(SUM(size_bytes), 0) AS total_size_bytes,
+                COALESCE(SUM(CASE WHEN modified_at >= ? THEN 1 ELSE 0 END), 0) AS recent_7d,
+                COALESCE(SUM(CASE WHEN modified_at >= ? THEN 1 ELSE 0 END), 0) AS recent_30d
+            FROM library_files
+            GROUP BY root_path
+            ORDER BY file_count DESC, root_path ASC
+            """,
+            (cutoff_7d, cutoff_30d),
+        ).fetchall()
+
+    roots = [
+        RootLibraryMetrics(
+            root_path=row[0],
+            file_count=int(row[1]),
+            total_size_bytes=int(row[2]),
+            recent_7d=int(row[3]),
+            recent_30d=int(row[4]),
+        )
+        for row in root_rows
+    ]
+
+    return LibraryMetrics(
+        total_files=int(summary_row[0]) if summary_row is not None else 0,
+        total_size_bytes=int(summary_row[1]) if summary_row is not None else 0,
+        recent_7d=int(summary_row[2]) if summary_row is not None else 0,
+        recent_30d=int(summary_row[3]) if summary_row is not None else 0,
+        roots=roots,
+        missing_paths=missing_paths,
+    )
+
+
+def format_library_metrics_message() -> str:
+    metrics = library_metrics()
+    lines = [
+        "Library Metrics",
+        f"- Total indexed files: {metrics.total_files}",
+        f"- Total indexed size: {_format_bytes(metrics.total_size_bytes)}",
+        f"- Added/updated in last 7 days: {metrics.recent_7d}",
+        f"- Added/updated in last 30 days: {metrics.recent_30d}",
+    ]
+
+    if metrics.roots:
+        lines.append("")
+        lines.append("Per-library totals:")
+        for root in metrics.roots:
+            lines.append(
+                f"- {root.root_path}: {root.file_count} file(s), "
+                f"{_format_bytes(root.total_size_bytes)}, "
+                f"{root.recent_7d} new/updated in 7d"
+            )
+
+    if metrics.missing_paths:
+        lines.append("")
+        lines.append("Missing/unavailable configured paths:")
+        lines.extend(f"- {path}" for path in metrics.missing_paths)
+
+    lines.append("")
+    lines.append(
+        "Note: duration and watch-history metrics require Plex metadata/API access; "
+        "these numbers are based on indexed files only."
+    )
+    return "\n".join(lines)
