@@ -9,7 +9,9 @@
   ],
   "ignore": [
     "build",
-    "dist"
+    "dist",
+    "C:/Program Files/WindowsApps/PythonSoftwareFoundation.Python.3.11_*/Lib/**",
+    "C:/Users/Cole/.vscode-insiders/extensions/ms-python.vscode-pylance-*/dist/typeshed-fallback/**"
   ],
   "pythonVersion": "3.11",
   "reportMissingModuleSource": "none"

@@ -135,7 +135,7 @@ def parse_request_list(text: str) -> list[ParsedRequest]:
 # Shared HTTP helpers
 # ---------------------------------------------------------------------------
 
-def _get_json(url: str, *, headers: dict[str, str] | None = None, timeout: int = 10) -> dict | list:
+def _get_json(url: str, *, headers: dict[str, str] | None = None, timeout: int = 10) -> dict:
     req_headers: dict[str, str] = {"User-Agent": _USER_AGENT, "Accept": "application/json"}
     if headers:
         req_headers.update(headers)

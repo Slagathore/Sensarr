@@ -23,9 +23,9 @@
 
 import asyncio
 import logging
-from typing import Any
+from typing import Any, cast
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
@@ -285,6 +285,7 @@ async def handle_type_selection(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     if query is None or query.message is None:
         return ConversationHandler.END
+    message = cast(Message, query.message)
     await query.answer()
 
     data = query.data or ""
@@ -293,7 +294,7 @@ async def handle_type_selection(update: Update, context: ContextTypes.DEFAULT_TY
 
     if media_type == "queue":
         queue_text = format_requests_message_user()
-        await query.message.reply_text(queue_text)
+        await message.reply_text(queue_text)
         return ConversationHandler.END
 
     # Store chosen type and send instructions
@@ -301,7 +302,7 @@ async def handle_type_selection(update: Update, context: ContextTypes.DEFAULT_TY
     context.user_data[_UD_MEDIA_TYPE] = media_type
 
     instruction = _INSTRUCTIONS.get(media_type, _INSTRUCTIONS["other"])
-    await query.message.reply_html(instruction)
+    await message.reply_html(instruction)
     return AWAITING_CONTENT
 
 
@@ -422,13 +423,14 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
     query = update.callback_query
     if query is None or query.message is None:
         return ConversationHandler.END
+    message = cast(Message, query.message)
     await query.answer()
 
     data = query.data or ""
     assert context.user_data is not None
 
     if data == "req_confirm_restart":
-        await query.message.reply_text(
+        await message.reply_text(
             "No problem — what would you like to request?",
             reply_markup=_TYPE_KEYBOARD,
         )
@@ -466,12 +468,12 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         if added:
             bullet_list = "\n".join(f"• {t}" for t in added)
-            await query.message.reply_html(
+            await message.reply_html(
                 f"✅ <b>Added {len(added)} request(s) to the queue:</b>\n{bullet_list}\n\n"
                 f"Use the <b>📝 Requests</b> button anytime to see the full queue."
             )
         else:
-            await query.message.reply_text(
+            await message.reply_text(
                 "Nothing new to add — everything was already in your library!"
             )
 
