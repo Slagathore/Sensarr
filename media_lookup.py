@@ -192,8 +192,8 @@ def _tmdb_enabled() -> bool:
     return bool(config.TMDB_API_KEY)
 
 
-def search_tmdb_movies(title: str, year: int | None = None) -> list[MediaResult]:
-    """Search TMDB for movies. Returns up to 5 ranked results."""
+def search_tmdb_movies(title: str, year: int | None = None, *, limit: int = 5) -> list[MediaResult]:
+    """Search TMDB for movies. Returns up to `limit` ranked results."""
     if not _tmdb_enabled():
         logger.warning("TMDB_API_KEY not set — movie search unavailable.")
         return []
@@ -216,7 +216,7 @@ def search_tmdb_movies(title: str, year: int | None = None) -> list[MediaResult]
         return []
 
     results: list[MediaResult] = []
-    for item in (data.get("results") or [])[:5]:
+    for item in (data.get("results") or [])[:limit]:
         tmdb_id = item.get("id")
         release_year: int | None = None
         rd = item.get("release_date") or ""
@@ -239,8 +239,8 @@ def search_tmdb_movies(title: str, year: int | None = None) -> list[MediaResult]
     return results
 
 
-def search_tmdb_shows(title: str, year: int | None = None) -> list[MediaResult]:
-    """Search TMDB for TV shows. Returns up to 5 ranked results."""
+def search_tmdb_shows(title: str, year: int | None = None, *, limit: int = 5) -> list[MediaResult]:
+    """Search TMDB for TV shows. Returns up to `limit` ranked results."""
     if not _tmdb_enabled():
         logger.warning("TMDB_API_KEY not set — TV search via TMDB unavailable.")
         return []
@@ -263,7 +263,7 @@ def search_tmdb_shows(title: str, year: int | None = None) -> list[MediaResult]:
         return []
 
     results: list[MediaResult] = []
-    for item in (data.get("results") or [])[:5]:
+    for item in (data.get("results") or [])[:limit]:
         tmdb_id = item.get("id")
         release_year: int | None = None
         fa = item.get("first_air_date") or ""
@@ -319,14 +319,14 @@ def _tvdb_get_token() -> str | None:
     return None
 
 
-def search_tvdb_shows(title: str, year: int | None = None) -> list[MediaResult]:
-    """Search TVDB for TV series. Returns up to 5 results."""
+def search_tvdb_shows(title: str, year: int | None = None, *, limit: int = 5) -> list[MediaResult]:
+    """Search TVDB for TV series. Returns up to `limit` results."""
     token = _tvdb_get_token()
     if not token:
         logger.warning("TVDB not available (missing key or auth failure).")
         return []
 
-    params: dict[str, str] = {"query": title, "type": "series", "limit": "5"}
+    params: dict[str, str] = {"query": title, "type": "series", "limit": str(limit)}
     if year:
         params["year"] = str(year)
 
@@ -338,7 +338,7 @@ def search_tvdb_shows(title: str, year: int | None = None) -> list[MediaResult]:
         return []
 
     results: list[MediaResult] = []
-    for item in (data.get("data") or [])[:5]:
+    for item in (data.get("data") or [])[:limit]:
         tvdb_id = item.get("tvdb_id") or item.get("id")
         slug = item.get("slug") or ""
         release_year: int | None = None
@@ -387,7 +387,7 @@ def _jikan_throttle() -> None:
     _jikan_last_request = time.time()
 
 
-def search_jikan_anime(title: str, *, explicit: bool = False) -> list[MediaResult]:
+def search_jikan_anime(title: str, *, explicit: bool = False, limit: int = 5) -> list[MediaResult]:
     """
     Search MAL via the Jikan v4 API.
 
@@ -398,7 +398,7 @@ def search_jikan_anime(title: str, *, explicit: bool = False) -> list[MediaResul
 
     params: dict[str, str] = {
         "q": title,
-        "limit": "5",
+        "limit": str(limit),
         "order_by": "score",
         "sort": "desc",
     }
@@ -415,7 +415,7 @@ def search_jikan_anime(title: str, *, explicit: bool = False) -> list[MediaResul
         return []
 
     results: list[MediaResult] = []
-    for item in (data.get("data") or [])[:5]:
+    for item in (data.get("data") or [])[:limit]:
         mal_id = item.get("mal_id")
         title_str = item.get("title_english") or item.get("title") or "Unknown"
 

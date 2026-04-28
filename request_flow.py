@@ -40,7 +40,8 @@ import config
 from llm_service import categorize_other_request, fuzzy_correct_title, llm_available
 from media_lookup import (
     LookupResult, MediaResult, ParsedRequest,
-    clean_library_name, lookup_media, parse_request_list, title_similarity,
+    check_library_for_title, clean_library_name, lookup_media,
+    parse_request_list, title_similarity,
     search_tmdb_movies, search_tmdb_shows, search_tvdb_shows,
     search_jikan_anime, search_anidb,
 )
@@ -63,6 +64,11 @@ _UD_RESULTS = "req_lookup_results"          # list[LookupResult]
 _UD_CORRECTING_IDX = "req_correcting_idx"   # int: 0-based index of item being corrected
 _UD_CORRECTION_OPTS = "req_correction_opts" # list[MediaResult]: candidates for correction
 _UD_CORRECTION_QUEUE = "req_correction_queue"  # list[int]: 0-based indices still to fix
+_UD_CORRECTION_PAGE  = "req_correction_page"   # int: current result page (0-based, 5 per page)
+_UD_REMOVED          = "req_removed"           # set[int]: 0-based indices dropped by the user
+
+_CORRECTION_PAGE_SIZE = 5
+_CORRECTION_FETCH_LIMIT = 15  # fetch this many results upfront so paging works without extra calls
 
 # ---------------------------------------------------------------------------
 # Static keyboards
@@ -173,6 +179,8 @@ def _requester_name(update: Update) -> str:
 def _build_results_message(
     results: list[LookupResult],
     media_type: str,
+    *,
+    removed: set[int] | None = None,
 ) -> str:
     """
     Build the numbered HTML confirmation message.
@@ -197,7 +205,11 @@ def _build_results_message(
     nf_searched:   list[tuple[int, LookupResult]] = []
     nf_no_key:     list[tuple[int, LookupResult]] = []
 
+    _removed = removed or set()
+
     for num, lr in enumerate(results, start=1):
+        if num - 1 in _removed:
+            continue
         if lr.in_library:
             if lr.request.qualifier:
                 in_lib_qual.append((num, lr))
@@ -285,7 +297,7 @@ def _build_results_message(
             "(e.g. <code>9 is wrong</code>) to search again.</i>\n"
         )
 
-    submittable = [lr for lr in results if not lr.in_library]
+    submittable = [lr for i, lr in enumerate(results) if i not in _removed and not lr.in_library]
     if submittable:
         lines.append(
             "Tap <b>Submit Requests</b> to add the un-found title(s) to the queue, "
@@ -297,9 +309,10 @@ def _build_results_message(
     return "\n".join(lines)
 
 
-def _has_submittable(results: list[LookupResult]) -> bool:
-    """True if at least one result is not already in the library."""
-    return any(not lr.in_library for lr in results)
+def _has_submittable(results: list[LookupResult], removed: set[int] | None = None) -> bool:
+    """True if at least one non-removed result is not already in the library."""
+    _removed = removed or set()
+    return any(not lr.in_library for i, lr in enumerate(results) if i not in _removed)
 
 
 # ---------------------------------------------------------------------------
@@ -483,17 +496,21 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         context.user_data.pop(_UD_RESULTS, None)
         context.user_data.pop(_UD_MEDIA_TYPE, None)
+        context.user_data.pop(_UD_REMOVED, None)
         return SELECT_TYPE
 
     if data == "req_confirm_yes":
         results: list[LookupResult] = context.user_data.get(_UD_RESULTS, [])
         media_type: str = context.user_data.get(_UD_MEDIA_TYPE, "unknown")
+        removed: set[int] = context.user_data.get(_UD_REMOVED, set())
         requester = _requester_name(update)
 
         loop = asyncio.get_running_loop()
         added: list[str] = []
 
-        for lr in results:
+        for i, lr in enumerate(results):
+            if i in removed:
+                continue  # user dropped this item
             if lr.in_library:
                 continue  # already there — skip
 
@@ -526,6 +543,7 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         context.user_data.pop(_UD_RESULTS, None)
         context.user_data.pop(_UD_MEDIA_TYPE, None)
+        context.user_data.pop(_UD_REMOVED, None)
         return ConversationHandler.END
 
     # Unknown confirm action — just end
@@ -541,6 +559,17 @@ _WRONG_KEYWORDS = frozenset({
 })
 
 
+def _parse_remove_numbers(text: str) -> list[int]:
+    """
+    Extract item numbers from messages like 'remove 9', 'drop 9 and 11'.
+    Returns an empty list if no remove keyword is present.
+    """
+    lower = text.lower().strip()
+    if not re.match(r"^(remove|delete|drop|ditch|scratch)\b", lower):
+        return []
+    return [int(m.group()) for m in re.finditer(r"\b(\d+)\b", lower) if int(m.group()) >= 1]
+
+
 def _parse_wrong_numbers(text: str) -> list[int]:
     """
     Extract item numbers from messages like '9 is wrong', 'fix 9 and 11'.
@@ -552,17 +581,22 @@ def _parse_wrong_numbers(text: str) -> list[int]:
     return [int(m.group()) for m in re.finditer(r"\b(\d+)\b", lower) if int(m.group()) >= 1]
 
 
-def _run_external_search(request: ParsedRequest, media_type: str) -> list[MediaResult]:
+def _run_external_search(
+    request: ParsedRequest,
+    media_type: str,
+    *,
+    limit: int = _CORRECTION_FETCH_LIMIT,
+) -> list[MediaResult]:
     """Force an external DB search regardless of library state. Blocking — run in executor."""
     if media_type == "movie":
-        return search_tmdb_movies(request.title, request.year)
+        return search_tmdb_movies(request.title, request.year, limit=limit)
     if media_type == "tv":
-        results = search_tvdb_shows(request.title, request.year)
-        return results or search_tmdb_shows(request.title, request.year)
+        results = search_tvdb_shows(request.title, request.year, limit=limit)
+        return results or search_tmdb_shows(request.title, request.year, limit=limit)
     if media_type == "anime":
-        return search_jikan_anime(request.title, explicit=False)
+        return search_jikan_anime(request.title, explicit=False, limit=limit)
     if media_type == "xanime":
-        return search_anidb(request.title) or search_jikan_anime(request.title, explicit=True)
+        return search_anidb(request.title) or search_jikan_anime(request.title, explicit=True, limit=limit)
     return []
 
 
@@ -570,68 +604,126 @@ def _run_external_search(request: ParsedRequest, media_type: str) -> list[MediaR
 # CONFIRMING state — text handler for "X is wrong" / "9 and 11 are wrong"
 # ---------------------------------------------------------------------------
 
+def _format_candidates_page(
+    label: str,
+    candidates: list[MediaResult],
+    page: int,
+) -> str:
+    """Format one page of candidates as an HTML string ready to send."""
+    start = page * _CORRECTION_PAGE_SIZE
+    page_items = candidates[start : start + _CORRECTION_PAGE_SIZE]
+    has_more = (start + _CORRECTION_PAGE_SIZE) < len(candidates)
+
+    lines = [f"🔍 Results for <b>{label}</b> (page {page + 1}):\n"]
+    for i, m in enumerate(page_items, start=1):
+        year_str = f" ({m.year})" if m.year else ""
+        title_link = f'<a href="{m.external_url}">{m.title}</a>' if m.external_url else f"<b>{m.title}</b>"
+        snippet = f" — <i>{m.overview[:80]}…</i>" if m.overview else ""
+        lines.append(f"  <b>{i}.</b> {title_link}{year_str}{snippet}")
+
+    footer_parts = ["Reply with a number (1–5) to select", "0 to leave as-is"]
+    if has_more:
+        footer_parts.append("<code>more</code> for next page")
+    footer_parts.append("or type a different search term")
+    lines.append("\n" + ", ".join(footer_parts) + ".")
+    return "\n".join(lines)
+
+
 async def _search_and_show_candidates(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     item_num: int,          # 1-based display number
     results: list[LookupResult],
     media_type: str,
+    *,
+    override_title: str | None = None,  # use a different search term if provided
 ) -> bool:
     """
-    Run external search for item_num, store candidates, send the pick prompt.
-    Returns True if candidates were found (caller should go to CORRECTING),
-    False if nothing was found (caller should stay in CONFIRMING).
+    Run external search for item_num (or override_title), store all candidates,
+    show page 0. Returns True if candidates were found, False otherwise.
     """
     assert context.user_data is not None
     lr = results[item_num - 1]
+    search_label = override_title or lr.request.display()
 
     await update.message.reply_html(  # type: ignore[union-attr]
-        f"🔄 Re-searching for item <b>{item_num}</b>: <i>{lr.request.display()}</i>…"
+        f"🔄 Searching for <b>{search_label}</b>…"
     )
     await update.message.chat.send_action("typing")  # type: ignore[union-attr]
+
+    # Build a request with potentially overridden title for the search
+    search_req = lr.request
+    if override_title:
+        search_req = ParsedRequest(
+            original=override_title,
+            title=override_title,
+            year=lr.request.year,
+            qualifier=lr.request.qualifier,
+        )
 
     loop = asyncio.get_running_loop()
     candidates: list[MediaResult] = await loop.run_in_executor(
         None,
-        lambda: _run_external_search(lr.request, media_type),
+        lambda: _run_external_search(search_req, media_type),
     )
 
     if not candidates:
-        await update.message.reply_text(  # type: ignore[union-attr]
-            f"Couldn't find any results for '{lr.request.display()}'. "
-            "Check the spelling and try again, or submit as-is."
+        await update.message.reply_html(  # type: ignore[union-attr]
+            f"No results found for <b>{search_label}</b>.\n"
+            "Try a different search term, or reply <code>0</code> to leave this item as-is."
         )
         return False
 
     context.user_data[_UD_CORRECTING_IDX] = item_num - 1
     context.user_data[_UD_CORRECTION_OPTS] = candidates
+    context.user_data[_UD_CORRECTION_PAGE] = 0
 
-    lines = [f"🔍 Top results for <b>{lr.request.display()}</b>:\n"]
-    for i, m in enumerate(candidates[:5], start=1):
-        year_str = f" ({m.year})" if m.year else ""
-        title_link = f'<a href="{m.external_url}">{m.title}</a>' if m.external_url else f"<b>{m.title}</b>"
-        snippet = f" — <i>{m.overview[:80]}…</i>" if m.overview else ""
-        lines.append(f"  <b>{i}.</b> {title_link}{year_str}{snippet}")
-    lines.append("\nReply with a number (1–5) to select, or <code>0</code> to leave as-is.")
-
-    await update.message.reply_html("\n".join(lines))  # type: ignore[union-attr]
+    await update.message.reply_html(  # type: ignore[union-attr]
+        _format_candidates_page(search_label, candidates, 0)
+    )
     return True
 
 
 async def handle_correction_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """User typed something like '9 is wrong' or '9 and 11 are wrong'."""
+    """User typed something like '9 is wrong', '9 and 11 are wrong', or 'remove 9'."""
     if update.message is None or update.message.text is None:
         return CONFIRMING
 
     assert context.user_data is not None
     results: list[LookupResult] = context.user_data.get(_UD_RESULTS, [])
     media_type: str = context.user_data.get(_UD_MEDIA_TYPE, "other")
+    removed: set[int] = context.user_data.get(_UD_REMOVED, set())
 
+    # ── "remove X" — drop items from the list ────────────────────────────────
+    remove_numbers = _parse_remove_numbers(update.message.text)
+    if remove_numbers:
+        newly_removed = []
+        for n in remove_numbers:
+            if n < 1 or n > len(results):
+                await update.message.reply_text(
+                    f"Item {n} doesn't exist — there are {len(results)} items."
+                )
+            elif (n - 1) not in removed:
+                removed.add(n - 1)
+                newly_removed.append(n)
+        if newly_removed:
+            context.user_data[_UD_REMOVED] = removed
+            removed_list = ", ".join(f"#{n}" for n in newly_removed)
+            await update.message.reply_text(f"Removed {removed_list} from your request.")
+            results_msg = _build_results_message(results, media_type, removed=removed)
+            keyboard = _CONFIRM_KEYBOARD if _has_submittable(results, removed) else InlineKeyboardMarkup([[
+                InlineKeyboardButton("✏️ Make another request", callback_data="req_confirm_restart"),
+                InlineKeyboardButton("❌ Done", callback_data="req_cancel"),
+            ]])
+            await update.message.reply_html(results_msg, reply_markup=keyboard)
+        return CONFIRMING
+
+    # ── "X is wrong" — start correction flow ─────────────────────────────────
     wrong_numbers = _parse_wrong_numbers(update.message.text)
     if not wrong_numbers:
         await update.message.reply_text(
             "Tap Submit Requests or Start Over, or type '<number> is wrong' "
-            "to fix a specific item (e.g. '9 is wrong')."
+            "to fix a specific item (e.g. '9 is wrong'), or 'remove 9' to drop one."
         )
         return CONFIRMING
 
@@ -648,9 +740,7 @@ async def handle_correction_request(update: Update, context: ContextTypes.DEFAUL
     if not valid:
         return CONFIRMING
 
-    # Store the remainder of the queue (everything after the first item)
     context.user_data[_UD_CORRECTION_QUEUE] = valid[1:]
-
     found = await _search_and_show_candidates(update, context, valid[0], results, media_type)
     return CORRECTING if found else CONFIRMING
 
@@ -660,7 +750,13 @@ async def handle_correction_request(update: Update, context: ContextTypes.DEFAUL
 # ---------------------------------------------------------------------------
 
 async def handle_correction_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """User replied with a number to pick a correction candidate."""
+    """
+    In CORRECTING state, handle:
+      • a digit      → pick that result from the current page
+      • 0 / "skip"   → leave item unchanged, advance queue
+      • "more"/"next" → show next page of candidates
+      • anything else → treat as a new search term and re-search
+    """
     if update.message is None or update.message.text is None:
         return CORRECTING
 
@@ -668,54 +764,111 @@ async def handle_correction_pick(update: Update, context: ContextTypes.DEFAULT_T
     results: list[LookupResult] = context.user_data.get(_UD_RESULTS, [])
     correcting_idx: int = context.user_data.get(_UD_CORRECTING_IDX, -1)
     candidates: list[MediaResult] = context.user_data.get(_UD_CORRECTION_OPTS, [])
+    page: int = context.user_data.get(_UD_CORRECTION_PAGE, 0)
     queue: list[int] = context.user_data.get(_UD_CORRECTION_QUEUE, [])
     media_type: str = context.user_data.get(_UD_MEDIA_TYPE, "other")
 
-    text = update.message.text.strip().lower()
+    text = update.message.text.strip()
+    text_lower = text.lower()
 
-    try:
-        pick = int(text)
-    except ValueError:
-        await update.message.reply_text(
-            f"Please reply with a number (1–{min(5, len(candidates))}) to pick a result, "
-            "or 0 to leave this item as-is."
-        )
-        return CORRECTING
+    # ── "remove" / "delete" — drop this item entirely ────────────────────────
+    if text_lower in {"remove", "delete", "drop", "ditch", "scratch"}:
+        removed: set[int] = context.user_data.get(_UD_REMOVED, set())
+        removed.add(correcting_idx)
+        context.user_data[_UD_REMOVED] = removed
+        context.user_data.pop(_UD_CORRECTING_IDX, None)
+        context.user_data.pop(_UD_CORRECTION_OPTS, None)
+        context.user_data.pop(_UD_CORRECTION_PAGE, None)
+        await update.message.reply_text(f"Removed #{correcting_idx + 1} from your request.")
+        if queue:
+            next_num = queue[0]
+            context.user_data[_UD_CORRECTION_QUEUE] = queue[1:]
+            found = await _search_and_show_candidates(update, context, next_num, results, media_type)
+            return CORRECTING if found else await _finish_corrections(update, context, results, media_type)
+        return await _finish_corrections(update, context, results, media_type)
 
-    if pick == 0 or text in {"skip", "none"}:
-        pass  # leave item unchanged
-    elif 1 <= pick <= len(candidates):
-        chosen = candidates[pick - 1]
-        lr = results[correcting_idx]
-        if lr.request.qualifier:
-            chosen = MediaResult(
-                title=chosen.title, year=chosen.year,
-                external_id=chosen.external_id, external_url=chosen.external_url,
-                media_type=chosen.media_type, overview=chosen.overview,
-                source=chosen.source, qualifier=lr.request.qualifier,
+    # ── "more" / "next" — advance to the next page of stored candidates ──────
+    if text_lower in {"more", "next"}:
+        next_page = page + 1
+        if next_page * _CORRECTION_PAGE_SIZE >= len(candidates):
+            await update.message.reply_text(
+                "No more results. Try a different search term, or pick from the list above."
             )
-        results[correcting_idx] = LookupResult(
-            request=lr.request, in_library=False, library_matches=[],
-            external_matches=candidates, best_match=chosen, search_attempted=True,
-        )
-        context.user_data[_UD_RESULTS] = results
-    else:
-        await update.message.reply_text(
-            f"Please choose between 1 and {min(5, len(candidates))}, or 0 to skip."
+            return CORRECTING
+        context.user_data[_UD_CORRECTION_PAGE] = next_page
+        lr = results[correcting_idx]
+        await update.message.reply_html(
+            _format_candidates_page(lr.request.display(), candidates, next_page)
         )
         return CORRECTING
 
-    context.user_data.pop(_UD_CORRECTING_IDX, None)
-    context.user_data.pop(_UD_CORRECTION_OPTS, None)
+    # ── numeric pick ─────────────────────────────────────────────────────────
+    try:
+        pick = int(text_lower)
+    except ValueError:
+        pick = None
 
-    # If there are more items queued, move straight to the next one
-    if queue:
-        next_num = queue[0]
-        context.user_data[_UD_CORRECTION_QUEUE] = queue[1:]
-        found = await _search_and_show_candidates(update, context, next_num, results, media_type)
-        return CORRECTING if found else await _finish_corrections(update, context, results, media_type)
+    if pick is not None:
+        if pick != 0:
+            page_start = page * _CORRECTION_PAGE_SIZE
+            page_items = candidates[page_start : page_start + _CORRECTION_PAGE_SIZE]
+            if pick < 1 or pick > len(page_items):
+                await update.message.reply_text(
+                    f"Please choose between 1 and {len(page_items)}, or 0 to skip."
+                )
+                return CORRECTING
 
-    return await _finish_corrections(update, context, results, media_type)
+            chosen = candidates[page_start + pick - 1]
+            lr = results[correcting_idx]
+            if lr.request.qualifier:
+                chosen = MediaResult(
+                    title=chosen.title, year=chosen.year,
+                    external_id=chosen.external_id, external_url=chosen.external_url,
+                    media_type=chosen.media_type, overview=chosen.overview,
+                    source=chosen.source, qualifier=lr.request.qualifier,
+                )
+
+            # Re-check the library for the corrected title — it may already be there
+            loop = asyncio.get_running_loop()
+            in_lib, lib_matches = await loop.run_in_executor(
+                None,
+                lambda t=chosen.title: check_library_for_title(t, media_type),
+            )
+            if in_lib:
+                await update.message.reply_html(
+                    f"✅ <b>{chosen.title}</b> is actually already in your library! "
+                    "Marking it as found."
+                )
+                results[correcting_idx] = LookupResult(
+                    request=lr.request, in_library=True, library_matches=lib_matches,
+                    external_matches=candidates, best_match=chosen, search_attempted=True,
+                )
+            else:
+                results[correcting_idx] = LookupResult(
+                    request=lr.request, in_library=False, library_matches=[],
+                    external_matches=candidates, best_match=chosen, search_attempted=True,
+                )
+            context.user_data[_UD_RESULTS] = results
+
+        # Clear correction state for this item
+        context.user_data.pop(_UD_CORRECTING_IDX, None)
+        context.user_data.pop(_UD_CORRECTION_OPTS, None)
+        context.user_data.pop(_UD_CORRECTION_PAGE, None)
+
+        if queue:
+            next_num = queue[0]
+            context.user_data[_UD_CORRECTION_QUEUE] = queue[1:]
+            found = await _search_and_show_candidates(update, context, next_num, results, media_type)
+            return CORRECTING if found else await _finish_corrections(update, context, results, media_type)
+
+        return await _finish_corrections(update, context, results, media_type)
+
+    # ── free-text → re-search with new query ─────────────────────────────────
+    await _search_and_show_candidates(
+        update, context, correcting_idx + 1, results, media_type,
+        override_title=text,
+    )
+    return CORRECTING
 
 
 async def _finish_corrections(
@@ -727,8 +880,9 @@ async def _finish_corrections(
     """Clear correction state and redisplay the full confirmation."""
     assert context.user_data is not None
     context.user_data.pop(_UD_CORRECTION_QUEUE, None)
-    results_msg = _build_results_message(results, media_type)
-    keyboard = _CONFIRM_KEYBOARD if _has_submittable(results) else InlineKeyboardMarkup([[
+    removed: set[int] = context.user_data.get(_UD_REMOVED, set())
+    results_msg = _build_results_message(results, media_type, removed=removed)
+    keyboard = _CONFIRM_KEYBOARD if _has_submittable(results, removed) else InlineKeyboardMarkup([[
         InlineKeyboardButton("✏️ Make another request", callback_data="req_confirm_restart"),
         InlineKeyboardButton("❌ Done", callback_data="req_cancel"),
     ]])
@@ -752,6 +906,7 @@ async def cancel_request_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
     if context.user_data:
         context.user_data.pop(_UD_RESULTS, None)
         context.user_data.pop(_UD_MEDIA_TYPE, None)
+        context.user_data.pop(_UD_REMOVED, None)
 
     return ConversationHandler.END
 
