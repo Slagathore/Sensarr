@@ -1,4 +1,16 @@
 {
-  "pythonPath": "C:\\Program Files\\Python311\\python.exe",
+  "include": [
+    "."
+  ],
+  "exclude": [
+    "build",
+    "dist",
+    "**/__pycache__"
+  ],
+  "ignore": [
+    "build",
+    "dist"
+  ],
+  "pythonVersion": "3.11",
   "reportMissingModuleSource": "none"
 }

@@ -117,3 +117,34 @@ TRAY_ICON_PATH: str = str(ASSETS_DIR / "tray_icon.png")
 TASKBAR_ICON_PATH: str = str(ASSETS_DIR / "taskbar_icon.png")
 TRAY_EXPAND_ARROW_PATH: str = str(ASSETS_DIR / "tray_expand_arrow.png")
 EXIT_MENU_ITEM_PATH: str = str(ASSETS_DIR / "exit_menu_item.png")
+
+# ---------------------------------------------------------------------------
+# External media database API keys
+# Get TMDB key free at: https://www.themoviedb.org/settings/api
+# Get TVDB key free at: https://thetvdb.com/api-information
+# ---------------------------------------------------------------------------
+TMDB_API_KEY: str = os.getenv("TMDB_API_KEY", "").strip()
+TVDB_API_KEY: str = os.getenv("TVDB_API_KEY", "").strip()
+
+# ---------------------------------------------------------------------------
+# Ollama — used for fuzzy title matching and 'Other' request categorization
+# Ollama must be running locally (https://ollama.com).
+# The model should already be available via Ollama (gemini-3-flash-preview:cloud).
+# OLLAMA_HOST defaults to http://localhost:11434 (standard Ollama install).
+# OLLAMA_MODEL is whatever tag you have pulled in Ollama.
+# ---------------------------------------------------------------------------
+OLLAMA_HOST: str = os.getenv("OLLAMA_HOST", "http://localhost:11434").strip()
+OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "gemini-3-flash-preview:cloud").strip()
+
+# ---------------------------------------------------------------------------
+# AniDB — used for xAnime (explicit anime) title lookup
+# Register a free client name at: https://anidb.net/software/add
+# ---------------------------------------------------------------------------
+ANIDB_CLIENT: str = os.getenv("ANIDB_CLIENT", "plexrequestbot").strip()
+ANIDB_CLIENT_VER: int = int(os.getenv("ANIDB_CLIENT_VER", "1"))
+
+# ---------------------------------------------------------------------------
+# Daily library check — hour of day (0-23) at which the scheduled check runs
+# The check compares open requests against the Plex library and marks found ones
+# ---------------------------------------------------------------------------
+LIBRARY_CHECK_HOUR: int = int(os.getenv("LIBRARY_CHECK_HOUR", "3"))

@@ -1,3 +1,4 @@
+import datetime
 import logging
 import threading
 import tkinter as tk
@@ -16,8 +17,14 @@ from plex_auth import (PlexPinSession, PlexTokenResult, launch_auth_browser,
                        save_plex_credentials, start_plex_pin_login,
                        wait_for_plex_token)
 from plex_control import get_status, hard_reset, launch_plex, soft_reset
-from queue_store import (add_request, complete_request, initialize_queue_db,
-                          list_requests, open_request_count)
+from maintenance import (
+    DuplicateGroup, FilenameIssue, MissingEpisode, SanitizePair, UnindexedFile,
+    apply_sanitization, check_filenames_vs_plex, daily_library_check,
+    find_duplicates, find_missing_episodes, find_unindexed_files, sanitize_all,
+)
+from queue_store import (add_request, complete_request, find_duplicate_requests,
+                          get_request, initialize_queue_db, list_requests,
+                          open_request_count)
 from telegram_service import TelegramBotService
 
 logger = logging.getLogger(__name__)
@@ -52,9 +59,17 @@ class DesktopApp:
         self.status_text: scrolledtext.ScrolledText | None = None
         self.log_text: scrolledtext.ScrolledText | None = None
         self.requests_tree: ttk.Treeview | None = None
+        self.request_detail_text: scrolledtext.ScrolledText | None = None
         self.library_summary_text: scrolledtext.ScrolledText | None = None
         self.library_results_tree: ttk.Treeview | None = None
         self.metrics_text: scrolledtext.ScrolledText | None = None
+        # Maintenance tab state
+        self._maint_results: list[Any] = []
+        self._maint_tool_name: str = ""
+        self._maint_tree: ttk.Treeview | None = None
+        self._maint_check_vars: list[tk.BooleanVar] = []
+        self._maint_status_var = tk.StringVar(value="Select a tool to run.")
+        self._last_library_check_date: str = ""
         self._last_log_count = 0
         self._tray_icon = self._build_tray_icon()
         self._quitting = False
@@ -94,6 +109,7 @@ class DesktopApp:
         self.refresh_library_metrics()
         self._schedule_status_refresh()
         self._schedule_log_refresh()
+        self._schedule_daily_library_check()
 
     def _build_ui(self) -> None:
         self.root.columnconfigure(0, weight=1)
@@ -132,30 +148,31 @@ class DesktopApp:
         requests_tab = ttk.Frame(notebook, padding=12)
         library_tab = ttk.Frame(notebook, padding=12)
         metrics_tab = ttk.Frame(notebook, padding=12)
+        maintenance_tab = ttk.Frame(notebook, padding=12)
         logs_tab = ttk.Frame(notebook, padding=12)
         notebook.add(status_tab, text="Status")
         notebook.add(requests_tab, text="Requests")
         notebook.add(library_tab, text="Library")
         notebook.add(metrics_tab, text="Metrics")
+        notebook.add(maintenance_tab, text="Maintenance")
         notebook.add(logs_tab, text="Logs")
 
         status_tab.columnconfigure(0, weight=1)
         status_tab.rowconfigure(0, weight=1)
         requests_tab.columnconfigure(0, weight=1)
         requests_tab.rowconfigure(1, weight=1)
+        requests_tab.rowconfigure(2, weight=0)
         library_tab.columnconfigure(0, weight=1)
         library_tab.rowconfigure(2, weight=1)
         metrics_tab.columnconfigure(0, weight=1)
         metrics_tab.rowconfigure(1, weight=1)
+        maintenance_tab.columnconfigure(0, weight=1)
+        maintenance_tab.rowconfigure(2, weight=1)
         logs_tab.columnconfigure(0, weight=1)
         logs_tab.rowconfigure(0, weight=1)
 
         self.status_text = scrolledtext.ScrolledText(
-            status_tab,
-            wrap=tk.WORD,
-            height=14,
-            font=("Consolas", 10),
-            state=tk.DISABLED,
+            status_tab, wrap=tk.WORD, height=14, font=("Consolas", 10), state=tk.DISABLED,
         )
         self.status_text.grid(row=0, column=0, sticky="nsew")
 
@@ -180,23 +197,37 @@ class DesktopApp:
 
         self.requests_tree = ttk.Treeview(
             requests_frame,
-            columns=("id", "requester", "created", "content"),
+            columns=("id", "type", "requester", "created", "title", "status"),
             show="headings",
-            height=14,
+            height=10,
         )
-        self.requests_tree.heading("id", text="ID")
+        self.requests_tree.heading("id",        text="ID")
+        self.requests_tree.heading("type",      text="Type")
         self.requests_tree.heading("requester", text="Requester")
-        self.requests_tree.heading("created", text="Created")
-        self.requests_tree.heading("content", text="Request")
-        self.requests_tree.column("id", width=70, anchor=tk.CENTER, stretch=False)
-        self.requests_tree.column("requester", width=140, anchor=tk.W, stretch=False)
-        self.requests_tree.column("created", width=150, anchor=tk.W, stretch=False)
-        self.requests_tree.column("content", width=420, anchor=tk.W)
+        self.requests_tree.heading("created",   text="Created")
+        self.requests_tree.heading("title",     text="Title / Request")
+        self.requests_tree.heading("status",    text="In Library")
+        self.requests_tree.column("id",        width=50,  anchor=tk.CENTER, stretch=False)
+        self.requests_tree.column("type",      width=70,  anchor=tk.CENTER, stretch=False)
+        self.requests_tree.column("requester", width=130, anchor=tk.W,      stretch=False)
+        self.requests_tree.column("created",   width=140, anchor=tk.W,      stretch=False)
+        self.requests_tree.column("title",     width=360, anchor=tk.W)
+        self.requests_tree.column("status",    width=70,  anchor=tk.CENTER, stretch=False)
         self.requests_tree.grid(row=0, column=0, sticky="nsew")
 
         requests_scroll = ttk.Scrollbar(requests_frame, orient=tk.VERTICAL, command=self.requests_tree.yview)
         requests_scroll.grid(row=0, column=1, sticky="ns")
         self.requests_tree.configure(yscrollcommand=requests_scroll.set)
+
+        detail_frame = ttk.LabelFrame(requests_tab, text="Request Detail", padding=6)
+        detail_frame.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        detail_frame.columnconfigure(0, weight=1)
+
+        self.request_detail_text = scrolledtext.ScrolledText(
+            detail_frame, wrap=tk.WORD, height=5, font=("Consolas", 9), state=tk.DISABLED,
+        )
+        self.request_detail_text.grid(row=0, column=0, sticky="ew")
+        self.requests_tree.bind("<<TreeviewSelect>>", self._on_request_selected)
 
         library_toolbar = ttk.Frame(library_tab)
         library_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
@@ -211,11 +242,7 @@ class DesktopApp:
         ttk.Button(library_toolbar, text="Refresh Summary", command=self.refresh_library_summary).grid(row=0, column=4)
 
         self.library_summary_text = scrolledtext.ScrolledText(
-            library_tab,
-            wrap=tk.WORD,
-            height=7,
-            font=("Consolas", 10),
-            state=tk.DISABLED,
+            library_tab, wrap=tk.WORD, height=7, font=("Consolas", 10), state=tk.DISABLED,
         )
         self.library_summary_text.grid(row=1, column=0, sticky="ew", pady=(0, 8))
 
@@ -225,10 +252,7 @@ class DesktopApp:
         library_results_frame.rowconfigure(0, weight=1)
 
         self.library_results_tree = ttk.Treeview(
-            library_results_frame,
-            columns=("name", "root", "path"),
-            show="headings",
-            height=12,
+            library_results_frame, columns=("name", "root", "path"), show="headings", height=12,
         )
         self.library_results_tree.heading("name", text="Name")
         self.library_results_tree.heading("root", text="Library Root")
@@ -238,11 +262,7 @@ class DesktopApp:
         self.library_results_tree.column("path", width=420, anchor=tk.W)
         self.library_results_tree.grid(row=0, column=0, sticky="nsew")
 
-        library_scroll = ttk.Scrollbar(
-            library_results_frame,
-            orient=tk.VERTICAL,
-            command=self.library_results_tree.yview,
-        )
+        library_scroll = ttk.Scrollbar(library_results_frame, orient=tk.VERTICAL, command=self.library_results_tree.yview)
         library_scroll.grid(row=0, column=1, sticky="ns")
         self.library_results_tree.configure(yscrollcommand=library_scroll.set)
 
@@ -251,24 +271,70 @@ class DesktopApp:
         ttk.Button(metrics_toolbar, text="Refresh Metrics", command=self.refresh_library_metrics).grid(row=0, column=0, sticky="w")
 
         self.metrics_text = scrolledtext.ScrolledText(
-            metrics_tab,
-            wrap=tk.WORD,
-            font=("Consolas", 10),
-            state=tk.DISABLED,
+            metrics_tab, wrap=tk.WORD, font=("Consolas", 10), state=tk.DISABLED,
         )
         self.metrics_text.grid(row=1, column=0, sticky="nsew")
 
+        # -----------------------------------------------------------------
+        # Maintenance tab
+        # -----------------------------------------------------------------
+        maint_toolbar = ttk.Frame(maintenance_tab)
+        maint_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        for col in range(7):
+            maint_toolbar.columnconfigure(col, weight=1)
+
+        ttk.Button(maint_toolbar, text="Daily Check",     command=self._run_daily_check).grid(row=0, column=0, padx=2, sticky="ew")
+        ttk.Button(maint_toolbar, text="Find Duplicates", command=self._run_find_duplicates).grid(row=0, column=1, padx=2, sticky="ew")
+        ttk.Button(maint_toolbar, text="Filename Issues", command=self._run_filename_check).grid(row=0, column=2, padx=2, sticky="ew")
+        ttk.Button(maint_toolbar, text="Sanitize Names",  command=self._run_sanitize).grid(row=0, column=3, padx=2, sticky="ew")
+        ttk.Button(maint_toolbar, text="Missing Episodes",command=self._run_missing_episodes).grid(row=0, column=4, padx=2, sticky="ew")
+        ttk.Button(maint_toolbar, text="Unindexed Files", command=self._run_unindexed).grid(row=0, column=5, padx=2, sticky="ew")
+        ttk.Button(maint_toolbar, text="Apply Selected",  command=self._apply_maint_selection).grid(row=0, column=6, padx=2, sticky="ew")
+
+        ttk.Label(maintenance_tab, textvariable=self._maint_status_var,
+                  font=("Segoe UI", 9, "italic")).grid(row=1, column=0, sticky="w", pady=(0, 4))
+
+        maint_results_frame = ttk.Frame(maintenance_tab)
+        maint_results_frame.grid(row=2, column=0, sticky="nsew")
+        maint_results_frame.columnconfigure(0, weight=1)
+        maint_results_frame.rowconfigure(0, weight=1)
+
+        self._maint_tree = ttk.Treeview(
+            maint_results_frame,
+            columns=("check", "col1", "col2", "col3"),
+            show="headings",
+            height=18,
+        )
+        self._maint_tree.heading("check", text="[/]")
+        self._maint_tree.heading("col1",  text="Item")
+        self._maint_tree.heading("col2",  text="Detail")
+        self._maint_tree.heading("col3",  text="Extra")
+        self._maint_tree.column("check", width=30,  anchor=tk.CENTER, stretch=False)
+        self._maint_tree.column("col1",  width=280, anchor=tk.W)
+        self._maint_tree.column("col2",  width=280, anchor=tk.W)
+        self._maint_tree.column("col3",  width=160, anchor=tk.W, stretch=False)
+        self._maint_tree.grid(row=0, column=0, sticky="nsew")
+
+        maint_scroll = ttk.Scrollbar(maint_results_frame, orient=tk.VERTICAL, command=self._maint_tree.yview)
+        maint_scroll.grid(row=0, column=1, sticky="ns")
+        self._maint_tree.configure(yscrollcommand=maint_scroll.set)
+        self._maint_tree.bind("<ButtonRelease-1>", self._on_maint_tree_click)
+
+        # -----------------------------------------------------------------
+        # Logs tab
+        # -----------------------------------------------------------------
         self.log_text = scrolledtext.ScrolledText(
-            logs_tab,
-            wrap=tk.WORD,
-            font=("Consolas", 10),
-            state=tk.DISABLED,
+            logs_tab, wrap=tk.WORD, font=("Consolas", 10), state=tk.DISABLED,
         )
         self.log_text.grid(row=0, column=0, sticky="nsew")
 
         summary = ttk.Frame(self.root, padding=(16, 0, 16, 16))
         summary.grid(row=3, column=0, sticky="ew")
         ttk.Label(summary, textvariable=self.status_var).grid(row=0, column=0, sticky="w")
+
+    # =====================================================================
+    # Tray icon
+    # =====================================================================
 
     def _build_tray_icon(self) -> Icon:
         image = self._create_tray_image()
@@ -303,6 +369,10 @@ class DesktopApp:
         draw.rounded_rectangle((8, 8, 56, 56), radius=12, fill=(227, 88, 51, 255))
         draw.text((22, 18), "PR", fill=(255, 255, 255, 255))
         return icon
+
+    # =====================================================================
+    # Window management
+    # =====================================================================
 
     def show_window(self) -> None:
         self._post_to_ui(self._show_window)
@@ -346,14 +416,20 @@ class DesktopApp:
             return messagebox.askyesno(title, message)
         return messagebox.askyesno(title, message, parent=parent)
 
-    def refresh_status(self) -> None:
-        self.run_action("Refresh Status", get_status, show_popup=False, update_status_only=True)
+    # =====================================================================
+    # Requests tab
+    # =====================================================================
+
+    _TYPE_LABEL = {
+        "movie": "Movie", "tv": "TV", "anime": "Anime",
+        "xanime": "xAnime", "other": "Other", "unknown": "?",
+    }
 
     def refresh_requests(self) -> None:
         if self.requests_tree is None:
             return
 
-        requests = list_requests(limit=100)
+        requests = list_requests(limit=200)
         selected = self.requests_tree.selection()
         selected_id = None
         if selected:
@@ -366,15 +442,14 @@ class DesktopApp:
 
         for request in requests:
             row_id = str(request.request_id)
+            display_title = request.resolved_title or request.content
+            type_label = self._TYPE_LABEL.get(request.media_type, "?")
+            in_library = "YES" if request.found_in_library else ""
             self.requests_tree.insert(
-                "",
-                "end",
-                iid=row_id,
+                "", "end", iid=row_id,
                 values=(
-                    request.request_id,
-                    request.requester,
-                    request.created_at.replace("T", " "),
-                    request.content,
+                    request.request_id, type_label, request.requester,
+                    request.created_at.replace("T", " "), display_title, in_library,
                 ),
             )
 
@@ -383,114 +458,45 @@ class DesktopApp:
 
         self.queue_var.set(f"Open requests: {open_request_count()}")
 
-    def refresh_library_summary(self) -> None:
-        if self._library_summary_refresh_running:
-            self._library_summary_refresh_pending = True
+    def _on_request_selected(self, _event: Any) -> None:
+        if self.requests_tree is None or self.request_detail_text is None:
             return
 
-        self._library_summary_refresh_running = True
-
-        def worker() -> None:
-            try:
-                summary = format_library_summary_message()
-            except Exception as exc:
-                logger.exception("Library summary refresh failed.")
-                summary = f"Library summary unavailable: {exc}"
-
-            self._post_to_ui(lambda: self._handle_library_summary_result(summary))
-
-        threading.Thread(target=worker, name="ui-library-summary", daemon=True).start()
-
-    def _handle_library_summary_result(self, summary: str) -> None:
-        self._library_summary_refresh_running = False
-        indexed_line = summary.splitlines()[0] if summary else "Library index unavailable"
-        self.library_var.set(indexed_line)
-
-        if self.library_summary_text is not None:
-            self.library_summary_text.configure(state=tk.NORMAL)
-            self.library_summary_text.delete("1.0", tk.END)
-            self.library_summary_text.insert("1.0", summary)
-            self.library_summary_text.configure(state=tk.DISABLED)
-
-        if self._library_summary_refresh_pending and not self._quitting:
-            self._library_summary_refresh_pending = False
-            self.refresh_library_summary()
-
-    def refresh_library_metrics(self) -> None:
-        if self._library_metrics_refresh_running:
-            self._library_metrics_refresh_pending = True
+        selected = self.requests_tree.selection()
+        if not selected:
             return
 
-        self._library_metrics_refresh_running = True
-
-        def worker() -> None:
-            try:
-                metrics = format_combined_metrics_message()
-            except Exception as exc:
-                logger.exception("Library metrics refresh failed.")
-                metrics = f"Metrics unavailable: {exc}"
-
-            self._post_to_ui(lambda: self._handle_library_metrics_result(metrics))
-
-        threading.Thread(target=worker, name="ui-library-metrics", daemon=True).start()
-
-    def _handle_library_metrics_result(self, metrics: str) -> None:
-        self._library_metrics_refresh_running = False
-        if self.metrics_text is not None:
-            self.metrics_text.configure(state=tk.NORMAL)
-            self.metrics_text.delete("1.0", tk.END)
-            self.metrics_text.insert("1.0", metrics)
-            self.metrics_text.configure(state=tk.DISABLED)
-
-        if self._library_metrics_refresh_pending and not self._quitting:
-            self._library_metrics_refresh_pending = False
-            self.refresh_library_metrics()
-
-    def search_library_from_ui(self) -> None:
-        if self.library_results_tree is None:
+        values = self.requests_tree.item(selected[0], "values")
+        if not values:
             return
 
-        query = self.library_search_var.get().strip()
-        if not query:
-            self._show_warning("Missing search", "Enter a title or keyword to search for.")
+        request_id = int(values[0])
+        req = get_request(request_id)
+        if req is None:
             return
 
-        results = search_library(query)
-        for item_id in self.library_results_tree.get_children():
-            self.library_results_tree.delete(item_id)
+        type_label = self._TYPE_LABEL.get(req.media_type, "?")
+        lines = [
+            f"Request #{req.request_id}  |  {type_label} ({req.media_type})  |  {req.created_at}",
+            f"Requester : {req.requester}",
+            f"Raw input : {req.content}",
+        ]
+        if req.resolved_title and req.resolved_title != req.content:
+            lines.append(f"Resolved  : {req.resolved_title}")
+        if req.external_url:
+            lines.append(f"DB Link   : {req.external_url}")
+        if req.found_in_library:
+            lines.append(f"[IN LIBRARY]  Found in library  (last checked: {req.library_checked_at or 'unknown'})")
+        elif req.library_checked_at:
+            lines.append(f"[NOT FOUND]  Not in library yet  (last checked: {req.library_checked_at})")
+        else:
+            lines.append("[PENDING]  Not yet checked against library")
 
-        for index, entry in enumerate(results):
-            self.library_results_tree.insert(
-                "",
-                "end",
-                iid=str(index),
-                values=(entry.name, entry.root_path, entry.path),
-            )
-
-        self.status_var.set(f'Library search for "{query}" returned {len(results)} result(s)')
-        self.last_action_var.set("Last action: library search")
-        if not results:
-            self._show_info("No results", f'No indexed library matches for "{query}".')
-
-    def rebuild_library_index_from_ui(self) -> None:
-        def worker() -> None:
-            try:
-                result = rebuild_library_index()
-                message = format_reindex_result_message(result)
-            except Exception as exc:
-                logger.exception("Library reindex failed.")
-                message = f"Library reindex failed: {exc}"
-
-            self._post_to_ui(lambda: self._handle_library_reindex_result(message))
-
-        threading.Thread(target=worker, name="ui-library-reindex", daemon=True).start()
-
-    def _handle_library_reindex_result(self, message: str) -> None:
-        self.refresh_library_summary()
-        self.refresh_library_metrics()
-        self.status_var.set(message.splitlines()[0] if message else "Library reindex complete")
-        self.last_action_var.set("Last action: library reindex")
-        self._show_info("Library Reindex", message)
+        detail = "\n".join(lines)
+        self.request_detail_text.configure(state=tk.NORMAL)
+        self.request_detail_text.delete("1.0", tk.END)
+        self.request_detail_text.insert("1.0", detail)
+        self.request_detail_text.configure(state=tk.DISABLED)
 
     def add_request_from_ui(self) -> None:
         requester = self.requester_var.get().strip() or "Admin"
@@ -526,6 +532,13 @@ class DesktopApp:
                 f"Request #{request_id} was already completed or no longer exists.",
             )
 
+    # =====================================================================
+    # Plex actions
+    # =====================================================================
+
+    def refresh_status(self) -> None:
+        self.run_action("Refresh Status", get_status, show_popup=False, update_status_only=True)
+
     def confirm_hard_reset(self, from_tray: bool = False) -> None:
         self._post_to_ui(lambda: self._confirm_hard_reset(from_tray))
 
@@ -547,9 +560,7 @@ class DesktopApp:
             try:
                 session = start_plex_pin_login()
                 browser_opened = launch_auth_browser(session)
-                self._post_to_ui(
-                    lambda: self._handle_plex_auth_started(session, browser_opened),
-                )
+                self._post_to_ui(lambda: self._handle_plex_auth_started(session, browser_opened))
                 result = wait_for_plex_token(session)
                 save_plex_credentials(result)
             except TimeoutError:
@@ -559,7 +570,6 @@ class DesktopApp:
                 logger.exception("Plex authorization failed.")
                 self._post_to_ui(lambda: self._handle_plex_auth_failure(str(exc)))
                 return
-
             self._post_to_ui(lambda: self._handle_plex_auth_success(result))
 
         threading.Thread(target=worker, name="ui-plex-auth", daemon=True).start()
@@ -574,19 +584,14 @@ class DesktopApp:
             f"This app will keep polling for up to {session.expires_in} seconds."
         )
         if not browser_opened:
-            message = (
-                "Could not open your browser automatically.\n\n"
-                + message
-            )
+            message = "Could not open your browser automatically.\n\n" + message
         self._show_info("Authorize Plex", message)
 
     def _handle_plex_auth_timeout(self) -> None:
         self.last_action_var.set("Last action: Plex authorization timed out")
         self.status_var.set("Plex authorization timed out")
-        self._show_warning(
-            "Plex Authorization",
-            "The Plex authorization window expired before approval completed. Start the flow again.",
-        )
+        self._show_warning("Plex Authorization",
+            "The Plex authorization window expired before approval completed. Start the flow again.")
 
     def _handle_plex_auth_failure(self, error_message: str) -> None:
         self.last_action_var.set("Last action: Plex authorization failed")
@@ -596,53 +601,30 @@ class DesktopApp:
     def _handle_plex_auth_success(self, result: PlexTokenResult) -> None:
         masked_token = (
             f"{result.auth_token[:6]}...{result.auth_token[-4:]}"
-            if len(result.auth_token) >= 12
-            else result.auth_token
+            if len(result.auth_token) >= 12 else result.auth_token
         )
         self.last_action_var.set("Last action: Plex token saved")
         self.status_var.set("Saved Plex token to .env")
         self.refresh_library_metrics()
-        self._show_info(
-            "Plex Authorization",
+        self._show_info("Plex Authorization",
             "Plex authorization succeeded.\n\n"
             "Saved PLEX_TOKEN and PLEX_CLIENT_IDENTIFIER to .env.\n"
-            f"Token: {masked_token}",
-        )
+            f"Token: {masked_token}")
 
-    def run_action(
-        self,
-        action_name: str,
-        action,
-        *,
-        show_popup: bool = True,
-        update_status_only: bool = False,
-    ) -> None:
+    def run_action(self, action_name: str, action, *, show_popup: bool = True, update_status_only: bool = False) -> None:
         def worker() -> None:
             try:
                 result = action()
             except Exception as exc:
                 logger.exception("%s failed.", action_name)
                 result = f"{action_name} failed: {exc}"
-
-            self._post_to_ui(
-                lambda: self._handle_action_result(
-                    action_name,
-                    result,
-                    show_popup=show_popup,
-                    update_status_only=update_status_only,
-                )
-            )
+            self._post_to_ui(lambda: self._handle_action_result(
+                action_name, result, show_popup=show_popup, update_status_only=update_status_only,
+            ))
 
         threading.Thread(target=worker, name=f"ui-{action_name.lower().replace(' ', '-')}", daemon=True).start()
 
-    def _handle_action_result(
-        self,
-        action_name: str,
-        result: str,
-        *,
-        show_popup: bool,
-        update_status_only: bool,
-    ) -> None:
+    def _handle_action_result(self, action_name: str, result: str, *, show_popup: bool, update_status_only: bool) -> None:
         self.last_action_var.set(f"Last action: {action_name}")
         self.status_var.set(result.splitlines()[0] if result else action_name)
 
@@ -659,11 +641,120 @@ class DesktopApp:
     def _set_status_text(self, content: str) -> None:
         if self.status_text is None:
             return
-
         self.status_text.configure(state=tk.NORMAL)
         self.status_text.delete("1.0", tk.END)
         self.status_text.insert("1.0", content)
         self.status_text.configure(state=tk.DISABLED)
+
+    # =====================================================================
+    # Library tab
+    # =====================================================================
+
+    def refresh_library_summary(self) -> None:
+        if self._library_summary_refresh_running:
+            self._library_summary_refresh_pending = True
+            return
+        self._library_summary_refresh_running = True
+
+        def worker() -> None:
+            try:
+                summary = format_library_summary_message()
+            except Exception as exc:
+                logger.exception("Library summary refresh failed.")
+                summary = f"Library summary unavailable: {exc}"
+            self._post_to_ui(lambda: self._handle_library_summary_result(summary))
+
+        threading.Thread(target=worker, name="ui-library-summary", daemon=True).start()
+
+    def _handle_library_summary_result(self, summary: str) -> None:
+        self._library_summary_refresh_running = False
+        indexed_line = summary.splitlines()[0] if summary else "Library index unavailable"
+        self.library_var.set(indexed_line)
+
+        if self.library_summary_text is not None:
+            self.library_summary_text.configure(state=tk.NORMAL)
+            self.library_summary_text.delete("1.0", tk.END)
+            self.library_summary_text.insert("1.0", summary)
+            self.library_summary_text.configure(state=tk.DISABLED)
+
+        if self._library_summary_refresh_pending and not self._quitting:
+            self._library_summary_refresh_pending = False
+            self.refresh_library_summary()
+
+    def refresh_library_metrics(self) -> None:
+        if self._library_metrics_refresh_running:
+            self._library_metrics_refresh_pending = True
+            return
+        self._library_metrics_refresh_running = True
+
+        def worker() -> None:
+            try:
+                metrics = format_combined_metrics_message()
+            except Exception as exc:
+                logger.exception("Library metrics refresh failed.")
+                metrics = f"Metrics unavailable: {exc}"
+            self._post_to_ui(lambda: self._handle_library_metrics_result(metrics))
+
+        threading.Thread(target=worker, name="ui-library-metrics", daemon=True).start()
+
+    def _handle_library_metrics_result(self, metrics: str) -> None:
+        self._library_metrics_refresh_running = False
+        if self.metrics_text is not None:
+            self.metrics_text.configure(state=tk.NORMAL)
+            self.metrics_text.delete("1.0", tk.END)
+            self.metrics_text.insert("1.0", metrics)
+            self.metrics_text.configure(state=tk.DISABLED)
+
+        if self._library_metrics_refresh_pending and not self._quitting:
+            self._library_metrics_refresh_pending = False
+            self.refresh_library_metrics()
+
+    def search_library_from_ui(self) -> None:
+        if self.library_results_tree is None:
+            return
+
+        query = self.library_search_var.get().strip()
+        if not query:
+            self._show_warning("Missing search", "Enter a title or keyword to search for.")
+            return
+
+        results = search_library(query)
+        for item_id in self.library_results_tree.get_children():
+            self.library_results_tree.delete(item_id)
+
+        for index, entry in enumerate(results):
+            self.library_results_tree.insert(
+                "", "end", iid=str(index),
+                values=(entry.name, entry.root_path, entry.path),
+            )
+
+        self.status_var.set(f'Library search for "{query}" returned {len(results)} result(s)')
+        self.last_action_var.set("Last action: library search")
+        if not results:
+            self._show_info("No results", f'No indexed library matches for "{query}".')
+
+    def rebuild_library_index_from_ui(self) -> None:
+        def worker() -> None:
+            try:
+                result = rebuild_library_index()
+                message = format_reindex_result_message(result)
+            except Exception as exc:
+                logger.exception("Library reindex failed.")
+                message = f"Library reindex failed: {exc}"
+            self._post_to_ui(lambda: self._handle_library_reindex_result(message))
+
+        threading.Thread(target=worker, name="ui-library-reindex", daemon=True).start()
+
+    def _handle_library_reindex_result(self, message: str) -> None:
+        self.refresh_library_summary()
+        self.refresh_library_metrics()
+        self.status_var.set(message.splitlines()[0] if message else "Library reindex complete")
+        self.last_action_var.set("Last action: library reindex")
+        self._show_info("Library Reindex", message)
+
+    # =====================================================================
+    # Scheduled refresh loops
+    # =====================================================================
 
     def _schedule_log_refresh(self) -> None:
         self._refresh_logs()
@@ -673,13 +764,11 @@ class DesktopApp:
     def _schedule_status_refresh(self) -> None:
         if self._quitting:
             return
-
         self.root.after(config.ADMIN_STATUS_REFRESH_SECONDS * 1000, self._status_refresh_tick)
 
     def _status_refresh_tick(self) -> None:
         if self._quitting:
             return
-
         self.refresh_status()
         self.refresh_requests()
         self.refresh_library_summary()
@@ -689,17 +778,356 @@ class DesktopApp:
     def _refresh_logs(self) -> None:
         if self.log_text is None:
             return
-
         logs = get_recent_logs()
         if len(logs) == self._last_log_count:
             return
-
         self._last_log_count = len(logs)
         self.log_text.configure(state=tk.NORMAL)
         self.log_text.delete("1.0", tk.END)
         self.log_text.insert("1.0", "\n".join(logs))
         self.log_text.see(tk.END)
         self.log_text.configure(state=tk.DISABLED)
+
+    # =====================================================================
+    # Maintenance tab — UI helpers
+    # =====================================================================
+
+    def _maint_set_busy(self, label: str) -> None:
+        self._maint_status_var.set(f"Running {label}...")
+        if self._maint_tree is not None:
+            for item in self._maint_tree.get_children():
+                self._maint_tree.delete(item)
+
+    def _populate_maint_tree(
+        self,
+        rows: list[tuple[str, str, str, str]],
+        *,
+        col1: str = "Item",
+        col2: str = "Detail",
+        col3: str = "Extra",
+    ) -> None:
+        if self._maint_tree is None:
+            return
+        self._maint_tree.heading("col1", text=col1)
+        self._maint_tree.heading("col2", text=col2)
+        self._maint_tree.heading("col3", text=col3)
+        for item in self._maint_tree.get_children():
+            self._maint_tree.delete(item)
+        self._maint_check_vars = []
+        for _check, c1, c2, c3 in rows:
+            var = tk.BooleanVar(value=False)
+            self._maint_check_vars.append(var)
+            self._maint_tree.insert("", "end", values=("[ ]", c1, c2, c3))
+
+    def _on_maint_tree_click(self, event: Any) -> None:
+        if self._maint_tree is None:
+            return
+        region = self._maint_tree.identify_region(event.x, event.y)
+        if region != "cell":
+            return
+        col = self._maint_tree.identify_column(event.x)
+        if col != "#1":
+            return
+        row_id = self._maint_tree.identify_row(event.y)
+        if not row_id:
+            return
+        children = list(self._maint_tree.get_children())
+        try:
+            idx = children.index(row_id)
+        except ValueError:
+            return
+        if idx >= len(self._maint_check_vars):
+            return
+        var = self._maint_check_vars[idx]
+        var.set(not var.get())
+        current_vals = list(self._maint_tree.item(row_id, "values"))
+        current_vals[0] = "[X]" if var.get() else "[ ]"
+        self._maint_tree.item(row_id, values=current_vals)
+
+    # =====================================================================
+    # Maintenance tab — daily library check
+    # =====================================================================
+
+    def _run_daily_check(self) -> None:
+        self._maint_set_busy("Daily Library Check")
+
+        def worker() -> None:
+            try:
+                summary = daily_library_check()
+            except Exception as exc:
+                logger.exception("Daily library check failed.")
+                summary = {"checked": 0, "newly_found": 0, "errors": [str(exc)]}
+            self._post_to_ui(lambda: self._handle_daily_check_result(summary))
+
+        threading.Thread(target=worker, name="maint-daily-check", daemon=True).start()
+
+    def _handle_daily_check_result(self, summary: dict) -> None:
+        self._last_library_check_date = datetime.date.today().isoformat()
+        checked = summary.get("checked", 0)
+        newly_found = summary.get("newly_found", 0)
+        errors = summary.get("errors", [])
+
+        status = f"Daily check complete -- {checked} checked, {newly_found} newly found"
+        if errors:
+            status += f", {len(errors)} error(s)"
+        self._maint_status_var.set(status)
+
+        rows: list[tuple[str, str, str, str]] = []
+        if newly_found:
+            rows.append(("", f"{newly_found} request(s) now found in library", "", ""))
+        rows.append(("", f"Scanned {checked} open requests", "", ""))
+        for err in errors:
+            rows.append(("", "Error", err, ""))
+
+        self._maint_tool_name = "daily_check"
+        self._maint_results = []
+        self._populate_maint_tree(rows, col1="Result", col2="Detail", col3="")
+        self.refresh_requests()
+
+    def _schedule_daily_library_check(self) -> None:
+        now = datetime.datetime.now()
+        target_hour = getattr(config, "LIBRARY_CHECK_HOUR", 3)
+        today_str = now.date().isoformat()
+        if self._last_library_check_date != today_str and now.hour >= target_hour:
+            self._run_daily_check()
+        if not self._quitting:
+            self.root.after(60 * 60 * 1000, self._daily_check_tick)
+
+    def _daily_check_tick(self) -> None:
+        if self._quitting:
+            return
+        now = datetime.datetime.now()
+        target_hour = getattr(config, "LIBRARY_CHECK_HOUR", 3)
+        today_str = now.date().isoformat()
+        if self._last_library_check_date != today_str and now.hour >= target_hour:
+            self._run_daily_check()
+        self.root.after(60 * 60 * 1000, self._daily_check_tick)
+
+    # =====================================================================
+    # Maintenance tab — find duplicates
+    # =====================================================================
+
+    def _run_find_duplicates(self) -> None:
+        self._maint_set_busy("Find Duplicates")
+
+        def worker() -> None:
+            try:
+                results = find_duplicates()
+            except Exception as exc:
+                logger.exception("find_duplicates failed.")
+                self._post_to_ui(lambda: self._maint_status_var.set(f"Find duplicates error: {exc}"))
+                return
+            self._post_to_ui(lambda: self._handle_duplicates_result(results))
+
+        threading.Thread(target=worker, name="maint-duplicates", daemon=True).start()
+
+    def _handle_duplicates_result(self, results: list[DuplicateGroup]) -> None:
+        self._maint_tool_name = "find_duplicates"
+        self._maint_results = results
+        if not results:
+            self._maint_status_var.set("No duplicate groups found.")
+            self._populate_maint_tree([], col1="Title", col2="Candidates", col3="Total Size")
+            return
+        total_size = sum(g.total_size_bytes for g in results)
+        self._maint_status_var.set(f"{len(results)} duplicate group(s) -- {self._fmt_bytes(total_size)} total")
+        rows: list[tuple[str, str, str, str]] = []
+        for group in results:
+            for i, candidate in enumerate(group.candidates):
+                indent = "" if i == 0 else "  -> "
+                rows.append(("", indent + group.normalized_title, candidate,
+                              self._fmt_bytes(group.total_size_bytes) if i == 0 else ""))
+        self._populate_maint_tree(rows, col1="Normalized Title", col2="File Path", col3="Group Size")
+
+    # =====================================================================
+    # Maintenance tab — filename check
+    # =====================================================================
+
+    def _run_filename_check(self) -> None:
+        self._maint_set_busy("Filename Check")
+
+        def worker() -> None:
+            try:
+                results = check_filenames_vs_plex()
+            except Exception as exc:
+                logger.exception("check_filenames_vs_plex failed.")
+                self._post_to_ui(lambda: self._maint_status_var.set(f"Filename check error: {exc}"))
+                return
+            self._post_to_ui(lambda: self._handle_filename_check_result(results))
+
+        threading.Thread(target=worker, name="maint-filename-check", daemon=True).start()
+
+    def _handle_filename_check_result(self, results: list[FilenameIssue]) -> None:
+        self._maint_tool_name = "filename_check"
+        self._maint_results = results
+        if not results:
+            self._maint_status_var.set("All filenames match Plex titles.")
+            self._populate_maint_tree([], col1="Disk Name", col2="Expected Name", col3="Plex Title")
+            return
+        self._maint_status_var.set(f"{len(results)} filename mismatch(es) found")
+        rows = [("", issue.disk_name, issue.expected_filename, issue.plex_title) for issue in results]
+        self._populate_maint_tree(rows, col1="Disk Name", col2="Expected Name", col3="Plex Title")
+
+    # =====================================================================
+    # Maintenance tab — sanitize filenames
+    # =====================================================================
+
+    def _run_sanitize(self) -> None:
+        self._maint_set_busy("Sanitize Names (preview)")
+
+        def worker() -> None:
+            try:
+                results = sanitize_all(dry_run=True)
+            except Exception as exc:
+                logger.exception("sanitize_all failed.")
+                self._post_to_ui(lambda: self._maint_status_var.set(f"Sanitize error: {exc}"))
+                return
+            self._post_to_ui(lambda: self._handle_sanitize_result(results))
+
+        threading.Thread(target=worker, name="maint-sanitize", daemon=True).start()
+
+    def _handle_sanitize_result(self, results: list[SanitizePair]) -> None:
+        self._maint_tool_name = "sanitize"
+        self._maint_results = results
+        if not results:
+            self._maint_status_var.set("All filenames are already Plex-friendly.")
+            self._populate_maint_tree([], col1="Original Name", col2="Proposed Name", col3="Size")
+            return
+        self._maint_status_var.set(f"{len(results)} rename(s) proposed -- check boxes then click Apply Selected")
+        rows = [
+            ("", Path(pair.original).name, Path(pair.sanitized).name, self._fmt_bytes(pair.size_bytes))
+            for pair in results
+        ]
+        self._populate_maint_tree(rows, col1="Original Name", col2="Proposed Name", col3="Size")
+
+    # =====================================================================
+    # Maintenance tab — missing episodes
+    # =====================================================================
+
+    def _run_missing_episodes(self) -> None:
+        self._maint_set_busy("Missing Episodes")
+
+        def worker() -> None:
+            try:
+                results = find_missing_episodes()
+            except Exception as exc:
+                logger.exception("find_missing_episodes failed.")
+                self._post_to_ui(lambda: self._maint_status_var.set(f"Missing episodes error: {exc}"))
+                return
+            self._post_to_ui(lambda: self._handle_missing_episodes_result(results))
+
+        threading.Thread(target=worker, name="maint-missing-eps", daemon=True).start()
+
+    def _handle_missing_episodes_result(self, results: list[MissingEpisode]) -> None:
+        self._maint_tool_name = "missing_episodes"
+        self._maint_results = results
+        if not results:
+            self._maint_status_var.set("No missing episodes detected.")
+            self._populate_maint_tree([], col1="Show", col2="Missing Episode", col3="Show Path")
+            return
+        shows = len({r.show_title for r in results})
+        self._maint_status_var.set(f"{len(results)} missing episode slot(s) across {shows} show(s)")
+        rows = [("", ep.show_title, f"S{ep.season:02d}E{ep.episode:02d}", ep.show_path) for ep in results]
+        self._populate_maint_tree(rows, col1="Show", col2="Missing Episode", col3="Show Path")
+
+    # =====================================================================
+    # Maintenance tab — unindexed files
+    # =====================================================================
+
+    def _run_unindexed(self) -> None:
+        self._maint_set_busy("Unindexed Files")
+
+        def worker() -> None:
+            try:
+                results = find_unindexed_files()
+            except Exception as exc:
+                logger.exception("find_unindexed_files failed.")
+                self._post_to_ui(lambda: self._maint_status_var.set(f"Unindexed files error: {exc}"))
+                return
+            self._post_to_ui(lambda: self._handle_unindexed_result(results))
+
+        threading.Thread(target=worker, name="maint-unindexed", daemon=True).start()
+
+    def _handle_unindexed_result(self, results: list[UnindexedFile]) -> None:
+        self._maint_tool_name = "unindexed"
+        self._maint_results = results
+        if not results:
+            self._maint_status_var.set("No unindexed files found -- library index is up to date.")
+            self._populate_maint_tree([], col1="Filename", col2="Full Path", col3="Size")
+            return
+        total = sum(f.size_bytes for f in results)
+        self._maint_status_var.set(f"{len(results)} unindexed file(s) -- {self._fmt_bytes(total)} total")
+        rows = [("", f.name, f.path, self._fmt_bytes(f.size_bytes)) for f in results]
+        self._populate_maint_tree(rows, col1="Filename", col2="Full Path", col3="Size")
+
+    # =====================================================================
+    # Maintenance tab — apply selected (sanitize renames)
+    # =====================================================================
+
+    def _apply_maint_selection(self) -> None:
+        if self._maint_tool_name not in ("sanitize",):
+            self._show_info(
+                "Apply Selection",
+                "The current tool results have no applyable actions.\n\n"
+                "Run 'Sanitize Names' first, check the files you want renamed, "
+                "then click Apply Selected.",
+            )
+            return
+
+        selected_indices = [i for i, var in enumerate(self._maint_check_vars) if var.get()]
+        if not selected_indices:
+            self._show_warning("Nothing selected", "Check at least one row before clicking Apply Selected.")
+            return
+
+        if self._maint_tool_name == "sanitize":
+            pairs = [self._maint_results[i] for i in selected_indices if i < len(self._maint_results)]
+            if not pairs:
+                return
+            names_preview = "\n".join(
+                f"  {Path(p.original).name}  ->  {Path(p.sanitized).name}" for p in pairs[:10]
+            )
+            if len(pairs) > 10:
+                names_preview += f"\n  ... and {len(pairs) - 10} more"
+            confirmed = self._ask_yes_no(
+                "Confirm Rename",
+                f"About to rename {len(pairs)} file(s):\n\n{names_preview}\n\nThis cannot be undone. Continue?",
+            )
+            if not confirmed:
+                return
+            self._maint_status_var.set(f"Renaming {len(pairs)} file(s)...")
+
+            def worker() -> None:
+                errors = apply_sanitization(pairs)
+                self._post_to_ui(lambda: self._handle_apply_sanitize_result(len(pairs), errors))
+
+            threading.Thread(target=worker, name="maint-apply-sanitize", daemon=True).start()
+
+    def _handle_apply_sanitize_result(self, attempted: int, errors: list[str]) -> None:
+        success = attempted - len(errors)
+        if errors:
+            self._maint_status_var.set(f"Renamed {success}/{attempted} file(s) -- {len(errors)} error(s)")
+            self._show_warning("Rename Results",
+                f"Renamed {success} of {attempted} file(s).\n\nErrors:\n" + "\n".join(errors[:10]))
+        else:
+            self._maint_status_var.set(f"{success} file(s) renamed successfully.")
+            self._show_info("Rename Complete", f"Successfully renamed {success} file(s).")
+        self._run_sanitize()
+
+    # =====================================================================
+    # Utilities
+    # =====================================================================
+
+    @staticmethod
+    def _fmt_bytes(n: int) -> str:
+        value: float = float(n)
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if abs(value) < 1024:
+                return f"{value:.1f} {unit}"
+            value /= 1024
+        return f"{value:.1f} PB"
+
+    # =====================================================================
+    # Shutdown
+    # =====================================================================
 
     def request_exit(self) -> None:
         if self._quitting:
@@ -712,19 +1140,16 @@ class DesktopApp:
     def _shutdown(self, *, bot_timeout: float = 20.0) -> None:
         if self._quitting:
             return
-
         self._quitting = True
         logger.info("Shutting down desktop app.")
         try:
             self._tray_icon.stop()
         except Exception:
             logger.exception("Failed to stop tray icon cleanly.")
-
         try:
             self.bot_service.stop(timeout=bot_timeout)
         except Exception:
             logger.exception("Failed to stop Telegram bot service cleanly.")
-
         try:
             self.root.destroy()
         except tk.TclError:

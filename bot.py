@@ -24,7 +24,7 @@ from library_index import (format_library_summary_message,
                            format_search_results_message, rebuild_library_index)
 from metrics_report import format_combined_metrics_message
 from plex_control import control_busy, get_status, hard_reset, launch_plex, soft_reset
-from queue_store import add_request, format_requests_message
+from queue_store import add_request, format_requests_message, format_requests_message_user
 
 logger = logging.getLogger(__name__)
 
@@ -97,12 +97,14 @@ async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def requests_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the current request queue (user-facing: no requester names)."""
     if update.message is None:
         return
     loop = asyncio.get_running_loop()
-    requests_text = await loop.run_in_executor(None, format_requests_message)
+    # format_requests_message_user omits requester names for privacy
+    requests_text = await loop.run_in_executor(None, format_requests_message_user)
     await update.message.reply_text(
-        requests_text + "\n\nAdd one with: /request <what you want>"
+        requests_text + "\n\nTap 📝 Requests to add one."
     )
 
 
@@ -246,13 +248,8 @@ async def cmd_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         status_text = await loop.run_in_executor(None, get_status)
         await context.bot.send_message(chat_id=chat_id, text=status_text)
 
-    elif query.data == "cmd_requests":
-        loop = asyncio.get_running_loop()
-        requests_text = await loop.run_in_executor(None, format_requests_message)
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=requests_text + "\n\nAdd one with: /request <what you want>",
-        )
+    # NOTE: "cmd_requests" is handled by REQUEST_CONV_HANDLER in request_flow.py
+    # (the ConversationHandler is registered before this wildcard handler).
 
     elif query.data == "cmd_libraries":
         loop = asyncio.get_running_loop()

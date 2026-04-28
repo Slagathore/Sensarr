@@ -11,6 +11,7 @@ from bot import (cmd_button_handler, hardreset_confirm_handler,
                  metrics_handler, reindex_handler, request_handler, requests_handler,
                  reset_handler, search_handler, start_handler,
                  status_handler)
+from request_flow import REQUEST_CONV_HANDLER
 
 logger = logging.getLogger(__name__)
 
@@ -18,12 +19,19 @@ logger = logging.getLogger(__name__)
 def build_application() -> Application:
     app = ApplicationBuilder().token(config.TELEGRAM_BOT_TOKEN).build()
 
+    # -----------------------------------------------------------------------
+    # IMPORTANT: ConversationHandler must be registered BEFORE the wildcard
+    # CallbackQueryHandler(cmd_button_handler, pattern="^cmd_") so that
+    # "cmd_requests" is captured by the conversation flow first.
+    # -----------------------------------------------------------------------
+    app.add_handler(REQUEST_CONV_HANDLER)
+
     app.add_handler(CommandHandler("start", start_handler))
     app.add_handler(CommandHandler("launch", launch_handler))
     app.add_handler(CommandHandler("libraries", libraries_handler))
     app.add_handler(CommandHandler("metrics", metrics_handler))
-    app.add_handler(CommandHandler("request", request_handler))
-    app.add_handler(CommandHandler("requests", requests_handler))
+    app.add_handler(CommandHandler("request", request_handler))   # legacy free-text add
+    app.add_handler(CommandHandler("requests", requests_handler)) # shows queue (no names)
     app.add_handler(CommandHandler("search", search_handler))
     app.add_handler(CommandHandler("reindex", reindex_handler))
     app.add_handler(CommandHandler("reset", reset_handler))

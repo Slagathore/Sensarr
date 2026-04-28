@@ -30,3 +30,10 @@ opencv-python==4.13.0.92
 
 # Required by opencv-python; keep in sync with the opencv build
 numpy>=1.26.0,<3.0.0
+
+# Ollama Python client — used for fuzzy title matching and 'Other' request categorization
+# Talks to your locally running Ollama instance (ollama.com)
+ollama>=0.4.0
+
+# Fuzzy string matching — fallback for title similarity when Ollama is unavailable
+rapidfuzz>=3.0.0
