@@ -4,6 +4,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
+from typing import TypedDict, cast
 
 import psutil
 import pyautogui
@@ -36,9 +37,24 @@ _KNOWN_PLEX_PROCESS_NAMES = {
 }
 
 
+class _ProcessInfo(TypedDict, total=False):
+    pid: int
+    name: str | None
+    exe: str | None
+    cmdline: list[str]
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _proc_info(proc: psutil.Process) -> _ProcessInfo:
+    """Return cached process_iter metadata when available."""
+    info = getattr(proc, "info", None)
+    if isinstance(info, dict):
+        return cast(_ProcessInfo, info)
+    return {}
+
 
 def _is_plex_gone() -> bool:
     """Returns True when no real Plex server processes are running."""
@@ -53,6 +69,8 @@ def _is_plex_gone() -> bool:
 
 def _is_plex_process(proc: psutil.Process) -> bool:
     """Best-effort match for Plex Media Server processes on Windows."""
+    info = _proc_info(proc)
+
     try:
         if proc.pid == _CURRENT_PID:
             return False
@@ -60,7 +78,7 @@ def _is_plex_process(proc: psutil.Process) -> bool:
         return False
 
     try:
-        name = (proc.info.get("name") or "").lower()
+        name = (info.get("name") or "").lower()
     except (psutil.NoSuchProcess, psutil.AccessDenied):
         name = ""
 
@@ -68,7 +86,7 @@ def _is_plex_process(proc: psutil.Process) -> bool:
         return True
 
     try:
-        exe_value = proc.info.get("exe")
+        exe_value = info.get("exe")
     except (psutil.NoSuchProcess, psutil.AccessDenied):
         exe_value = None
 
@@ -147,13 +165,14 @@ def _list_primary_plex_server_pids() -> set[int]:
         configured_resolved = None
 
     for proc in psutil.process_iter(["pid", "name", "exe"]):
+        info = _proc_info(proc)
         try:
-            name = (proc.info.get("name") or "").lower()
+            name = (info.get("name") or "").lower()
             if name == "plex media server.exe":
                 pids.add(proc.pid)
                 continue
 
-            exe_value = proc.info.get("exe")
+            exe_value = info.get("exe")
             if not exe_value or configured_resolved is None:
                 continue
 
@@ -179,8 +198,9 @@ def _kill_plex_processes() -> tuple[list[str], list[str]]:
         return killed, failed
 
     for proc in processes:
+        info = _proc_info(proc)
         try:
-            name = proc.info.get("name") or f"PID {proc.pid}"
+            name = info.get("name") or f"PID {proc.pid}"
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             name = f"PID {proc.pid}"
 
@@ -202,9 +222,10 @@ def _lingering_plex_processes() -> list[str]:
     """Return names of all currently-running processes that contain 'plex'."""
     names: list[str] = []
     for proc in psutil.process_iter(["pid", "name", "exe", "cmdline"]):
+        info = _proc_info(proc)
         try:
             if _is_plex_process(proc):
-                name = proc.info.get("name") or f"PID {proc.pid}"
+                name = info.get("name") or f"PID {proc.pid}"
                 names.append(f"{name} [{proc.pid}]")
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
@@ -521,9 +542,11 @@ def get_status() -> str:
     # --- process check ---
     plex_procs: list[str] = []
     for proc in psutil.process_iter(["pid", "name", "exe", "cmdline"]):
+        info = _proc_info(proc)
         try:
             if _is_plex_process(proc):
-                plex_procs.append(f"{proc.info['name']} [{proc.info['pid']}]")
+                proc_name = info.get("name") or f"PID {proc.pid}"
+                plex_procs.append(f"{proc_name} [{proc.pid}]")
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
 

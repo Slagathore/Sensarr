@@ -616,6 +616,53 @@ def search_anidb(title: str) -> list[MediaResult]:
 # Library check — avoids false positives from episode filenames
 # ---------------------------------------------------------------------------
 
+_EP_PATTERNS = [
+    re.compile(r"\s*[-–]\s*S\d{2}E\d{2}\b.*", re.IGNORECASE),
+    re.compile(r"\s*[-–]\s*\d+x\d+\b.*", re.IGNORECASE),
+    re.compile(r"\s*\(\d{4}\).*"),
+    re.compile(r"\s*\.\w{2,4}$"),
+]
+
+_FUZZY_LIBRARY_THRESHOLD = 0.75
+
+
+def _clean_library_name(name: str) -> str:
+    """Strip episode notation / extensions from a library filename."""
+    result = name
+    for pat in _EP_PATTERNS:
+        result = pat.sub("", result)
+    return result.strip().casefold()
+
+
+def _word_fallback_search(title: str) -> list:
+    """
+    When a full-title search finds nothing (e.g. due to a typo), search
+    the library for each meaningful word individually and return the union.
+    Words shorter than 4 chars are skipped; if none qualify, all words are used.
+    """
+    try:
+        from library_index import search_library
+    except ImportError:
+        return []
+
+    words = [w for w in title.casefold().split() if len(w) >= 4]
+    if not words:
+        words = title.casefold().split()
+
+    seen_paths: set[str] = set()
+    all_results = []
+    for word in words:
+        try:
+            for entry in search_library(word, limit=10):
+                if entry.path not in seen_paths:
+                    seen_paths.add(entry.path)
+                    all_results.append(entry)
+        except Exception:
+            pass
+
+    return all_results
+
+
 def check_library_for_title(title: str, media_type: str) -> tuple[bool, list[str]]:
     """
     Check whether a title exists in the configured Plex library (or file index).
@@ -623,10 +670,10 @@ def check_library_for_title(title: str, media_type: str) -> tuple[bool, list[str
     Returns:
         (found: bool, matched_display_titles: list[str])
 
-    False-positive guard: episode-level filenames like
-        "Breaking Bad - S01E01 - Pilot.mkv"
-    are stripped to their show name before comparison, so a request for
-    "Breaking Bad" won't get a match on a random episode name.
+    Fuzzy matching: a misspelled title like "get hin to the greek" will still
+    match "Get Him to the Greek" via rapidfuzz WRatio (threshold 0.75).
+    If the full-title search returns no candidates at all, a word-by-word
+    fallback search is run so that correctly-spelled words still locate the entry.
     """
     try:
         from library_index import search_library
@@ -635,31 +682,30 @@ def check_library_for_title(title: str, media_type: str) -> tuple[bool, list[str
         logger.warning("Library search failed for '%s': %s", title, exc)
         return False, []
 
+    # If the full-title query found nothing, try word-by-word so a single typo
+    # doesn't silently eliminate all candidates.
+    if not results:
+        results = _word_fallback_search(title)
+
     if not results:
         return False, []
 
     title_lower = title.casefold()
 
-    # Strip common episode notation from filenames to recover the show/movie name
-    _ep_patterns = [
-        re.compile(r"\s*[-–]\s*S\d{2}E\d{2}\b.*", re.IGNORECASE),
-        re.compile(r"\s*[-–]\s*\d+x\d+\b.*", re.IGNORECASE),
-        re.compile(r"\s*\(\d{4}\).*"),
-        re.compile(r"\s*\.\w{2,4}$"),   # strip extension if any slipped through
-    ]
-
     matched: list[str] = []
     for entry in results:
-        cleaned = entry.name
-        for pat in _ep_patterns:
-            cleaned = pat.sub("", cleaned)
-        cleaned = cleaned.strip().casefold()
-
-        # Accept the match if the titles overlap substantially
+        cleaned = _clean_library_name(entry.name)
         if not cleaned:
             continue
+
+        # Fuzzy match: tolerates typos and minor spelling errors.
+        sim = title_similarity(title_lower, cleaned)
+        if sim >= _FUZZY_LIBRARY_THRESHOLD:
+            matched.append(entry.name)
+            continue
+
+        # Exact substring fallback for very short titles (e.g. "It", "Us").
         if title_lower in cleaned or cleaned in title_lower:
-            # Minimum length guard: short words like "It" could cause false positives
             if len(title_lower) >= 4 or title_lower == cleaned:
                 matched.append(entry.name)
 
