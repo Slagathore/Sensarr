@@ -73,6 +73,7 @@ class LookupResult:
     library_matches: list[str]      # matched titles already in Plex
     external_matches: list[MediaResult]
     best_match: MediaResult | None
+    search_attempted: bool = False  # False when no API key is configured for this type
 
 
 # ---------------------------------------------------------------------------
@@ -626,7 +627,7 @@ _EP_PATTERNS = [
 _FUZZY_LIBRARY_THRESHOLD = 0.75
 
 
-def _clean_library_name(name: str) -> str:
+def clean_library_name(name: str) -> str:
     """Strip episode notation / extensions from a library filename."""
     result = name
     for pat in _EP_PATTERNS:
@@ -694,7 +695,7 @@ def check_library_for_title(title: str, media_type: str) -> tuple[bool, list[str
 
     matched: list[str] = []
     for entry in results:
-        cleaned = _clean_library_name(entry.name)
+        cleaned = clean_library_name(entry.name)
         if not cleaned:
             continue
 
@@ -758,22 +759,28 @@ def lookup_media(request: ParsedRequest, media_type: str) -> LookupResult:
     in_library, library_matches = check_library_for_title(request.title, media_type)
 
     external_matches: list[MediaResult] = []
+    search_attempted = False
 
     if not in_library:
         if media_type == "movie":
+            if _tmdb_enabled():
+                search_attempted = True
             external_matches = search_tmdb_movies(request.title, request.year)
 
         elif media_type == "tv":
             # TVDB is primary for shows; TMDB is the fallback
+            if config.TVDB_API_KEY or _tmdb_enabled():
+                search_attempted = True
             external_matches = search_tvdb_shows(request.title, request.year)
             if not external_matches:
                 external_matches = search_tmdb_shows(request.title, request.year)
 
         elif media_type == "anime":
+            search_attempted = True  # Jikan requires no API key
             external_matches = search_jikan_anime(request.title, explicit=False)
 
         elif media_type == "xanime":
-            # AniDB first (better explicit coverage), Jikan rx as fallback
+            search_attempted = True  # AniDB + Jikan require no API key
             external_matches = search_anidb(request.title)
             if not external_matches:
                 external_matches = search_jikan_anime(request.title, explicit=True)
@@ -798,4 +805,5 @@ def lookup_media(request: ParsedRequest, media_type: str) -> LookupResult:
         library_matches=library_matches,
         external_matches=external_matches,
         best_match=best,
+        search_attempted=search_attempted,
     )

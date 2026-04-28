@@ -23,6 +23,7 @@
 
 import asyncio
 import logging
+import re
 from typing import Any, cast
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
@@ -37,7 +38,12 @@ from telegram.ext import (
 
 import config
 from llm_service import categorize_other_request, fuzzy_correct_title, llm_available
-from media_lookup import LookupResult, ParsedRequest, lookup_media, parse_request_list, title_similarity
+from media_lookup import (
+    LookupResult, MediaResult, ParsedRequest,
+    clean_library_name, lookup_media, parse_request_list, title_similarity,
+    search_tmdb_movies, search_tmdb_shows, search_tvdb_shows,
+    search_jikan_anime, search_anidb,
+)
 from queue_store import add_request, format_requests_message_user
 
 logger = logging.getLogger(__name__)
@@ -49,10 +55,14 @@ logger = logging.getLogger(__name__)
 SELECT_TYPE = 0
 AWAITING_CONTENT = 1
 CONFIRMING = 2
+CORRECTING = 3
 
 # user_data keys
-_UD_MEDIA_TYPE = "req_media_type"       # str: "movie" | "tv" | "anime" | "xanime"
-_UD_RESULTS = "req_lookup_results"      # list[LookupResult]
+_UD_MEDIA_TYPE = "req_media_type"           # str: "movie" | "tv" | "anime" | "xanime"
+_UD_RESULTS = "req_lookup_results"          # list[LookupResult]
+_UD_CORRECTING_IDX = "req_correcting_idx"   # int: 0-based index of item being corrected
+_UD_CORRECTION_OPTS = "req_correction_opts" # list[MediaResult]: candidates for correction
+_UD_CORRECTION_QUEUE = "req_correction_queue"  # list[int]: 0-based indices still to fix
 
 # ---------------------------------------------------------------------------
 # Static keyboards
@@ -165,79 +175,116 @@ def _build_results_message(
     media_type: str,
 ) -> str:
     """
-    Build the HTML confirmation message that shows the user what was found.
+    Build the numbered HTML confirmation message.
+
+    Items are numbered 1–N in their original request order and that numbering
+    is preserved across all sections so users can reference them by number
+    (e.g. "9 is wrong").
 
     Sections:
-        ✅ Already in your library
-        🔍 Not in library — found online  (hyperlinks to DB)
-        ⚠️  Uncertain match — please verify
-        ❌ Not found anywhere
+        ✅  Already in your library
+        ⚠️  In library but qualifier noted (e.g. [english dub])
+        🔍  Not in library — found online
+        ❓  Uncertain match — please verify
+        ❌  Not found in any database
+        ⚙️  External search unavailable (API key not configured)
     """
-    in_library: list[LookupResult] = []
-    found_online: list[LookupResult] = []
-    uncertain: list[LookupResult] = []
-    not_found: list[LookupResult] = []
+    # Bucket each result WITH its 1-based display number
+    in_lib:        list[tuple[int, LookupResult]] = []
+    in_lib_qual:   list[tuple[int, LookupResult]] = []
+    found_online:  list[tuple[int, LookupResult]] = []
+    uncertain:     list[tuple[int, LookupResult]] = []
+    nf_searched:   list[tuple[int, LookupResult]] = []
+    nf_no_key:     list[tuple[int, LookupResult]] = []
 
-    for lr in results:
+    for num, lr in enumerate(results, start=1):
         if lr.in_library:
-            in_library.append(lr)
+            if lr.request.qualifier:
+                in_lib_qual.append((num, lr))
+            else:
+                in_lib.append((num, lr))
         elif lr.best_match is not None:
             sim = title_similarity(lr.request.title, lr.best_match.title)
             if sim >= 0.55:
-                found_online.append(lr)
+                found_online.append((num, lr))
             else:
-                uncertain.append(lr)
+                uncertain.append((num, lr))
         else:
-            not_found.append(lr)
+            if lr.search_attempted:
+                nf_searched.append((num, lr))
+            else:
+                nf_no_key.append((num, lr))
 
     lines: list[str] = []
     label = _MEDIA_TYPE_LABEL.get(media_type, "request")
     emoji = _MEDIA_TYPE_EMOJI.get(media_type, "📝")
     lines.append(f"{emoji} <b>Here's what I found for your {label} request(s):</b>\n")
 
-    if in_library:
+    if in_lib:
         lines.append("✅ <b>Already in your library:</b>")
-        for lr in in_library:
-            display = lr.library_matches[0] if lr.library_matches else lr.request.display()
-            lines.append(f"  • <i>{display}</i>")
+        for num, lr in in_lib:
+            raw = lr.library_matches[0] if lr.library_matches else ""
+            display = clean_library_name(raw) if raw else lr.request.display()
+            lines.append(f"  <b>{num}.</b> <i>{display}</i>")
+        lines.append("")
+
+    if in_lib_qual:
+        lines.append("⚠️ <b>In library — but you added a note (please verify):</b>")
+        for num, lr in in_lib_qual:
+            raw = lr.library_matches[0] if lr.library_matches else ""
+            display = clean_library_name(raw) if raw else lr.request.display()
+            lines.append(
+                f"  <b>{num}.</b> <i>{display}</i>"
+                f" — you asked for <code>[{lr.request.qualifier}]</code>"
+            )
         lines.append("")
 
     if found_online:
         lines.append("🔍 <b>Not in library — found online:</b>")
-        for lr in found_online:
+        for num, lr in found_online:
             m = lr.best_match
             assert m is not None
             year_str = f" ({m.year})" if m.year else ""
             qualifier_str = f" [{m.qualifier}]" if m.qualifier else ""
-            if m.external_url:
-                title_link = f'<a href="{m.external_url}">{m.title}</a>'
-            else:
-                title_link = f"<b>{m.title}</b>"
-            lines.append(f"  • {title_link}{qualifier_str}{year_str}  <i>[{m.source.upper()}]</i>")
+            title_link = f'<a href="{m.external_url}">{m.title}</a>' if m.external_url else f"<b>{m.title}</b>"
+            lines.append(f"  <b>{num}.</b> {title_link}{qualifier_str}{year_str}  <i>[{m.source.upper()}]</i>")
         lines.append("")
 
     if uncertain:
-        lines.append("⚠️ <b>Uncertain match — please verify:</b>")
-        for lr in uncertain:
+        lines.append("❓ <b>Uncertain match — please verify:</b>")
+        for num, lr in uncertain:
             m = lr.best_match
             assert m is not None
-            if m.external_url:
-                title_link = f'<a href="{m.external_url}">{m.title}</a>'
-            else:
-                title_link = f"<b>{m.title}</b>"
+            title_link = f'<a href="{m.external_url}">{m.title}</a>' if m.external_url else f"<b>{m.title}</b>"
             lines.append(
-                f'  • You asked for "<i>{lr.request.display()}</i>" '
-                f"→ found {title_link} — correct?"
+                f'  <b>{num}.</b> You asked for "<i>{lr.request.display()}</i>"'
+                f" → found {title_link}"
             )
         lines.append("")
 
-    if not_found:
-        lines.append("❌ <b>Not found anywhere:</b>")
-        for lr in not_found:
-            lines.append(f"  • {lr.request.display()}")
+    if nf_searched:
+        lines.append("❌ <b>Not found in any database:</b>")
+        for num, lr in nf_searched:
+            lines.append(f"  <b>{num}.</b> {lr.request.display()}")
         lines.append("")
 
-    # Summary note
+    if nf_no_key:
+        lines.append("⚙️ <b>External search unavailable (API key not configured):</b>")
+        for num, lr in nf_no_key:
+            lines.append(f"  <b>{num}.</b> {lr.request.display()}")
+        lines.append(
+            "<i>Ask your admin to add TMDB_API_KEY / TVDB_API_KEY to the .env file.</i>"
+        )
+        lines.append("")
+
+    # Correction hint — shown whenever there's anything that could need fixing
+    fixable = found_online + uncertain + nf_searched + in_lib_qual
+    if fixable:
+        lines.append(
+            "💡 <i>If a match looks wrong, type its number followed by \"is wrong\" "
+            "(e.g. <code>9 is wrong</code>) to search again.</i>\n"
+        )
+
     submittable = [lr for lr in results if not lr.in_library]
     if submittable:
         lines.append(
@@ -486,6 +533,210 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # ---------------------------------------------------------------------------
+# Correction flow helpers
+# ---------------------------------------------------------------------------
+
+_WRONG_KEYWORDS = frozenset({
+    "wrong", "fix", "incorrect", "bad", "off", "redo", "retry", "recheck", "not right",
+})
+
+
+def _parse_wrong_numbers(text: str) -> list[int]:
+    """
+    Extract item numbers from messages like '9 is wrong', 'fix 9 and 11'.
+    Returns an empty list if no correction keyword is found.
+    """
+    lower = text.lower()
+    if not any(kw in lower for kw in _WRONG_KEYWORDS):
+        return []
+    return [int(m.group()) for m in re.finditer(r"\b(\d+)\b", lower) if int(m.group()) >= 1]
+
+
+def _run_external_search(request: ParsedRequest, media_type: str) -> list[MediaResult]:
+    """Force an external DB search regardless of library state. Blocking — run in executor."""
+    if media_type == "movie":
+        return search_tmdb_movies(request.title, request.year)
+    if media_type == "tv":
+        results = search_tvdb_shows(request.title, request.year)
+        return results or search_tmdb_shows(request.title, request.year)
+    if media_type == "anime":
+        return search_jikan_anime(request.title, explicit=False)
+    if media_type == "xanime":
+        return search_anidb(request.title) or search_jikan_anime(request.title, explicit=True)
+    return []
+
+
+# ---------------------------------------------------------------------------
+# CONFIRMING state — text handler for "X is wrong" / "9 and 11 are wrong"
+# ---------------------------------------------------------------------------
+
+async def _search_and_show_candidates(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    item_num: int,          # 1-based display number
+    results: list[LookupResult],
+    media_type: str,
+) -> bool:
+    """
+    Run external search for item_num, store candidates, send the pick prompt.
+    Returns True if candidates were found (caller should go to CORRECTING),
+    False if nothing was found (caller should stay in CONFIRMING).
+    """
+    assert context.user_data is not None
+    lr = results[item_num - 1]
+
+    await update.message.reply_html(  # type: ignore[union-attr]
+        f"🔄 Re-searching for item <b>{item_num}</b>: <i>{lr.request.display()}</i>…"
+    )
+    await update.message.chat.send_action("typing")  # type: ignore[union-attr]
+
+    loop = asyncio.get_running_loop()
+    candidates: list[MediaResult] = await loop.run_in_executor(
+        None,
+        lambda: _run_external_search(lr.request, media_type),
+    )
+
+    if not candidates:
+        await update.message.reply_text(  # type: ignore[union-attr]
+            f"Couldn't find any results for '{lr.request.display()}'. "
+            "Check the spelling and try again, or submit as-is."
+        )
+        return False
+
+    context.user_data[_UD_CORRECTING_IDX] = item_num - 1
+    context.user_data[_UD_CORRECTION_OPTS] = candidates
+
+    lines = [f"🔍 Top results for <b>{lr.request.display()}</b>:\n"]
+    for i, m in enumerate(candidates[:5], start=1):
+        year_str = f" ({m.year})" if m.year else ""
+        title_link = f'<a href="{m.external_url}">{m.title}</a>' if m.external_url else f"<b>{m.title}</b>"
+        snippet = f" — <i>{m.overview[:80]}…</i>" if m.overview else ""
+        lines.append(f"  <b>{i}.</b> {title_link}{year_str}{snippet}")
+    lines.append("\nReply with a number (1–5) to select, or <code>0</code> to leave as-is.")
+
+    await update.message.reply_html("\n".join(lines))  # type: ignore[union-attr]
+    return True
+
+
+async def handle_correction_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """User typed something like '9 is wrong' or '9 and 11 are wrong'."""
+    if update.message is None or update.message.text is None:
+        return CONFIRMING
+
+    assert context.user_data is not None
+    results: list[LookupResult] = context.user_data.get(_UD_RESULTS, [])
+    media_type: str = context.user_data.get(_UD_MEDIA_TYPE, "other")
+
+    wrong_numbers = _parse_wrong_numbers(update.message.text)
+    if not wrong_numbers:
+        await update.message.reply_text(
+            "Tap Submit Requests or Start Over, or type '<number> is wrong' "
+            "to fix a specific item (e.g. '9 is wrong')."
+        )
+        return CONFIRMING
+
+    # Validate and deduplicate, preserving order
+    valid: list[int] = []
+    for n in wrong_numbers:
+        if n < 1 or n > len(results):
+            await update.message.reply_text(
+                f"Item {n} doesn't exist — there are {len(results)} items."
+            )
+        elif n not in valid:
+            valid.append(n)
+
+    if not valid:
+        return CONFIRMING
+
+    # Store the remainder of the queue (everything after the first item)
+    context.user_data[_UD_CORRECTION_QUEUE] = valid[1:]
+
+    found = await _search_and_show_candidates(update, context, valid[0], results, media_type)
+    return CORRECTING if found else CONFIRMING
+
+
+# ---------------------------------------------------------------------------
+# CORRECTING state — user picks a candidate, then moves to next in queue
+# ---------------------------------------------------------------------------
+
+async def handle_correction_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """User replied with a number to pick a correction candidate."""
+    if update.message is None or update.message.text is None:
+        return CORRECTING
+
+    assert context.user_data is not None
+    results: list[LookupResult] = context.user_data.get(_UD_RESULTS, [])
+    correcting_idx: int = context.user_data.get(_UD_CORRECTING_IDX, -1)
+    candidates: list[MediaResult] = context.user_data.get(_UD_CORRECTION_OPTS, [])
+    queue: list[int] = context.user_data.get(_UD_CORRECTION_QUEUE, [])
+    media_type: str = context.user_data.get(_UD_MEDIA_TYPE, "other")
+
+    text = update.message.text.strip().lower()
+
+    try:
+        pick = int(text)
+    except ValueError:
+        await update.message.reply_text(
+            f"Please reply with a number (1–{min(5, len(candidates))}) to pick a result, "
+            "or 0 to leave this item as-is."
+        )
+        return CORRECTING
+
+    if pick == 0 or text in {"skip", "none"}:
+        pass  # leave item unchanged
+    elif 1 <= pick <= len(candidates):
+        chosen = candidates[pick - 1]
+        lr = results[correcting_idx]
+        if lr.request.qualifier:
+            chosen = MediaResult(
+                title=chosen.title, year=chosen.year,
+                external_id=chosen.external_id, external_url=chosen.external_url,
+                media_type=chosen.media_type, overview=chosen.overview,
+                source=chosen.source, qualifier=lr.request.qualifier,
+            )
+        results[correcting_idx] = LookupResult(
+            request=lr.request, in_library=False, library_matches=[],
+            external_matches=candidates, best_match=chosen, search_attempted=True,
+        )
+        context.user_data[_UD_RESULTS] = results
+    else:
+        await update.message.reply_text(
+            f"Please choose between 1 and {min(5, len(candidates))}, or 0 to skip."
+        )
+        return CORRECTING
+
+    context.user_data.pop(_UD_CORRECTING_IDX, None)
+    context.user_data.pop(_UD_CORRECTION_OPTS, None)
+
+    # If there are more items queued, move straight to the next one
+    if queue:
+        next_num = queue[0]
+        context.user_data[_UD_CORRECTION_QUEUE] = queue[1:]
+        found = await _search_and_show_candidates(update, context, next_num, results, media_type)
+        return CORRECTING if found else await _finish_corrections(update, context, results, media_type)
+
+    return await _finish_corrections(update, context, results, media_type)
+
+
+async def _finish_corrections(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    results: list[LookupResult],
+    media_type: str,
+) -> int:
+    """Clear correction state and redisplay the full confirmation."""
+    assert context.user_data is not None
+    context.user_data.pop(_UD_CORRECTION_QUEUE, None)
+    results_msg = _build_results_message(results, media_type)
+    keyboard = _CONFIRM_KEYBOARD if _has_submittable(results) else InlineKeyboardMarkup([[
+        InlineKeyboardButton("✏️ Make another request", callback_data="req_confirm_restart"),
+        InlineKeyboardButton("❌ Done", callback_data="req_cancel"),
+    ]])
+    await update.message.reply_html(results_msg, reply_markup=keyboard)  # type: ignore[union-attr]
+    return CONFIRMING
+
+
+# ---------------------------------------------------------------------------
 # Cancel / fallback
 # ---------------------------------------------------------------------------
 
@@ -522,6 +773,14 @@ REQUEST_CONV_HANDLER = ConversationHandler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, handle_content_input),
         ],
         CONFIRMING: [
+            CallbackQueryHandler(handle_confirmation, pattern=r"^req_confirm_"),
+            CallbackQueryHandler(cancel_request_flow, pattern=r"^req_cancel$"),
+            # Text in CONFIRMING means the user is requesting a correction ("9 is wrong")
+            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_correction_request),
+        ],
+        CORRECTING: [
+            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_correction_pick),
+            # Allow the confirm/cancel buttons to still work if tapped from old message
             CallbackQueryHandler(handle_confirmation, pattern=r"^req_confirm_"),
             CallbackQueryHandler(cancel_request_flow, pattern=r"^req_cancel$"),
         ],
