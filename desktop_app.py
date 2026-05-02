@@ -18,11 +18,11 @@ from plex_auth import (PlexPinSession, PlexTokenResult, launch_auth_browser,
                        wait_for_plex_token)
 from plex_control import get_status, hard_reset, launch_plex, soft_reset
 from maintenance import (
-    DuplicateGroup, FilenameIssue, LibraryInventory, MissingEpisode,
-    SanitizePair, ShowInventory, UnindexedFile,
-    apply_sanitization, check_filenames_vs_plex, daily_library_check,
-    find_duplicates, find_missing_episodes, find_unindexed_files,
-    library_inventory, sanitize_all,
+    DuplicateGroup, LibraryInventory, SanitizePair, ShowInventory,
+    UnindexedFile, apply_sanitization, daily_library_check,
+    delete_files_with_cleanup, find_duplicates, find_missing_episodes,
+    find_unindexed_files, library_inventory, media_type_for_path,
+    sanitize_all, sanitize_filename,
 )
 from queue_store import (add_request, complete_request, find_duplicate_requests,
                           get_request, initialize_queue_db, list_requests,
@@ -73,6 +73,20 @@ class DesktopApp:
         self._maint_tree: ttk.Treeview | None = None
         self._maint_check_vars: list[tk.BooleanVar] = []
         self._maint_status_var = tk.StringVar(value="Select a tool to run.")
+        # Typed rows for re-rendering after a filter toggle.
+        # Each entry: (media_type_tag, row_values, action_payload).
+        # action_payload is opaque per-tool — for find_duplicates it's the
+        # file path so Apply Selected can delete the right files; for
+        # sanitize it's the SanitizePair index.
+        self._maint_typed_rows: list[tuple[str, tuple[str, str, str, str], Any]] = []
+        # Per-row payloads currently visible after filtering — kept parallel
+        # to _maint_check_vars so Apply Selected can resolve checked rows
+        # back to the right path / index.
+        self._maint_visible_payloads: list[Any] = []
+        # Filter checkbox state — one BooleanVar per media type tag.
+        self._maint_filter_vars: dict[str, tk.BooleanVar] = {
+            tag: tk.BooleanVar(value=True) for tag in ("movie", "tv", "anime", "xanime", "mixed")
+        }
         # Settings tab state — declared in _build_settings_tab
         self._settings_vars: dict[str, tk.Variable] = {}
         self._settings_paths: list[tuple[str, str]] = []  # (path, media_type)
@@ -178,7 +192,7 @@ class DesktopApp:
         metrics_tab.columnconfigure(0, weight=1)
         metrics_tab.rowconfigure(1, weight=1)
         maintenance_tab.columnconfigure(0, weight=1)
-        maintenance_tab.rowconfigure(2, weight=1)
+        # Row 2 now holds the filter row; the results tree moves to row 3 (set below).
         logs_tab.columnconfigure(0, weight=1)
         logs_tab.rowconfigure(0, weight=1)
 
@@ -297,8 +311,8 @@ class DesktopApp:
         ttk.Button(maint_toolbar, text="Daily Check",       command=self._run_daily_check).grid(row=0, column=0, padx=2, sticky="ew")
         ttk.Button(maint_toolbar, text="Library Inventory", command=self._run_library_inventory).grid(row=0, column=1, padx=2, sticky="ew")
         ttk.Button(maint_toolbar, text="Find Duplicates",   command=self._run_find_duplicates).grid(row=0, column=2, padx=2, sticky="ew")
-        ttk.Button(maint_toolbar, text="Filename Issues",   command=self._run_filename_check).grid(row=0, column=3, padx=2, sticky="ew")
-        ttk.Button(maint_toolbar, text="Sanitize Names",    command=self._run_sanitize).grid(row=0, column=4, padx=2, sticky="ew")
+        ttk.Button(maint_toolbar, text="Sanitize Names",    command=self._run_sanitize).grid(row=0, column=3, padx=2, sticky="ew")
+        ttk.Button(maint_toolbar, text="Custom Rename...",  command=self._open_custom_rename).grid(row=0, column=4, padx=2, sticky="ew")
         ttk.Button(maint_toolbar, text="Missing Episodes",  command=self._run_missing_episodes).grid(row=0, column=5, padx=2, sticky="ew")
         ttk.Button(maint_toolbar, text="Unindexed Files",   command=self._run_unindexed).grid(row=0, column=6, padx=2, sticky="ew")
         ttk.Button(maint_toolbar, text="Apply Selected",    command=self._apply_maint_selection).grid(row=0, column=7, padx=2, sticky="ew")
@@ -306,8 +320,25 @@ class DesktopApp:
         ttk.Label(maintenance_tab, textvariable=self._maint_status_var,
                   font=("Segoe UI", 11, "bold")).grid(row=1, column=0, sticky="w", pady=(0, 6))
 
+        # Media-type filter checkboxes — toggle these to hide/show rows by tag
+        # without re-running the tool.
+        filter_row = ttk.Frame(maintenance_tab)
+        filter_row.grid(row=2, column=0, sticky="ew", pady=(0, 4))
+        ttk.Label(filter_row, text="Show:").pack(side=tk.LEFT, padx=(0, 6))
+        for tag, label in (("movie", "Movies"), ("tv", "TV"),
+                            ("anime", "Anime"), ("xanime", "xAnime"),
+                            ("mixed", "Mixed/Other")):
+            ttk.Checkbutton(
+                filter_row, text=label,
+                variable=self._maint_filter_vars[tag],
+                command=self._apply_maint_filter,
+            ).pack(side=tk.LEFT, padx=4)
+
+        # Adjust the tab's row layout: results frame moves to row 3.
+        maintenance_tab.rowconfigure(3, weight=1)
+        maintenance_tab.rowconfigure(2, weight=0)
         maint_results_frame = ttk.Frame(maintenance_tab)
-        maint_results_frame.grid(row=2, column=0, sticky="nsew")
+        maint_results_frame.grid(row=3, column=0, sticky="nsew")
         maint_results_frame.columnconfigure(0, weight=1)
         maint_results_frame.rowconfigure(0, weight=1)
 
@@ -851,18 +882,53 @@ class DesktopApp:
         col1: str = "Item",
         col2: str = "Detail",
         col3: str = "Extra",
+        typed_rows: list[tuple[str, tuple[str, str, str, str], Any]] | None = None,
     ) -> None:
+        """
+        Render rows into the maintenance results tree.
+
+        The legacy `rows` parameter (list of (check, c1, c2, c3) 4-tuples) is
+        kept so existing tools that don't carry a media-type tag still work —
+        they're treated as type "mixed" and never get filtered out.
+
+        New callers should pass `typed_rows` so the media-type filter
+        checkboxes can hide/show entries without re-running the tool. Each
+        typed row is (media_type_tag, (check, c1, c2, c3), action_payload).
+        """
         if self._maint_tree is None:
             return
         self._maint_tree.heading("col1", text=col1)
         self._maint_tree.heading("col2", text=col2)
         self._maint_tree.heading("col3", text=col3)
+
+        if typed_rows is None:
+            typed_rows = [("mixed", row, None) for row in rows]
+
+        self._maint_typed_rows = list(typed_rows)
+        self._apply_maint_filter()
+
+    def _apply_maint_filter(self) -> None:
+        """
+        Re-render the maintenance tree from `_maint_typed_rows`, hiding rows
+        whose media-type tag is currently unchecked. Re-builds the parallel
+        `_maint_check_vars` and `_maint_visible_payloads` lists so Apply
+        Selected can map a checked row back to its action payload.
+        """
+        if self._maint_tree is None:
+            return
+        active_tags = {tag for tag, var in self._maint_filter_vars.items() if var.get()}
+
         for item in self._maint_tree.get_children():
             self._maint_tree.delete(item)
         self._maint_check_vars = []
-        for _check, c1, c2, c3 in rows:
+        self._maint_visible_payloads: list[Any] = []
+
+        for media_type, (_check, c1, c2, c3), payload in self._maint_typed_rows:
+            if media_type not in active_tags:
+                continue
             var = tk.BooleanVar(value=False)
             self._maint_check_vars.append(var)
+            self._maint_visible_payloads.append(payload)
             self._maint_tree.insert("", "end", values=("[ ]", c1, c2, c3))
 
     def _on_maint_tree_click(self, event: Any) -> None:
@@ -984,60 +1050,46 @@ class DesktopApp:
         self._maint_results = results
         if not results:
             self._maint_status_var.set("No duplicate groups found.")
-            self._populate_maint_tree([], col1="Title", col2="Candidates", col3="Total Size")
+            self._populate_maint_tree([], col1="Title", col2="File Path", col3="File Size")
             self._show_info("Find Duplicates", "No duplicate groups found across the configured library paths.")
             return
         total_size = sum(g.total_size_bytes for g in results)
-        self._maint_status_var.set(f"{len(results)} duplicate group(s) -- {self._fmt_bytes(total_size)} total")
-        rows: list[tuple[str, str, str, str]] = []
-        for group in results:
-            for i, candidate in enumerate(group.candidates):
-                indent = "" if i == 0 else "  -> "
-                rows.append(("", indent + group.normalized_title, candidate,
-                              self._fmt_bytes(group.total_size_bytes) if i == 0 else ""))
-        self._populate_maint_tree(rows, col1="Normalized Title", col2="File Path", col3="Group Size")
-        self._show_info(
-            "Find Duplicates",
-            f"Found {len(results)} duplicate group(s) -- {self._fmt_bytes(total_size)} total.\n\n"
-            "See the table below for details.",
+        recoverable = sum(
+            sum(g.candidate_sizes[1:])  # keep one copy, recover the rest
+            for g in results
+        )
+        self._maint_status_var.set(
+            f"{len(results)} duplicate group(s) -- {self._fmt_bytes(total_size)} on disk, "
+            f"{self._fmt_bytes(recoverable)} recoverable if you keep one of each"
         )
 
-    # =====================================================================
-    # Maintenance tab — filename check
-    # =====================================================================
+        # One typed row per candidate file. The first row in each group shows
+        # the title; subsequent rows are indented "-> " continuations. Each
+        # row's payload is the absolute path so Apply Selected can delete it.
+        typed_rows: list[tuple[str, tuple[str, str, str, str], Any]] = []
+        for group in results:
+            for i, (path, size) in enumerate(zip(group.candidates, group.candidate_sizes)):
+                indent = "" if i == 0 else "  -> "
+                title = indent + group.normalized_title
+                typed_rows.append((
+                    media_type_for_path(path),
+                    ("", title, path, self._fmt_bytes(size)),
+                    path,
+                ))
 
-    def _run_filename_check(self) -> None:
-        if not self._maint_require_library_paths("Filename Check"):
-            return
-        if not self._maint_require_plex_token("Filename Check"):
-            return
-        self._maint_set_busy("Filename Check")
-
-        def worker() -> None:
-            try:
-                results = check_filenames_vs_plex()
-            except Exception as exc:
-                logger.exception("check_filenames_vs_plex failed.")
-                self._post_to_ui(lambda: self._maint_status_var.set(f"Filename check error: {exc}"))
-                return
-            self._post_to_ui(lambda: self._handle_filename_check_result(results))
-
-        threading.Thread(target=worker, name="maint-filename-check", daemon=True).start()
-
-    def _handle_filename_check_result(self, results: list[FilenameIssue]) -> None:
-        self._maint_tool_name = "filename_check"
-        self._maint_results = results
-        if not results:
-            self._maint_status_var.set("All filenames match Plex titles.")
-            self._populate_maint_tree([], col1="Disk Name", col2="Expected Name", col3="Plex Title")
-            self._show_info("Filename Check", "All on-disk filenames match Plex titles.")
-            return
-        self._maint_status_var.set(f"{len(results)} filename mismatch(es) found")
-        rows = [("", issue.disk_name, issue.expected_filename, issue.plex_title) for issue in results]
-        self._populate_maint_tree(rows, col1="Disk Name", col2="Expected Name", col3="Plex Title")
+        self._populate_maint_tree(
+            [], col1="Normalized Title", col2="File Path", col3="File Size",
+            typed_rows=typed_rows,
+        )
         self._show_info(
-            "Filename Check",
-            f"Found {len(results)} filename mismatch(es).\n\nSee the table below for the proposed names.",
+            "Find Duplicates",
+            f"Found {len(results)} duplicate group(s) -- "
+            f"{self._fmt_bytes(total_size)} on disk total.\n"
+            f"You could free roughly {self._fmt_bytes(recoverable)} by keeping "
+            "one copy from each group.\n\n"
+            "Tick the rows you want to delete, then click 'Apply Selected'. "
+            "Empty folders left behind will be reported separately so you "
+            "can decide whether to remove them.",
         )
 
     # =====================================================================
@@ -1069,11 +1121,18 @@ class DesktopApp:
             self._show_info("Sanitize Names", "All filenames are already Plex-friendly -- nothing to rename.")
             return
         self._maint_status_var.set(f"{len(results)} rename(s) proposed -- check boxes then click Apply Selected")
-        rows = [
-            ("", Path(pair.original).name, Path(pair.sanitized).name, self._fmt_bytes(pair.size_bytes))
-            for pair in results
+        typed_rows: list[tuple[str, tuple[str, str, str, str], Any]] = [
+            (
+                media_type_for_path(pair.original),
+                ("", Path(pair.original).name, Path(pair.sanitized).name, self._fmt_bytes(pair.size_bytes)),
+                idx,  # index back into self._maint_results
+            )
+            for idx, pair in enumerate(results)
         ]
-        self._populate_maint_tree(rows, col1="Original Name", col2="Proposed Name", col3="Size")
+        self._populate_maint_tree(
+            [], col1="Original Name", col2="Proposed Name", col3="Size",
+            typed_rows=typed_rows,
+        )
         self._show_info(
             "Sanitize Names",
             f"{len(results)} rename(s) proposed.\n\n"
@@ -1101,22 +1160,73 @@ class DesktopApp:
 
         threading.Thread(target=worker, name="maint-missing-eps", daemon=True).start()
 
-    def _handle_missing_episodes_result(self, results: list[MissingEpisode]) -> None:
+    def _handle_missing_episodes_result(self, report: Any) -> None:
+        # `report` is a MissingEpisodesReport — typed Any so the import doesn't
+        # have to be eagerly named at this call site.
         self._maint_tool_name = "missing_episodes"
-        self._maint_results = results
-        if not results:
-            self._maint_status_var.set("No missing episodes detected.")
-            self._populate_maint_tree([], col1="Show", col2="Missing Episode", col3="Show Path")
-            self._show_info("Missing Episodes", "No gaps detected in any show's episode numbering.")
+        self._maint_results = list(report.gaps)
+
+        if report.shows_scanned == 0:
+            self._maint_status_var.set("No show folders found.")
+            self._populate_maint_tree([], col1="Show / Season", col2="Detail", col3="Path")
+            self._show_info(
+                "Missing Episodes",
+                "No show folders detected. Make sure your TV / Anime / xAnime "
+                "library paths actually contain show subfolders, not bare files.",
+            )
             return
-        shows = len({r.show_title for r in results})
-        self._maint_status_var.set(f"{len(results)} missing episode slot(s) across {shows} show(s)")
-        rows = [("", ep.show_title, f"S{ep.season:02d}E{ep.episode:02d}", ep.show_path) for ep in results]
-        self._populate_maint_tree(rows, col1="Show", col2="Missing Episode", col3="Show Path")
+
+        shows_with_gaps = len({g.show_title for g in report.gaps})
+        self._maint_status_var.set(
+            f"Scanned {report.shows_scanned} show(s), {len(report.seasons)} season(s) total. "
+            f"{len(report.gaps)} gap(s) across {shows_with_gaps} show(s)."
+        )
+
+        # Build per-season summary rows + per-gap detail rows.
+        # Group seasons by show so the user can spot incomplete seasons even
+        # when there are no NUMERIC gaps (e.g. "S03 only has E01-04").
+        typed_rows: list[tuple[str, tuple[str, str, str, str], Any]] = []
+        by_show: dict[str, list[Any]] = {}
+        for s in report.seasons:
+            by_show.setdefault(s.show_title, []).append(s)
+
+        for show_title in sorted(by_show.keys()):
+            seasons = sorted(by_show[show_title], key=lambda s: s.season)
+            show_path = seasons[0].show_path
+            tag = media_type_for_path(show_path)
+            for s in seasons:
+                summary = f"{s.episodes_present}/{s.highest_episode} ep present"
+                if s.missing_count:
+                    summary += f"  -- missing {s.missing_count}"
+                typed_rows.append((
+                    tag,
+                    ("", f"{show_title}  S{s.season:02d}", summary, show_path),
+                    None,
+                ))
+            # Per-gap rows underneath
+            for ep in report.gaps:
+                if ep.show_title != show_title:
+                    continue
+                typed_rows.append((
+                    tag,
+                    ("", f"  -> missing", f"S{ep.season:02d}E{ep.episode:02d}", ep.show_path),
+                    None,
+                ))
+
+        self._populate_maint_tree(
+            [], col1="Show / Season", col2="Detail", col3="Path",
+            typed_rows=typed_rows,
+        )
         self._show_info(
             "Missing Episodes",
-            f"Detected {len(results)} missing episode slot(s) across {shows} show(s).\n\n"
-            "See the table below.",
+            f"Scanned {report.shows_scanned} show folder(s) across "
+            f"{len(report.seasons)} season(s).\n\n"
+            f"{len(report.gaps)} gap(s) found inside seasons that have media "
+            f"(across {shows_with_gaps} show(s)).\n\n"
+            "Note: this only detects missing episodes WITHIN a season you "
+            "already have files for. It can't tell you that a brand-new "
+            "season exists upstream that you don't have any of -- check the "
+            "'highest ep present' column and compare to what should exist.",
         )
 
     # =====================================================================
@@ -1153,8 +1263,18 @@ class DesktopApp:
             return
         total = sum(f.size_bytes for f in results)
         self._maint_status_var.set(f"{len(results)} unindexed file(s) -- {self._fmt_bytes(total)} total")
-        rows = [("", f.name, f.path, self._fmt_bytes(f.size_bytes)) for f in results]
-        self._populate_maint_tree(rows, col1="Filename", col2="Full Path", col3="Size")
+        typed_rows: list[tuple[str, tuple[str, str, str, str], Any]] = [
+            (
+                media_type_for_path(f.path),
+                ("", f.name, f.path, self._fmt_bytes(f.size_bytes)),
+                f.path,
+            )
+            for f in results
+        ]
+        self._populate_maint_tree(
+            [], col1="Filename", col2="Full Path", col3="Size",
+            typed_rows=typed_rows,
+        )
         self._show_info(
             "Unindexed Files",
             f"Found {len(results)} unindexed file(s) -- {self._fmt_bytes(total)} total.\n\n"
@@ -1167,22 +1287,32 @@ class DesktopApp:
     # =====================================================================
 
     def _apply_maint_selection(self) -> None:
-        if self._maint_tool_name not in ("sanitize",):
+        if self._maint_tool_name not in ("sanitize", "find_duplicates", "custom_rename"):
             self._show_info(
                 "Apply Selection",
                 "The current tool results have no applyable actions.\n\n"
-                "Run 'Sanitize Names' first, check the files you want renamed, "
-                "then click Apply Selected.",
+                "Tools that support Apply Selected:\n"
+                "  - Find Duplicates    -> deletes the checked files\n"
+                "  - Sanitize Names     -> renames the checked files\n"
+                "  - Custom Rename...   -> renames per your find/replace rules",
             )
             return
 
-        selected_indices = [i for i, var in enumerate(self._maint_check_vars) if var.get()]
-        if not selected_indices:
+        selected_payloads = [
+            payload
+            for var, payload in zip(self._maint_check_vars, self._maint_visible_payloads)
+            if var.get()
+        ]
+        if not selected_payloads:
             self._show_warning("Nothing selected", "Check at least one row before clicking Apply Selected.")
             return
 
         if self._maint_tool_name == "sanitize":
-            pairs = [self._maint_results[i] for i in selected_indices if i < len(self._maint_results)]
+            # Payloads are indices into self._maint_results (SanitizePair list).
+            pairs = [
+                self._maint_results[i] for i in selected_payloads
+                if isinstance(i, int) and 0 <= i < len(self._maint_results)
+            ]
             if not pairs:
                 return
             names_preview = "\n".join(
@@ -1190,11 +1320,10 @@ class DesktopApp:
             )
             if len(pairs) > 10:
                 names_preview += f"\n  ... and {len(pairs) - 10} more"
-            confirmed = self._ask_yes_no(
+            if not self._ask_yes_no(
                 "Confirm Rename",
                 f"About to rename {len(pairs)} file(s):\n\n{names_preview}\n\nThis cannot be undone. Continue?",
-            )
-            if not confirmed:
+            ):
                 return
             self._maint_status_var.set(f"Renaming {len(pairs)} file(s)...")
 
@@ -1203,6 +1332,143 @@ class DesktopApp:
                 self._post_to_ui(lambda: self._handle_apply_sanitize_result(len(pairs), errors))
 
             threading.Thread(target=worker, name="maint-apply-sanitize", daemon=True).start()
+            return
+
+        if self._maint_tool_name == "find_duplicates":
+            # Payloads are absolute file paths.
+            paths_to_delete = [p for p in selected_payloads if isinstance(p, str)]
+            if not paths_to_delete:
+                return
+            self._confirm_and_delete_duplicates(paths_to_delete)
+            return
+
+        if self._maint_tool_name == "custom_rename":
+            # Payloads are SanitizePair instances built by the dialog.
+            pairs = [p for p in selected_payloads if isinstance(p, SanitizePair)]
+            if not pairs:
+                return
+            names_preview = "\n".join(
+                f"  {Path(p.original).name}  ->  {Path(p.sanitized).name}" for p in pairs[:10]
+            )
+            if len(pairs) > 10:
+                names_preview += f"\n  ... and {len(pairs) - 10} more"
+            if not self._ask_yes_no(
+                "Confirm Rename",
+                f"About to rename {len(pairs)} file(s) using your custom rule:\n\n"
+                f"{names_preview}\n\nThis cannot be undone. Continue?",
+            ):
+                return
+            self._maint_status_var.set(f"Renaming {len(pairs)} file(s)...")
+
+            def worker() -> None:
+                errors = apply_sanitization(pairs)
+                self._post_to_ui(lambda: self._handle_apply_sanitize_result(len(pairs), errors))
+
+            threading.Thread(target=worker, name="maint-apply-custom-rename", daemon=True).start()
+            return
+
+    def _confirm_and_delete_duplicates(self, paths: list[str]) -> None:
+        """
+        Two-step confirmation for destructive duplicate deletion.
+
+        1) Show the list (capped) plus total reclaimed size; require yes.
+        2) After deletion, surface any parent folders the deletes left empty
+           and let the user decide whether to remove those too. Configured
+           library roots are never offered for removal.
+        """
+        # Sum sizes from current cached DuplicateGroup data
+        sizes: dict[str, int] = {}
+        if isinstance(self._maint_results, list):
+            for grp in self._maint_results:
+                if isinstance(grp, DuplicateGroup):
+                    for path, size in zip(grp.candidates, grp.candidate_sizes):
+                        sizes[path] = size
+
+        total_bytes = sum(sizes.get(p, 0) for p in paths)
+        preview_lines = [f"  {p}  ({self._fmt_bytes(sizes.get(p, 0))})" for p in paths[:10]]
+        if len(paths) > 10:
+            preview_lines.append(f"  ... and {len(paths) - 10} more")
+
+        if not self._ask_yes_no(
+            "Confirm Deletion",
+            f"About to PERMANENTLY DELETE {len(paths)} file(s) "
+            f"({self._fmt_bytes(total_bytes)}):\n\n"
+            + "\n".join(preview_lines)
+            + "\n\nThis cannot be undone. Continue?",
+        ):
+            return
+
+        self._maint_status_var.set(f"Deleting {len(paths)} file(s)...")
+
+        def worker() -> None:
+            deleted, errors, empty_dirs = delete_files_with_cleanup(paths)
+            self._post_to_ui(
+                lambda: self._handle_duplicate_delete_result(deleted, errors, empty_dirs)
+            )
+
+        threading.Thread(target=worker, name="maint-delete-dupes", daemon=True).start()
+
+    def _handle_duplicate_delete_result(
+        self,
+        deleted: list[str],
+        errors: list[str],
+        empty_dirs: list[str],
+    ) -> None:
+        success = len(deleted)
+        if errors:
+            self._maint_status_var.set(
+                f"Deleted {success} file(s); {len(errors)} error(s)"
+            )
+            err_preview = "\n".join(errors[:10])
+            if len(errors) > 10:
+                err_preview += f"\n... and {len(errors) - 10} more"
+            self._show_warning(
+                "Delete Results",
+                f"Deleted {success} file(s).\n\nErrors:\n{err_preview}",
+            )
+        else:
+            self._maint_status_var.set(f"Deleted {success} file(s).")
+
+        if empty_dirs:
+            preview = "\n".join(f"  {d}" for d in empty_dirs[:10])
+            if len(empty_dirs) > 10:
+                preview += f"\n  ... and {len(empty_dirs) - 10} more"
+            if self._ask_yes_no(
+                "Empty Folders",
+                f"{len(empty_dirs)} folder(s) became empty after deletion:\n\n"
+                f"{preview}\n\n"
+                "Configured library roots are excluded automatically.\n\n"
+                "Remove these empty folders?",
+            ):
+                removed_dirs, dir_errors = self._remove_empty_dirs(empty_dirs)
+                if dir_errors:
+                    self._show_warning(
+                        "Folder Removal",
+                        f"Removed {removed_dirs} folder(s).\n\nErrors:\n"
+                        + "\n".join(dir_errors[:10]),
+                    )
+                else:
+                    self._show_info(
+                        "Folder Removal", f"Removed {removed_dirs} empty folder(s).",
+                    )
+
+        # Re-run find_duplicates so the tree reflects what's left
+        self._run_find_duplicates()
+
+    @staticmethod
+    def _remove_empty_dirs(dirs: list[str]) -> tuple[int, list[str]]:
+        removed = 0
+        errors: list[str] = []
+        for d in dirs:
+            try:
+                p = Path(d)
+                if p.is_dir() and not any(p.iterdir()):
+                    p.rmdir()
+                    removed += 1
+                    logger.info("Removed empty directory: %s", d)
+            except OSError as exc:
+                errors.append(f"{d}: {exc}")
+        return removed, errors
 
     def _handle_apply_sanitize_result(self, attempted: int, errors: list[str]) -> None:
         success = attempted - len(errors)
@@ -1262,21 +1528,29 @@ class DesktopApp:
             status += f" / {inventory.untyped_files} untyped"
         self._maint_status_var.set(status)
 
-        # One row per show with summarized seasons (e.g. "S1: 8, S2: 10").
-        rows: list[tuple[str, str, str, str]] = []
+        # One typed row per show — the media-type filter checkboxes can hide
+        # whole categories (e.g. show only TV+Anime, hide Movies/xAnime).
+        typed_rows: list[tuple[str, tuple[str, str, str, str], Any]] = []
         for show in inventory.shows:
             seasons_summary = ", ".join(
                 f"S{season}: {count}"
                 for season, count in sorted(show.seasons.items())
             )
-            rows.append((
-                "",
-                f"{show.title}  [{show.media_type}]",
-                f"{show.total_episodes} ep — {seasons_summary}",
-                self._fmt_bytes(show.total_size_bytes),
+            typed_rows.append((
+                show.media_type,
+                (
+                    "",
+                    f"{show.title}  [{show.media_type}]",
+                    f"{show.total_episodes} ep -- {seasons_summary}",
+                    self._fmt_bytes(show.total_size_bytes),
+                ),
+                None,
             ))
 
-        self._populate_maint_tree(rows, col1="Show", col2="Seasons / Episodes", col3="Size")
+        self._populate_maint_tree(
+            [], col1="Show", col2="Seasons / Episodes", col3="Size",
+            typed_rows=typed_rows,
+        )
 
         popup_lines = [
             f"Shows detected: {total_shows}",

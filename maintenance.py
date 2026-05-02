@@ -7,12 +7,14 @@
 #
 # Tools:
 #   daily_library_check()          — scan open requests against Plex; mark found
+#   library_inventory()            — per-show season/episode counts
 #   find_duplicates()              — files likely representing the same content
-#   check_filenames_vs_plex()      — files whose names diverge from Plex titles
 #   sanitize_filename(path, dry)   — return Plex-friendly renamed path
 #   apply_sanitization(pairs)      — rename files in bulk
 #   find_missing_episodes()        — gaps in episode numbering per show
 #   find_unindexed_files()         — files on disk not in Plex
+#   delete_files_with_cleanup()    — delete files and report empty parent dirs
+#   media_type_for_path(path)      — derive media-type tag from configured paths
 # =============================================================================
 
 import logging
@@ -34,17 +36,9 @@ logger = logging.getLogger(__name__)
 class DuplicateGroup:
     """A group of files that are likely duplicates of the same content."""
     normalized_title: str
-    candidates: list[str]       # file paths
+    candidates: list[str]            # file paths
+    candidate_sizes: list[int]       # parallel list of per-file sizes (bytes)
     total_size_bytes: int
-
-
-@dataclass
-class FilenameIssue:
-    """A file whose disk name doesn't match what Plex shows."""
-    path: str
-    disk_name: str
-    plex_title: str
-    expected_filename: str      # what the disk name ideally should be
 
 
 @dataclass
@@ -62,6 +56,25 @@ class MissingEpisode:
     show_path: str
     season: int
     episode: int
+
+
+@dataclass
+class SeasonSummary:
+    """Per-season totals captured alongside MissingEpisode gaps."""
+    show_title: str
+    show_path: str
+    season: int
+    episodes_present: int       # how many distinct episode files we found
+    highest_episode: int        # the highest episode number we saw
+    missing_count: int          # gap-count between 1 and highest
+
+
+@dataclass
+class MissingEpisodesReport:
+    """Full result of find_missing_episodes() — gaps plus per-season totals."""
+    gaps: list[MissingEpisode]
+    seasons: list[SeasonSummary]
+    shows_scanned: int
 
 
 @dataclass
@@ -241,14 +254,21 @@ def find_duplicates() -> list[DuplicateGroup]:
     for (norm_title, season, episode), paths in groups.items():
         if len(paths) < 2:
             continue
-        total_bytes = sum(p.stat().st_size for p in paths if p.exists())
+        sorted_paths = sorted(paths)
+        sizes: list[int] = []
+        for p in sorted_paths:
+            try:
+                sizes.append(p.stat().st_size)
+            except OSError:
+                sizes.append(0)
         label = norm_title
         if season is not None and episode is not None:
             label = f"{norm_title} S{season:02d}E{episode:02d}"
         results.append(DuplicateGroup(
             normalized_title=label,
-            candidates=[str(p) for p in sorted(paths)],
-            total_size_bytes=total_bytes,
+            candidates=[str(p) for p in sorted_paths],
+            candidate_sizes=sizes,
+            total_size_bytes=sum(sizes),
         ))
 
     results.sort(key=lambda g: -g.total_size_bytes)
@@ -260,18 +280,19 @@ def find_duplicates() -> list[DuplicateGroup]:
 # Library inventory — per-show season/episode counts
 # ---------------------------------------------------------------------------
 
-def _media_type_for_path(path: Path) -> str:
+def media_type_for_path(path: str | Path) -> str:
     """
     Map a file path to the media-type tag of the library root that contains it.
 
     Returns the media_type ("tv", "movie", "anime", "xanime", "mixed") of the
     first MediaLibraryPath whose root is an ancestor of `path`. Falls back to
-    "mixed" for legacy/untyped configurations.
+    "mixed" for legacy/untyped configurations or paths outside any root.
     """
+    p = Path(path) if not isinstance(path, Path) else path
     try:
-        path_resolved = path.resolve()
+        path_resolved = p.resolve()
     except OSError:
-        path_resolved = path
+        path_resolved = p
     for entry in config.MEDIA_LIBRARY_PATHS:
         try:
             root = Path(entry.path).resolve()
@@ -283,6 +304,10 @@ def _media_type_for_path(path: Path) -> str:
         except ValueError:
             continue
     return "mixed"
+
+
+# Backwards-compat alias for existing internal callers in this module.
+_media_type_for_path = media_type_for_path
 
 
 def library_inventory() -> LibraryInventory:
@@ -356,74 +381,6 @@ def library_inventory() -> LibraryInventory:
         movie_size_bytes=movie_size,
         untyped_files=untyped,
     )
-
-
-# ---------------------------------------------------------------------------
-# Filename vs Plex title check
-# ---------------------------------------------------------------------------
-
-def check_filenames_vs_plex() -> list[FilenameIssue]:
-    """
-    Compare on-disk filenames to the titles Plex has for them.
-    Requires PLEX_TOKEN; returns [] if Plex is not configured.
-
-    Returns FilenameIssue objects for files where the disk name diverges
-    significantly from Plex's title.
-    """
-    try:
-        from plex_api import search_plex_library
-    except ImportError:
-        logger.error("plex_api not available.")
-        return []
-
-    issues: list[FilenameIssue] = []
-
-    for lib_path in config.PLEX_LIBRARY_PATHS:
-        root = Path(lib_path)
-        if not root.is_dir():
-            continue
-
-        for dirpath, _dirs, names in os.walk(root):
-            for name in names:
-                if Path(name).suffix.lower() not in set(config.LIBRARY_INDEX_EXTENSIONS):
-                    continue
-
-                stem = Path(name).stem
-                normalized = _normalize_title(name)
-                if not normalized:
-                    continue
-
-                try:
-                    plex_results = search_plex_library(normalized, limit=3)
-                except Exception as exc:
-                    logger.debug("Plex search failed for '%s': %s", normalized, exc)
-                    continue
-
-                if not plex_results:
-                    continue
-
-                plex_title = plex_results[0].name
-                # Strip the Plex show prefix ("ShowName - S01E02 - Title") to get the canonical title
-                canonical = re.sub(r"\s*[-–]\s*S\d{2}E\d{2}\b.*", "", plex_title).strip()
-
-                if canonical.casefold() == normalized:
-                    continue  # Names match — no issue
-
-                # Build what the filename ideally should look like
-                year_match = re.search(r"\((\d{4})\)", plex_title)
-                year_str = f" ({year_match.group(1)})" if year_match else ""
-                ext = Path(name).suffix
-                expected = f"{canonical}{year_str}{ext}"
-
-                issues.append(FilenameIssue(
-                    path=str(Path(dirpath) / name),
-                    disk_name=name,
-                    plex_title=plex_title,
-                    expected_filename=expected,
-                ))
-
-    logger.info("check_filenames_vs_plex: %d issue(s) found.", len(issues))
-    return issues
 
 
 # ---------------------------------------------------------------------------
@@ -508,6 +465,67 @@ def sanitize_all(*, dry_run: bool = True) -> list[SanitizePair]:
     return pairs
 
 
+def delete_files_with_cleanup(
+    paths: list[str],
+) -> tuple[list[str], list[str], list[str]]:
+    """
+    Delete the given files and identify any parent directories left empty.
+
+    Returns ``(deleted, errors, empty_parent_dirs)``:
+      - deleted:           paths that were successfully removed
+      - errors:            human-readable failure messages
+      - empty_parent_dirs: directories that became empty after the deletes —
+                           the caller is expected to ask the user before
+                           actually removing them, since some libraries put
+                           movies "free-floating" in a shared root and we
+                           must NOT collapse the root itself.
+
+    Empty-folder detection only walks UP one level from each deleted file
+    (good enough for the common "Movie Title (Year)/Movie Title.mkv" layout)
+    and never returns a directory that is a configured library root.
+    """
+    deleted: list[str] = []
+    errors: list[str] = []
+    candidate_parents: set[Path] = set()
+
+    library_roots: set[Path] = set()
+    for entry in config.MEDIA_LIBRARY_PATHS:
+        try:
+            library_roots.add(Path(entry.path).resolve())
+        except OSError:
+            library_roots.add(Path(entry.path))
+
+    for raw_path in paths:
+        path = Path(raw_path)
+        if not path.is_file():
+            errors.append(f"Not a file (skipped): {raw_path}")
+            continue
+        try:
+            parent = path.parent
+            path.unlink()
+            deleted.append(raw_path)
+            candidate_parents.add(parent)
+            logger.info("Deleted duplicate file: %s", raw_path)
+        except OSError as exc:
+            errors.append(f"Delete failed for {raw_path}: {exc}")
+
+    empty_parents: list[str] = []
+    for parent in candidate_parents:
+        try:
+            parent_resolved = parent.resolve()
+        except OSError:
+            parent_resolved = parent
+        if parent_resolved in library_roots:
+            continue  # never offer to nuke a configured library root
+        try:
+            if parent.is_dir() and not any(parent.iterdir()):
+                empty_parents.append(str(parent))
+        except OSError:
+            continue
+
+    return deleted, errors, empty_parents
+
+
 def apply_sanitization(pairs: list[SanitizePair]) -> list[str]:
     """
     Apply a list of SanitizePair renames (those selected by the user via
@@ -551,30 +569,39 @@ def _parse_episode(filename: str) -> tuple[int, int] | None:
     return None
 
 
-def find_missing_episodes() -> list[MissingEpisode]:
+def find_missing_episodes() -> MissingEpisodesReport:
     """
     Walk TV show directories and detect gaps in S##E## episode numbering.
 
-    A directory is treated as a TV show if it contains sub-directories named
-    "Season XX" or if the majority of its files match the S##E## pattern.
+    Logic (intentionally narrow):
+      1. For each configured library path, look at every immediate
+         subdirectory as a candidate show.
+      2. Walk that show recursively, parsing SxxExx / NxN out of filenames.
+      3. For each season we observe, expect episodes 1..max(present) and
+         report any integers from that range that are absent.
 
-    Returns a list of MissingEpisode objects for each detected gap.
+    What this *cannot* detect: that a season exists upstream which you
+    have nothing of yet (e.g. a show just released S04 and you have only
+    S01-S03). For that, an external lookup against TVDB would be needed.
+
+    The returned report includes per-season summaries (highest episode
+    found, count present) so you can sanity-check completeness yourself.
     """
     extensions = set(config.LIBRARY_INDEX_EXTENSIONS)
-    missing: list[MissingEpisode] = []
+    gaps: list[MissingEpisode] = []
+    summaries: list[SeasonSummary] = []
+    shows_scanned = 0
 
     for lib_root in config.PLEX_LIBRARY_PATHS:
         root = Path(lib_root)
         if not root.is_dir():
             continue
 
-        # Walk one level deep to find show directories
         for show_dir in root.iterdir():
             if not show_dir.is_dir():
                 continue
 
             show_title = show_dir.name
-            # Collect all episodes: season → set of episode numbers
             season_map: dict[int, set[int]] = {}
 
             for dirpath, _dirs, names in os.walk(show_dir):
@@ -588,26 +615,36 @@ def find_missing_episodes() -> list[MissingEpisode]:
                     season_map.setdefault(season, set()).add(ep)
 
             if not season_map:
-                continue  # not a TV show directory
+                continue
+            shows_scanned += 1
 
-            # Detect gaps within each season
             for season, episodes in sorted(season_map.items()):
-                sorted_eps = sorted(episodes)
-                if not sorted_eps:
+                if not episodes:
                     continue
-                # Check for gaps between 1 and max episode number
-                expected = set(range(1, max(sorted_eps) + 1))
-                gaps = sorted(expected - episodes)
-                for ep in gaps:
-                    missing.append(MissingEpisode(
+                highest = max(episodes)
+                expected = set(range(1, highest + 1))
+                missing = sorted(expected - episodes)
+                for ep in missing:
+                    gaps.append(MissingEpisode(
                         show_title=show_title,
                         show_path=str(show_dir),
                         season=season,
                         episode=ep,
                     ))
+                summaries.append(SeasonSummary(
+                    show_title=show_title,
+                    show_path=str(show_dir),
+                    season=season,
+                    episodes_present=len(episodes),
+                    highest_episode=highest,
+                    missing_count=len(missing),
+                ))
 
-    logger.info("find_missing_episodes: %d missing episode slot(s) detected.", len(missing))
-    return missing
+    logger.info(
+        "find_missing_episodes: %d show(s) scanned, %d season(s), %d gap(s) total.",
+        shows_scanned, len(summaries), len(gaps),
+    )
+    return MissingEpisodesReport(gaps=gaps, seasons=summaries, shows_scanned=shows_scanned)
 
 
 # ---------------------------------------------------------------------------
