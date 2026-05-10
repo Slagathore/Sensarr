@@ -17,7 +17,7 @@ Phone (Telegram) ──► Telegram Bot API ──► PlexResetButton.exe ──
 | **Hard reset**       | Force-kills every Plex process tree via `taskkill /F` (runs elevated; never fails silently)                  |
 | **UAC elevation**    | EXE requests admin at launch via `uac_admin=True`; Python script self-elevates with `ShellExecuteW("runas")` |
 | **System tray**      | Lives in the Windows notification area; hides to tray on close                                               |
-| **Request queue**    | Household members submit watch requests via `/request`; admin marks them complete                            |
+| **Request queue**    | Users interacting with the telegram bot are guideed through a library aware and db linking request daemon    |
 | **Library index**    | Indexes your media folders to SQLite for fast search; fallback to Plex API search                            |
 | **Play metrics**     | Per-user play counts, watch time, active sessions, and library section inventory                             |
 | **Plex PIN auth**    | Built-in browser-based PIN flow to obtain and persist your Plex token                                        |
