@@ -2,8 +2,11 @@ import datetime
 import logging
 import os
 import re
+import shutil
 import threading
 import tkinter as tk
+import urllib.parse
+import webbrowser
 from importlib import import_module
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
@@ -34,6 +37,28 @@ from settings_store import (load_current_settings, reload_config_from_env,
 from telegram_service import TelegramBotService
 
 logger = logging.getLogger(__name__)
+
+# Sentinel marking the Firefox controller as "not yet resolved" (distinct from
+# None, which means "Firefox not found, fall back to the default browser").
+_FIREFOX_UNSET: Any = object()
+
+# Torrent-source search endpoints, keyed by request media_type. {q} is replaced
+# with the URL-encoded search query.
+#   - movie / tv / other: The Pirate Bay (see screenshot 1; form action "/s/")
+#   - anime: nyaa.si filtered to "Anime - English-translated" (c=1_2, screenshot 2)
+#   - xanime (🔞): sukebei.nyaa.si, the adult counterpart of nyaa
+_TPB_SEARCH = "https://thepiratebay10.info/s/?q={q}&page=0&orderby=99"
+_NYAA_ANIME_SEARCH = "https://nyaa.si/?f=0&c=1_2&q={q}&s=seeders&o=desc"
+_SUKEBEI_SEARCH = "https://sukebei.nyaa.si/?f=0&c=0_0&q={q}&s=seeders&o=desc"
+
+_SOURCE_SEARCH_BY_TYPE = {
+    "movie":  _TPB_SEARCH,
+    "tv":     _TPB_SEARCH,
+    "other":  _TPB_SEARCH,
+    "unknown": _TPB_SEARCH,
+    "anime":  _NYAA_ANIME_SEARCH,
+    "xanime": _SUKEBEI_SEARCH,
+}
 Image = cast(Any, import_module("PIL.Image"))
 ImageDraw = cast(Any, import_module("PIL.ImageDraw"))
 pystray = cast(Any, import_module("pystray"))
@@ -66,6 +91,9 @@ class DesktopApp:
         self.log_text: scrolledtext.ScrolledText | None = None
         self.requests_tree: ttk.Treeview | None = None
         self.request_detail_text: scrolledtext.ScrolledText | None = None
+        # Cached Firefox controller for opening source searches. Sentinel
+        # value below means "not yet resolved"; None means "Firefox unavailable".
+        self._firefox_browser_cache: Any = _FIREFOX_UNSET
         self.library_summary_text: scrolledtext.ScrolledText | None = None
         self.library_results_tree: ttk.Treeview | None = None
         self.metrics_text: scrolledtext.ScrolledText | None = None
@@ -214,8 +242,9 @@ class DesktopApp:
         request_entry.grid(row=0, column=3, padx=(6, 12), sticky="ew")
         request_entry.bind("<Return>", lambda _event: self.add_request_from_ui())
         ttk.Button(requests_toolbar, text="Add", command=self.add_request_from_ui).grid(row=0, column=4, padx=(0, 6))
-        ttk.Button(requests_toolbar, text="Complete Selected", command=self.complete_selected_request).grid(row=0, column=5, padx=(0, 6))
-        ttk.Button(requests_toolbar, text="Refresh", command=self.refresh_requests).grid(row=0, column=6)
+        ttk.Button(requests_toolbar, text="🔍 Find Source", command=self.search_source_for_selected_request).grid(row=0, column=5, padx=(0, 6))
+        ttk.Button(requests_toolbar, text="Complete Selected", command=self.complete_selected_request).grid(row=0, column=6, padx=(0, 6))
+        ttk.Button(requests_toolbar, text="Refresh", command=self.refresh_requests).grid(row=0, column=7)
 
         requests_frame = ttk.Frame(requests_tab)
         requests_frame.grid(row=1, column=0, sticky="nsew")
@@ -255,6 +284,8 @@ class DesktopApp:
         )
         self.request_detail_text.grid(row=0, column=0, sticky="ew")
         self.requests_tree.bind("<<TreeviewSelect>>", self._on_request_selected)
+        # Double-click a request to open its torrent-source search in Firefox.
+        self.requests_tree.bind("<Double-1>", self._on_request_activated)
 
         library_toolbar = ttk.Frame(library_tab)
         library_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
@@ -581,6 +612,108 @@ class DesktopApp:
                 "Nothing changed",
                 f"Request #{request_id} was already completed or no longer exists.",
             )
+
+    # ---------------------------------------------------------------------
+    # Source search (open torrent site for a request)
+    # ---------------------------------------------------------------------
+
+    def _on_request_activated(self, _event: Any) -> None:
+        """Double-click handler: open the source search for the clicked row."""
+        self.search_source_for_selected_request()
+
+    def _selected_request_id(self) -> int | None:
+        if self.requests_tree is None:
+            return None
+        selected = self.requests_tree.selection()
+        if not selected:
+            return None
+        values = self.requests_tree.item(selected[0], "values")
+        if not values:
+            return None
+        return int(values[0])
+
+    @staticmethod
+    def _source_search_url(media_type: str, query: str) -> str:
+        template = _SOURCE_SEARCH_BY_TYPE.get(media_type, _TPB_SEARCH)
+        return template.format(q=urllib.parse.quote_plus(query))
+
+    def search_source_for_selected_request(self) -> None:
+        request_id = self._selected_request_id()
+        if request_id is None:
+            self._show_warning("No request selected", "Select a request in the list first.")
+            return
+
+        req = get_request(request_id)
+        if req is None:
+            self._show_warning("Request not found", f"Request #{request_id} no longer exists.")
+            return
+
+        query = (req.resolved_title or req.content or "").strip()
+        if not query:
+            self._show_warning("Nothing to search", "This request has no title to search for.")
+            return
+
+        url = self._source_search_url(req.media_type, query)
+        site = "Sukebei" if req.media_type == "xanime" else (
+            "nyaa.si" if req.media_type == "anime" else "The Pirate Bay")
+        self._open_in_firefox(url)
+        self.last_action_var.set(f"Last action: searched {site} for request #{request_id}")
+        self.status_var.set(f"Opened {site} search for: {query}")
+
+    def _open_in_firefox(self, url: str) -> None:
+        """Open *url* in a new Firefox tab, falling back to the default browser."""
+        browser = self._get_firefox_browser()
+        try:
+            if browser is not None:
+                browser.open_new_tab(url)
+            else:
+                webbrowser.open_new_tab(url)
+        except Exception:
+            logger.exception("Failed to open source search URL: %s", url)
+            try:
+                webbrowser.open_new_tab(url)
+            except Exception:
+                logger.exception("Default browser also failed to open: %s", url)
+
+    def _get_firefox_browser(self) -> Any:
+        """Return a cached webbrowser controller for Firefox, or None."""
+        if self._firefox_browser_cache is not _FIREFOX_UNSET:
+            return self._firefox_browser_cache
+
+        controller = None
+        firefox_path = self._find_firefox_path()
+        if firefox_path:
+            try:
+                webbrowser.register(
+                    "plex_reset_firefox", None,
+                    webbrowser.BackgroundBrowser(firefox_path),
+                )
+                controller = webbrowser.get("plex_reset_firefox")
+            except Exception:
+                logger.exception("Could not register Firefox at %s", firefox_path)
+                controller = None
+        else:
+            logger.info("Firefox not found; source searches will use the default browser.")
+
+        self._firefox_browser_cache = controller
+        return controller
+
+    @staticmethod
+    def _find_firefox_path() -> str | None:
+        """Locate firefox.exe via PATH or the standard install directories."""
+        on_path = shutil.which("firefox")
+        if on_path:
+            return on_path
+        candidates = [
+            Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+            / "Mozilla Firefox" / "firefox.exe",
+            Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"))
+            / "Mozilla Firefox" / "firefox.exe",
+        ]
+        for candidate in candidates:
+            if candidate.is_file():
+                return str(candidate)
+        return None
 
     # =====================================================================
     # Plex actions
