@@ -40,6 +40,7 @@ import auth_store
 import downloads_store
 import torrent_routing
 from download_manager import DownloadManager
+from shows_tab import ShowsTab
 from torrent_search import TorrentResult, format_size, search_torrents
 
 logger = logging.getLogger(__name__)
@@ -241,6 +242,7 @@ class DesktopApp:
         self.refresh_library_metrics()
         self.refresh_downloads()
         self.refresh_users_tab()
+        self.shows_tab.refresh()
         self._schedule_status_refresh()
         self._schedule_log_refresh()
         self._schedule_daily_library_check()
@@ -296,6 +298,7 @@ class DesktopApp:
         status_tab = ttk.Frame(notebook, padding=12)
         requests_tab = ttk.Frame(notebook, padding=12)
         downloads_tab = ttk.Frame(notebook, padding=12)
+        shows_tab = ttk.Frame(notebook, padding=12)
         library_tab = ttk.Frame(notebook, padding=12)
         metrics_tab = ttk.Frame(notebook, padding=12)
         maintenance_tab = ttk.Frame(notebook, padding=12)
@@ -305,6 +308,7 @@ class DesktopApp:
         notebook.add(status_tab, text="Status")
         notebook.add(requests_tab, text="Requests")
         notebook.add(downloads_tab, text="Downloads")
+        notebook.add(shows_tab, text="Shows")
         notebook.add(library_tab, text="Library")
         notebook.add(metrics_tab, text="Metrics")
         notebook.add(maintenance_tab, text="Maintenance")
@@ -316,6 +320,9 @@ class DesktopApp:
         self._downloads_tab = downloads_tab
         self._build_downloads_tab(downloads_tab)
         self._build_users_tab(users_tab)
+        # Shows tab lives in its own module (shows_tab.py) — the first tab
+        # split out of this class; new tabs should follow that pattern.
+        self.shows_tab = ShowsTab(shows_tab, self)
 
         status_tab.columnconfigure(0, weight=1)
         status_tab.rowconfigure(0, weight=1)
@@ -1352,6 +1359,24 @@ class DesktopApp:
         staging.mkdir(parents=True, exist_ok=True)
         os.startfile(str(staging))  # noqa: S606 — local folder open on Windows
 
+    def open_downloads_search(
+        self, query: str, media_type: str,
+        *, request_context: tuple[int, str] | None = None,
+    ) -> None:
+        """Jump to the Downloads tab with a search pre-filled and running.
+
+        Used by the Requests tab ("Grab Torrent") and the Shows tab ("Find
+        Torrent for Selected Episode").
+        """
+        if media_type not in ("movie", "tv", "anime", "xanime"):
+            media_type = "other"
+        self._dl_request_context = request_context
+        self._dl_search_var.set(query)
+        self._dl_type_var.set(media_type)
+        if self._notebook is not None and self._downloads_tab is not None:
+            self._notebook.select(self._downloads_tab)
+        self.search_torrents_from_ui()
+
     def grab_torrent_for_selected_request(self) -> None:
         """Requests tab → Downloads tab: pre-fill the search for a request."""
         request_id = self._selected_request_id()
@@ -1363,13 +1388,9 @@ class DesktopApp:
             self._show_warning("Request not found", f"Request #{request_id} no longer exists.")
             return
         query = (req.resolved_title or req.content or "").strip()
-        media_type = req.media_type if req.media_type in ("movie", "tv", "anime", "xanime") else "other"
-        self._dl_request_context = (request_id, query)
-        self._dl_search_var.set(query)
-        self._dl_type_var.set(media_type)
-        if self._notebook is not None and self._downloads_tab is not None:
-            self._notebook.select(self._downloads_tab)
-        self.search_torrents_from_ui()
+        self.open_downloads_search(
+            query, req.media_type, request_context=(request_id, query),
+        )
 
     # --- Auto-grab poller -------------------------------------------------
 

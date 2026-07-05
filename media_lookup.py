@@ -978,3 +978,148 @@ def lookup_media(request: ParsedRequest, media_type: str) -> LookupResult:
         best_match=best,
         search_attempted=search_attempted,
     )
+
+
+# ---------------------------------------------------------------------------
+# Episode lists — used by the Shows tracker (show_tracker.py)
+# ---------------------------------------------------------------------------
+# One fetcher per identification source. All return EpisodeInfo lists sorted
+# by (season, episode) and degrade to [] on failure, matching the rest of
+# this module. AniDB has no cheap episode API, so xanime shows identified
+# via AniDB sync episodes through Jikan when a MAL id is available.
+
+
+@dataclass(frozen=True)
+class EpisodeInfo:
+    season: int
+    episode: int
+    title: str
+    air_date: str | None   # ISO YYYY-MM-DD, None when unaired/unknown
+
+
+def get_tvdb_episodes(series_id: str) -> list[EpisodeInfo]:
+    """All aired-order episodes for a TVDB series (specials = season 0)."""
+    token = _tvdb_get_token()
+    if not token:
+        return []
+
+    episodes: list[EpisodeInfo] = []
+    page = 0
+    while page < 20:  # hard cap — longest real shows are < 20 pages of 500
+        url = f"{_TVDB_BASE}/series/{series_id}/episodes/default?page={page}"
+        try:
+            data = _get_json(url, headers={"Authorization": f"Bearer {token}"})
+        except RuntimeError as exc:
+            logger.error("TVDB episodes fetch failed for %s: %s", series_id, exc)
+            break
+        payload = data.get("data") or {}
+        for ep in payload.get("episodes") or []:
+            season = ep.get("seasonNumber")
+            number = ep.get("number")
+            if season is None or number is None:
+                continue
+            episodes.append(EpisodeInfo(
+                season=int(season), episode=int(number),
+                title=ep.get("name") or "",
+                air_date=(ep.get("aired") or None),
+            ))
+        links = data.get("links") or {}
+        if not links.get("next"):
+            break
+        page += 1
+    episodes.sort(key=lambda e: (e.season, e.episode))
+    return episodes
+
+
+def get_tvdb_series_status(series_id: str) -> str:
+    """'Continuing' / 'Ended' / '' (unknown)."""
+    token = _tvdb_get_token()
+    if not token:
+        return ""
+    try:
+        data = _get_json(
+            f"{_TVDB_BASE}/series/{series_id}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    except RuntimeError:
+        return ""
+    return ((data.get("data") or {}).get("status") or {}).get("name") or ""
+
+
+def get_tmdb_tv_episodes(tv_id: str) -> list[EpisodeInfo]:
+    """All episodes for a TMDB TV show, season by season."""
+    if not _tmdb_enabled():
+        return []
+    key = config.TMDB_API_KEY
+    try:
+        show = _get_json(f"{_TMDB_BASE}/tv/{tv_id}?api_key={key}")
+    except RuntimeError as exc:
+        logger.error("TMDB show fetch failed for %s: %s", tv_id, exc)
+        return []
+
+    episodes: list[EpisodeInfo] = []
+    for season_stub in show.get("seasons") or []:
+        season_num = season_stub.get("season_number")
+        if season_num is None:
+            continue
+        try:
+            season = _get_json(f"{_TMDB_BASE}/tv/{tv_id}/season/{season_num}?api_key={key}")
+        except RuntimeError:
+            continue
+        for ep in season.get("episodes") or []:
+            episodes.append(EpisodeInfo(
+                season=int(ep.get("season_number") or season_num),
+                episode=int(ep.get("episode_number") or 0),
+                title=ep.get("name") or "",
+                air_date=ep.get("air_date") or None,
+            ))
+    episodes.sort(key=lambda e: (e.season, e.episode))
+    return episodes
+
+
+def get_tmdb_tv_status(tv_id: str) -> str:
+    if not _tmdb_enabled():
+        return ""
+    try:
+        data = _get_json(f"{_TMDB_BASE}/tv/{tv_id}?api_key={config.TMDB_API_KEY}")
+    except RuntimeError:
+        return ""
+    return data.get("status") or ""   # "Returning Series" / "Ended" / ...
+
+
+def get_jikan_episodes(mal_id: str) -> list[EpisodeInfo]:
+    """Episodes for one MAL entry. MAL entries are per-season, so season=1."""
+    episodes: list[EpisodeInfo] = []
+    page = 1
+    while page < 40:  # 100/page; hard cap for absurd long-runners
+        _jikan_throttle()
+        url = f"{_JIKAN_BASE}/anime/{mal_id}/episodes?page={page}"
+        try:
+            data = _get_json(url)
+        except RuntimeError as exc:
+            logger.error("Jikan episodes fetch failed for %s: %s", mal_id, exc)
+            break
+        for ep in data.get("data") or []:
+            number = ep.get("mal_id")
+            if number is None:
+                continue
+            aired = ep.get("aired") or ""
+            episodes.append(EpisodeInfo(
+                season=1, episode=int(number),
+                title=ep.get("title") or "",
+                air_date=aired[:10] if aired else None,
+            ))
+        if not ((data.get("pagination") or {}).get("has_next_page")):
+            break
+        page += 1
+    episodes.sort(key=lambda e: (e.season, e.episode))
+    return episodes
+
+
+def get_jikan_status(mal_id: str) -> str:
+    _jikan_throttle()
+    try:
+        data = _get_json(f"{_JIKAN_BASE}/anime/{mal_id}")
+    except RuntimeError:
+        return ""
+    return ((data.get("data") or {}).get("status")) or ""  # "Currently Airing" / "Finished Airing"
