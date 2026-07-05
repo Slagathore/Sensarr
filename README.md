@@ -40,6 +40,13 @@ plex_auth.py         Plex PIN/token authentication flow (urllib, no extra deps)
 library_index.py     SQLite-backed filesystem media indexer and searcher
 metrics_report.py    Formats combined metrics message for bot and desktop
 queue_store.py       SQLite request queue — add, complete, list, count
+auth_store.py        Telegram allowlist + access requests (admin approval)
+db.py                Shared SQLite connection helper (WAL, busy timeout)
+torrent_search.py    In-app torrent search (YTS / TPB / nyaa / sukebei)
+torrent_routing.py   Destination planner — show/season folders, safe renames
+download_manager.py  Torrent downloads via Node webtorrent runner + history
+downloads_store.py   Downloads + before/after history tables
+torrent_runner/      Headless Node webtorrent downloader (npm install once)
 config.py            Centralised config: reads .env, validates required keys
 app_logging.py       Dual log handler: stderr stream + in-memory ring buffer
 diagnose.py          Standalone DPI/asset diagnostic tool (read-only, safe to run)
@@ -78,6 +85,7 @@ Copy `.env.example` to `.env` and edit the values. The `.env` file is git-ignore
 | Variable                       | Required | Default                                                         | Description                                                 |
 | ------------------------------ | -------- | --------------------------------------------------------------- | ----------------------------------------------------------- |
 | `TELEGRAM_BOT_TOKEN`           | **Yes**  | —                                                               | Bot token from @BotFather                                   |
+| `TELEGRAM_ALLOWED_USER_IDS`    | No       | —                                                               | Comma-separated Telegram user IDs always allowed to use the bot (see Security Notes) |
 | `PLEX_MEDIA_SERVER_PATH`       | No       | `C:\Program Files\Plex\Plex Media Server\Plex Media Server.exe` | Full path to the Plex executable                            |
 | `PLEX_SERVER_URL`              | No       | `http://127.0.0.1:32400`                                        | Local Plex server URL                                       |
 | `PLEX_TOKEN`                   | No       | —                                                               | Plex authentication token (obtain via the in-app auth flow) |
@@ -193,10 +201,18 @@ To enable API-based features (metrics, library search, session data) you need a 
 
 ## Security Notes
 
+- **The bot only answers allowlisted Telegram users.** The allowlist lives in
+  the app database (`allowed_users` table), seeded on first run from everyone
+  who previously filed a request; each seeded name is pinned to a numeric
+  Telegram ID the first time that user messages the bot. Denied users are
+  shown their numeric ID — add it to `TELEGRAM_ALLOWED_USER_IDS` in `.env`
+  (or via the Settings tab) to let them in.
 - Your `.env` file is git-ignored and never committed
 - The Telegram bot token grants full control of the bot — treat it like a password
 - The Plex token is stored locally in `.env` only
 - The app only responds to Telegram updates delivered to your bot; no ports are opened
+- Note: the default `OLLAMA_MODEL` ends in `:cloud`, which relays request text
+  through Ollama's hosted service. Use a local model tag to keep inference on-box.
 
 ---
 

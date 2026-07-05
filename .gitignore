@@ -9,8 +9,7 @@
 # SQLite databases contain user request history and library index
 *.db
 # PyAutoGUI debug screenshots may capture personal screen content
-debug_screenshot.png
-debug_tray_corner.png
+debug_*.png
 # Log files may contain token fragments or personal file paths
 *.log
 pyinstaller_check.log
@@ -36,6 +35,10 @@ __pycache__/
 # -----------------------------------------------------------------------
 build/
 dist/
+torrent_runner/node_modules/
+
+# Torrent staging area (in-progress and unrouted downloads)
+downloads/
 
 # -----------------------------------------------------------------------
 # Editor / OS noise

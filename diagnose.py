@@ -7,7 +7,10 @@
 # reference asset and what PyAutoGUI sees on screen, and guide you to
 # capture a replacement asset at the correct resolution.
 #
-# Nothing here modifies bot state — it is entirely read-only / informational.
+# Mostly read-only: the diagnostics only capture screenshots and write
+# debug_*.png files. The one exception is auto_fix_asset_dpi(), which — after
+# an explicit prompt — rescales and OVERWRITES assets/tray_icon.png in place
+# (a .bak backup of the original is saved alongside it first).
 # =============================================================================
 
 import sys
