@@ -1,0 +1,10 @@
+{
+  "name": "plexresetbutton-torrent-runner",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Headless webtorrent downloader used by PlexResetButton's download pipeline",
+  "type": "module",
+  "dependencies": {
+    "webtorrent": "^2.5.1"
+  }
+}
