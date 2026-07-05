@@ -70,6 +70,29 @@ def _env_bool(key: str, default: bool) -> bool:
 
 
 TELEGRAM_BOT_TOKEN: str = _require("TELEGRAM_BOT_TOKEN")
+
+
+def _parse_id_list(raw: str) -> tuple[int, ...]:
+    """Parse a comma/semicolon-separated list of numeric Telegram user IDs."""
+    out: list[int] = []
+    for token in raw.replace(";", ",").split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            out.append(int(token))
+        except ValueError:
+            continue
+    return tuple(out)
+
+
+# Telegram user IDs that are always authorized to use the bot, in addition to
+# the SQLite allowlist managed by auth_store (which is seeded from past
+# requesters). Find your ID by messaging the bot once — denied users are shown
+# their own ID so the admin can paste it here.
+TELEGRAM_ALLOWED_USER_IDS: tuple[int, ...] = _parse_id_list(
+    os.getenv("TELEGRAM_ALLOWED_USER_IDS", "")
+)
 APP_PRODUCT_NAME: str = "Plex Reset Button"
 APP_VERSION: str = "1.0"
 
@@ -223,10 +246,14 @@ OMDB_API_KEY: str = os.getenv("OMDB_API_KEY", "").strip()
 
 # ---------------------------------------------------------------------------
 # Ollama — used for fuzzy title matching and 'Other' request categorization
-# Ollama must be running locally (https://ollama.com).
-# The model should already be available via Ollama (gemini-3-flash-preview:cloud).
+# The Ollama *daemon* runs locally (https://ollama.com), but note: the default
+# model tag ends in ":cloud", which means Ollama relays the prompt to its
+# hosted cloud service for inference — request text (user titles, including
+# xanime requests) LEAVES THIS MACHINE and is processed by ollama.com under
+# their privacy policy. This is a deliberate choice (no local GPU inference
+# required). To keep everything on-box instead, set OLLAMA_MODEL to a local
+# tag you have pulled (e.g. "llama3.1:8b") — the code needs no other change.
 # OLLAMA_HOST defaults to http://localhost:11434 (standard Ollama install).
-# OLLAMA_MODEL is whatever tag you have pulled in Ollama.
 # ---------------------------------------------------------------------------
 OLLAMA_HOST: str = os.getenv("OLLAMA_HOST", "http://localhost:11434").strip()
 OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "gemini-3-flash-preview:cloud").strip()
@@ -243,3 +270,26 @@ ANIDB_CLIENT_VER: int = int(os.getenv("ANIDB_CLIENT_VER", "1"))
 # The check compares open requests against the Plex library and marks found ones
 # ---------------------------------------------------------------------------
 LIBRARY_CHECK_HOUR: int = int(os.getenv("LIBRARY_CHECK_HOUR", "3"))
+
+# ---------------------------------------------------------------------------
+# Torrent download pipeline (webtorrent engine via Node runner)
+# ---------------------------------------------------------------------------
+# Staging directory — every torrent downloads here first; files only move to
+# a library folder when the route is confident and "move" is enabled (or the
+# admin clicks Apply Route). Keeping a fixed staging dir means a confused
+# route can never scatter files somewhere hard to find.
+TORRENT_DOWNLOAD_DIR: str = os.getenv(
+    "TORRENT_DOWNLOAD_DIR", str(APP_DIR / "downloads")
+)
+# Default states for the Downloads-tab checkboxes (persisted when toggled).
+TORRENT_AUTO_RENAME: bool = _env_bool("TORRENT_AUTO_RENAME", False)
+TORRENT_AUTO_MOVE: bool = _env_bool("TORRENT_AUTO_MOVE", False)
+# When on, new bot requests are searched and grabbed automatically
+# (best-seeded result). Off = admin approves each grab by hand.
+TORRENT_AUTO_GRAB: bool = _env_bool("TORRENT_AUTO_GRAB", False)
+# Abort a download when no data arrives for this many seconds.
+TORRENT_STALL_TIMEOUT_SECONDS: int = int(
+    os.getenv("TORRENT_STALL_TIMEOUT_SECONDS", "900")
+)
+# Path to the Node.js executable used to run the webtorrent downloader.
+NODE_PATH: str = os.getenv("NODE_PATH_EXE", "node")

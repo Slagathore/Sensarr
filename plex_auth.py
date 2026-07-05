@@ -33,9 +33,15 @@ class PlexTokenResult:
 
 
 def _ssl_context() -> ssl.SSLContext | None:
-    if config.PLEX_VERIFY_SSL:
-        return None
-    return ssl._create_unverified_context()
+    """Always verify TLS for plex.tv.
+
+    PLEX_VERIFY_SSL exists to tolerate the *local* Plex server's self-signed
+    certificate (see plex_api.py). It must NOT weaken the connection to the
+    public plex.tv auth endpoint, which has a valid certificate — an
+    unverified context there would expose the account token to MITM.
+    Returning None makes urllib use the default verifying context.
+    """
+    return None
 
 
 def _auth_headers(client_identifier: str) -> dict[str, str]:

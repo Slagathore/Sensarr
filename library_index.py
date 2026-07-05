@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import config
+import db
 
 _DB_LOCK = threading.Lock()
 
@@ -77,7 +78,7 @@ def initialize_library_index_db() -> None:
     db_path = _db_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with _DB_LOCK, sqlite3.connect(db_path) as conn:
+    with _DB_LOCK, db.connect(db_path) as conn:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS library_files (
@@ -105,7 +106,7 @@ def rebuild_library_index() -> ReindexResult:
     valid_paths, missing_paths = _configured_library_paths()
     extensions = set(config.LIBRARY_INDEX_EXTENSIONS)
 
-    with _DB_LOCK, sqlite3.connect(_db_path()) as conn:
+    with _DB_LOCK, db.connect(_db_path()) as conn:
         conn.execute("DELETE FROM library_files")
 
         batch: list[tuple[str, str, str, str, int, float]] = []
@@ -168,7 +169,7 @@ def rebuild_library_index() -> ReindexResult:
 
 def indexed_file_count() -> int:
     initialize_library_index_db()
-    with _DB_LOCK, sqlite3.connect(_db_path()) as conn:
+    with _DB_LOCK, db.connect(_db_path()) as conn:
         row = conn.execute("SELECT COUNT(*) FROM library_files").fetchone()
     return int(row[0]) if row is not None else 0
 
@@ -297,7 +298,7 @@ def search_library(query: str, *, limit: int | None = None) -> list[LibraryEntry
     initialize_library_index_db()
     max_results = limit or config.LIBRARY_SEARCH_RESULT_LIMIT
 
-    with _DB_LOCK, sqlite3.connect(_db_path()) as conn:
+    with _DB_LOCK, db.connect(_db_path()) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """
@@ -423,7 +424,7 @@ def library_metrics() -> LibraryMetrics:
     cutoff_7d = now - (7 * 24 * 60 * 60)
     cutoff_30d = now - (30 * 24 * 60 * 60)
 
-    with _DB_LOCK, sqlite3.connect(_db_path()) as conn:
+    with _DB_LOCK, db.connect(_db_path()) as conn:
         summary_row = conn.execute(
             """
             SELECT

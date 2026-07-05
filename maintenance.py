@@ -664,14 +664,12 @@ def find_unindexed_files() -> list[UnindexedFile]:
     Requires that the library index has been built (run Reindex first).
     If Plex API is available, it also checks against live Plex metadata.
     """
-    import sqlite3
-    from queue_store import _db_path
+    import db
 
     # Load indexed paths from the SQLite library_files table
     indexed_paths: set[str] = set()
     try:
-        db = Path(config.APP_DIR) / Path(config.APP_DB_PATH).name
-        with sqlite3.connect(str(db)) as conn:
+        with db.connect() as conn:
             rows = conn.execute("SELECT path FROM library_files").fetchall()
         indexed_paths = {row[0] for row in rows}
     except Exception as exc:

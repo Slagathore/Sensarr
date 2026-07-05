@@ -10,13 +10,13 @@
 #           external_url, found_in_library, library_checked_at
 # =============================================================================
 
-import hashlib
 import sqlite3
 import threading
 from dataclasses import dataclass
 from pathlib import Path
 
 import config
+import db
 
 _DB_LOCK = threading.Lock()
 
@@ -82,7 +82,7 @@ def initialize_queue_db() -> None:
     db_path = _db_path()
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with _DB_LOCK, sqlite3.connect(db_path) as conn:
+    with _DB_LOCK, db.connect(db_path) as conn:
         conn.execute(_SCHEMA_V1)
         conn.commit()
 
@@ -152,7 +152,7 @@ def add_request(
         raise ValueError("Request content cannot be empty.")
 
     initialize_queue_db()
-    with _DB_LOCK, sqlite3.connect(_db_path()) as conn:
+    with _DB_LOCK, db.connect(_db_path()) as conn:
         cursor = conn.execute(
             """
             INSERT INTO requests
@@ -174,7 +174,7 @@ def add_request(
 
 def get_request(request_id: int) -> QueueRequest | None:
     initialize_queue_db()
-    with _DB_LOCK, sqlite3.connect(_db_path()) as conn:
+    with _DB_LOCK, db.connect(_db_path()) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
             """
@@ -191,7 +191,7 @@ def get_request(request_id: int) -> QueueRequest | None:
 
 def list_requests(*, status: str = "open", limit: int = 50) -> list[QueueRequest]:
     initialize_queue_db()
-    with _DB_LOCK, sqlite3.connect(_db_path()) as conn:
+    with _DB_LOCK, db.connect(_db_path()) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """
@@ -211,7 +211,7 @@ def list_requests(*, status: str = "open", limit: int = 50) -> list[QueueRequest
 
 def complete_request(request_id: int) -> bool:
     initialize_queue_db()
-    with _DB_LOCK, sqlite3.connect(_db_path()) as conn:
+    with _DB_LOCK, db.connect(_db_path()) as conn:
         cursor = conn.execute(
             """
             UPDATE requests
@@ -227,7 +227,7 @@ def complete_request(request_id: int) -> bool:
 def update_library_status(request_id: int, *, found: bool) -> None:
     """Mark a request as found (or not found) in the Plex library after a check."""
     initialize_queue_db()
-    with _DB_LOCK, sqlite3.connect(_db_path()) as conn:
+    with _DB_LOCK, db.connect(_db_path()) as conn:
         conn.execute(
             """
             UPDATE requests
@@ -245,7 +245,7 @@ def get_requests_needing_library_check(*, max_age_hours: int = 20) -> list[Queue
     max_age_hours, or have never been checked.
     """
     initialize_queue_db()
-    with _DB_LOCK, sqlite3.connect(_db_path()) as conn:
+    with _DB_LOCK, db.connect(_db_path()) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """
@@ -295,7 +295,7 @@ def find_duplicate_requests() -> list[list[QueueRequest]]:
 
 def open_request_count() -> int:
     initialize_queue_db()
-    with _DB_LOCK, sqlite3.connect(_db_path()) as conn:
+    with _DB_LOCK, db.connect(_db_path()) as conn:
         row = conn.execute(
             "SELECT COUNT(*) FROM requests WHERE status = 'open'"
         ).fetchone()
