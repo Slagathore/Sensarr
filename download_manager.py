@@ -36,7 +36,29 @@ from torrent_search import TorrentResult, search_torrents
 
 logger = logging.getLogger(__name__)
 
-_RUNNER_PATH = Path(config.APP_DIR) / "torrent_runner" / "download.mjs"
+
+def _resolve_runner_path() -> Path:
+    """Locate download.mjs across the layouts it can live in.
+
+    - From source: <repo>/torrent_runner/download.mjs (APP_DIR == repo).
+    - Frozen EXE: node_modules can only sit beside the script, so we prefer a
+      writable torrent_runner NEXT TO the exe (APP_DIR/torrent_runner);
+      PyInstaller also bundles a read-only copy under _internal, and older
+      builds used BUNDLE_DIR — check those as fallbacks so the path always
+      resolves even if the sibling folder wasn't seeded.
+    """
+    candidates = [
+        Path(config.APP_DIR) / "torrent_runner" / "download.mjs",
+        Path(config.APP_DIR) / "_internal" / "torrent_runner" / "download.mjs",
+        Path(config.BUNDLE_DIR) / "torrent_runner" / "download.mjs",
+    ]
+    for path in candidates:
+        if path.is_file():
+            return path
+    return candidates[0]  # default; surfaced as a clear error at grab time
+
+
+_RUNNER_PATH = _resolve_runner_path()
 
 # Windows: suppress the console window for the Node subprocess.
 _CREATE_NO_WINDOW = 0x08000000

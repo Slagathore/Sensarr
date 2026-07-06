@@ -41,8 +41,36 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
+:: --------------------------------------------------------------------------
+:: Seed the Node torrent runner NEXT TO the freshly built EXE and install its
+:: dependencies. node_modules must sit beside download.mjs (Node resolves it
+:: from the script's folder), and PyInstaller only bundles the scripts under
+:: _internal, so we copy them out and npm install here. This makes every build
+:: self-sufficient for the Downloads pipeline (Node.js must be on PATH).
+:: --------------------------------------------------------------------------
+set "EXE_RUNNER=%DIST_ROOT%\PlexResetButton\torrent_runner"
+where node >nul 2>nul
+if %errorlevel% neq 0 (
+    echo.
+    echo NOTE: Node.js not found on PATH — skipping torrent runner setup.
+    echo       The app runs fine, but the Downloads pipeline needs Node.js.
+    echo       Install Node 20+, then run: cd "%EXE_RUNNER%" ^&^& npm install
+) else (
+    echo.
+    echo Setting up the torrent runner next to the EXE...
+    if not exist "%EXE_RUNNER%" mkdir "%EXE_RUNNER%"
+    copy /y "%SCRIPT_DIR%\torrent_runner\download.mjs"       "%EXE_RUNNER%\" >nul
+    copy /y "%SCRIPT_DIR%\torrent_runner\diag.mjs"           "%EXE_RUNNER%\" >nul
+    copy /y "%SCRIPT_DIR%\torrent_runner\package.json"       "%EXE_RUNNER%\" >nul
+    copy /y "%SCRIPT_DIR%\torrent_runner\package-lock.json"  "%EXE_RUNNER%\" >nul
+    pushd "%EXE_RUNNER%"
+    call npm install --no-audit --no-fund
+    popd
+)
+
 echo.
 echo Build complete.
 echo Executable bundle: %DIST_ROOT%\PlexResetButton
+echo Run setup_autostart.bat to point logon-autostart at this new build.
 pause
 endlocal
