@@ -71,6 +71,11 @@ _SCHEMA = [
 # Columns added after the tables first shipped — applied via ALTER on upgrade.
 _MIGRATIONS: list[tuple[str, str, str]] = [
     ("episodes", "grab_download_id", "INTEGER"),
+    # Airing schedule — next_episode_to_air captured from TMDB (see show_tracker).
+    ("tracked_shows", "tmdb_id", "TEXT"),
+    ("tracked_shows", "next_air_date", "TEXT"),
+    ("tracked_shows", "next_season", "INTEGER"),
+    ("tracked_shows", "next_episode", "INTEGER"),
 ]
 
 
@@ -98,6 +103,9 @@ class TrackedShow:
     have_count: int = 0
     missing_count: int = 0
     next_air_date: str | None = None
+    next_season: int | None = None
+    next_episode: int | None = None
+    tmdb_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -192,8 +200,12 @@ def list_shows() -> list[TrackedShow]:
                    (SELECT COUNT(*) FROM episodes e WHERE e.show_id = s.id AND e.season > 0 AND e.has_file = 1),
                    (SELECT COUNT(*) FROM episodes e WHERE e.show_id = s.id AND e.season > 0
                         AND e.has_file = 0 AND e.air_date IS NOT NULL AND e.air_date <= ?),
-                   (SELECT MIN(e.air_date) FROM episodes e WHERE e.show_id = s.id
-                        AND e.air_date IS NOT NULL AND e.air_date > ?)
+                   -- Prefer the TMDB-sourced next_air_date; fall back to the
+                   -- earliest future episode row if one happens to exist.
+                   COALESCE(s.next_air_date,
+                            (SELECT MIN(e.air_date) FROM episodes e WHERE e.show_id = s.id
+                                 AND e.air_date IS NOT NULL AND e.air_date > ?)),
+                   s.next_season, s.next_episode, s.tmdb_id
             FROM tracked_shows s ORDER BY s.title COLLATE NOCASE
             """,
             (today, today),
@@ -211,7 +223,8 @@ def list_shows() -> list[TrackedShow]:
             added_at=r[8], last_synced=r[9],
             folders=tuple(folders.get(r[0], [])),
             episode_count=r[10], have_count=r[11], missing_count=r[12],
-            next_air_date=r[13],
+            next_air_date=r[13], next_season=r[14], next_episode=r[15],
+            tmdb_id=r[16],
         )
         for r in rows
     ]
@@ -243,6 +256,23 @@ def set_show_status(show_id: int, status: str) -> None:
         return
     with _SHOWS_LOCK, db.connect() as conn:
         conn.execute("UPDATE tracked_shows SET status = ? WHERE id = ?", (status, show_id))
+        conn.commit()
+
+
+def set_show_tmdb_id(show_id: int, tmdb_id: str) -> None:
+    with _SHOWS_LOCK, db.connect() as conn:
+        conn.execute("UPDATE tracked_shows SET tmdb_id = ? WHERE id = ?", (tmdb_id, show_id))
+        conn.commit()
+
+
+def set_show_airing(show_id: int, *, next_air_date: str | None,
+                    next_season: int | None, next_episode: int | None) -> None:
+    """Store the next-episode-to-air captured from TMDB (all None clears it)."""
+    with _SHOWS_LOCK, db.connect() as conn:
+        conn.execute(
+            "UPDATE tracked_shows SET next_air_date = ?, next_season = ?, next_episode = ? WHERE id = ?",
+            (next_air_date, next_season, next_episode, show_id),
+        )
         conn.commit()
 
 
@@ -359,25 +389,46 @@ def clear_season_target(show_id: int, season: int) -> None:
 
 
 def upcoming_episodes(*, days: int = 14) -> list[tuple[TrackedShow, EpisodeRow]]:
-    """Episodes airing between today and today+days across all tracked shows."""
+    """Episodes airing between today and today+days across all tracked shows.
+
+    Primary source is each show's stored next-episode-to-air (TMDB); we also
+    fold in any genuinely future-dated episode rows (TVDB provides these) so a
+    week with multiple episodes isn't collapsed to one. Deduped by
+    (show, season, episode).
+    """
     initialize_shows_db()
     start = date.today().isoformat()
     end = (date.today() + timedelta(days=days)).isoformat()
     with _SHOWS_LOCK, db.connect() as conn:
-        rows = conn.execute(
+        ep_rows = conn.execute(
             """
-            SELECT e.id, e.show_id, e.season, e.episode, e.title, e.air_date,
+            SELECT e.show_id, e.season, e.episode, e.title, e.air_date,
                    e.has_file, e.file_path
             FROM episodes e
             WHERE e.air_date IS NOT NULL AND e.air_date >= ? AND e.air_date <= ?
-            ORDER BY e.air_date, e.show_id, e.season, e.episode
             """,
             (start, end),
         ).fetchall()
+
     shows_by_id = {s.show_id: s for s in list_shows()}
-    out: list[tuple[TrackedShow, EpisodeRow]] = []
-    for r in rows:
-        show = shows_by_id.get(r[1])
-        if show is not None:
-            out.append((show, EpisodeRow(r[0], r[1], r[2], r[3], r[4], r[5], bool(r[6]), r[7])))
-    return out
+    merged: dict[tuple[int, int, int], tuple[TrackedShow, EpisodeRow]] = {}
+
+    # Stored next-air per show (the reliable signal).
+    for show in shows_by_id.values():
+        if (show.next_air_date and start <= show.next_air_date <= end
+                and show.next_season is not None and show.next_episode is not None):
+            key = (show.show_id, show.next_season, show.next_episode)
+            merged[key] = (show, EpisodeRow(
+                0, show.show_id, show.next_season, show.next_episode, "",
+                show.next_air_date, False, None,
+            ))
+
+    # Future-dated episode rows (belt-and-suspenders for TVDB shows).
+    for r in ep_rows:
+        show = shows_by_id.get(r[0])
+        if show is None:
+            continue
+        key = (r[0], r[1], r[2])
+        merged.setdefault(key, (show, EpisodeRow(0, r[0], r[1], r[2], r[3], r[4], bool(r[5]), r[6])))
+
+    return sorted(merged.values(), key=lambda pair: (pair[1].air_date or "", pair[0].title))

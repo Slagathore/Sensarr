@@ -63,6 +63,18 @@ class MediaResult:
     overview: str
     source: str             # "tmdb" | "tvdb" | "jikan" | "anidb"
     qualifier: str | None = None   # anime season/arc from the parsed request
+    alt_titles: tuple[str, ...] = ()  # romaji/english/original — for matching
+
+
+def best_title_similarity(query: str, result: "MediaResult") -> float:
+    """Similarity of query against the result's primary AND alternate titles.
+
+    Anime folders are often romaji ("Shingeki no Bahamut") while the primary
+    result title may be English ("Rage of Bahamut"); scoring against both and
+    taking the max stops those from being scored as mismatches.
+    """
+    candidates = [result.title, *result.alt_titles]
+    return max((title_similarity(query, c) for c in candidates if c), default=0.0)
 
 
 @dataclass
@@ -273,14 +285,17 @@ def search_tmdb_shows(title: str, year: int | None = None, *, limit: int = 5) ->
             except ValueError:
                 pass
 
+        name = item.get("name") or item.get("original_name") or "Unknown"
+        original = item.get("original_name") or ""
         results.append(MediaResult(
-            title=item.get("name") or item.get("original_name") or "Unknown",
+            title=name,
             year=release_year,
             external_id=str(tmdb_id) if tmdb_id else "",
             external_url=f"{_TMDB_TV_WEB}/{tmdb_id}" if tmdb_id else "",
             media_type="tv",
             overview=(item.get("overview") or "")[:200],
             source="tmdb",
+            alt_titles=(original,) if original and original != name else (),
         ))
 
     return results
@@ -449,7 +464,11 @@ def search_tvdb_shows(title: str, year: int | None = None, *, limit: int = 5) ->
 _JIKAN_BASE = "https://api.jikan.moe/v4"
 _MAL_ANIME_WEB = "https://myanimelist.net/anime"
 _jikan_last_request: float = 0.0
-_JIKAN_RATE_LIMIT_S = 0.4  # Jikan allows 3/s; stay polite
+# Jikan v4 limits: ~3 req/s AND 60 req/min. The old 0.4s gap respected the
+# per-second cap but blew the per-minute one on multi-page fetches, causing
+# HTTP 429s. 1.1s between calls keeps us under both (~54/min worst case).
+_JIKAN_RATE_LIMIT_S = 1.1
+_JIKAN_MAX_RETRIES = 4
 
 
 def _jikan_throttle() -> None:
@@ -461,6 +480,26 @@ def _jikan_throttle() -> None:
     _jikan_last_request = time.time()
 
 
+def _jikan_get(url: str) -> dict | None:
+    """GET a Jikan URL with throttling and exponential backoff on HTTP 429.
+
+    Returns the parsed dict, or None if it kept getting rate-limited / failed.
+    """
+    for attempt in range(_JIKAN_MAX_RETRIES):
+        _jikan_throttle()
+        try:
+            return _get_json(url)
+        except RuntimeError as exc:
+            if "429" in str(exc) and attempt < _JIKAN_MAX_RETRIES - 1:
+                backoff = 2.0 * (attempt + 1)
+                logger.info("Jikan 429 — backing off %.1fs (attempt %d)", backoff, attempt + 1)
+                time.sleep(backoff)
+                continue
+            logger.error("Jikan request failed: %s", exc)
+            return None
+    return None
+
+
 def search_jikan_anime(title: str, *, explicit: bool = False, limit: int = 5) -> list[MediaResult]:
     """
     Search MAL via the Jikan v4 API.
@@ -468,30 +507,30 @@ def search_jikan_anime(title: str, *, explicit: bool = False, limit: int = 5) ->
     explicit=True filters to rating=rx (hentai on MAL).
     explicit=False adds sfw=true to exclude adult content from results.
     """
-    _jikan_throttle()
-
-    params: dict[str, str] = {
-        "q": title,
-        "limit": str(limit),
-        "order_by": "score",
-        "sort": "desc",
-    }
+    # NOTE: no order_by=score here. Ordering by MAL rating buried the actual
+    # title match under generically-popular shows (a search for "Shingeki no
+    # Bahamut" surfaced "Attack on Titan" first). Jikan's default ordering is
+    # relevance to the query, which is what identification needs.
+    params: dict[str, str] = {"q": title, "limit": str(limit)}
     if explicit:
         params["rating"] = "rx"
     else:
         params["sfw"] = "true"
 
     url = f"{_JIKAN_BASE}/anime?{urllib.parse.urlencode(params)}"
-    try:
-        data = _get_json(url)
-    except RuntimeError as exc:
-        logger.error("Jikan anime search failed: %s", exc)
+    data = _jikan_get(url)
+    if data is None:
         return []
 
     results: list[MediaResult] = []
     for item in (data.get("data") or [])[:limit]:
         mal_id = item.get("mal_id")
-        title_str = item.get("title_english") or item.get("title") or "Unknown"
+        # Keep BOTH titles so callers can match romaji or english folder names.
+        title_en = item.get("title_english") or ""
+        title_romaji = item.get("title") or ""
+        title_str = title_en or title_romaji or "Unknown"
+        alt = tuple(t for t in {title_en, title_romaji,
+                                *(item.get("title_synonyms") or [])} if t and t != title_str)
 
         year: int | None = None
         y = item.get("year")
@@ -516,6 +555,7 @@ def search_jikan_anime(title: str, *, explicit: bool = False, limit: int = 5) ->
             media_type="xanime" if explicit else "anime",
             overview=synopsis,
             source="jikan",
+            alt_titles=alt,
         ))
 
     return results
@@ -1087,17 +1127,19 @@ def get_tmdb_tv_status(tv_id: str) -> str:
     return data.get("status") or ""   # "Returning Series" / "Ended" / ...
 
 
-def get_jikan_episodes(mal_id: str) -> list[EpisodeInfo]:
-    """Episodes for one MAL entry. MAL entries are per-season, so season=1."""
+def get_jikan_episodes(mal_id: str, *, max_pages: int = 12) -> list[EpisodeInfo]:
+    """Episodes for one MAL entry. MAL entries are per-season, so season=1.
+
+    Jikan lists only AIRED episodes (never future ones) — do not use this for
+    'next episode to air'; use get_tmdb_next_air for that. Pagination is capped
+    (100 eps/page) so a 1000-episode show doesn't hammer the rate limit; the
+    tracker only needs aired counts, not every episode of One Piece.
+    """
     episodes: list[EpisodeInfo] = []
     page = 1
-    while page < 40:  # 100/page; hard cap for absurd long-runners
-        _jikan_throttle()
-        url = f"{_JIKAN_BASE}/anime/{mal_id}/episodes?page={page}"
-        try:
-            data = _get_json(url)
-        except RuntimeError as exc:
-            logger.error("Jikan episodes fetch failed for %s: %s", mal_id, exc)
+    while page <= max_pages:
+        data = _jikan_get(f"{_JIKAN_BASE}/anime/{mal_id}/episodes?page={page}")
+        if data is None:
             break
         for ep in data.get("data") or []:
             number = ep.get("mal_id")
@@ -1117,9 +1159,74 @@ def get_jikan_episodes(mal_id: str) -> list[EpisodeInfo]:
 
 
 def get_jikan_status(mal_id: str) -> str:
-    _jikan_throttle()
-    try:
-        data = _get_json(f"{_JIKAN_BASE}/anime/{mal_id}")
-    except RuntimeError:
+    data = _jikan_get(f"{_JIKAN_BASE}/anime/{mal_id}")
+    if data is None:
         return ""
     return ((data.get("data") or {}).get("status")) or ""  # "Currently Airing" / "Finished Airing"
+
+
+# ---------------------------------------------------------------------------
+# Next-episode-to-air — the reliable airing signal (see the airing bug notes)
+# ---------------------------------------------------------------------------
+# TMDB exposes next_episode_to_air directly; that's the only source that
+# consistently answers "when does the next episode air?" for both TV and the
+# anime TMDB carries. TVDB and Jikan episode lists are aired-only, so the
+# tracker resolves a TMDB id (even for TVDB/Jikan-identified shows) to fill in
+# the airing schedule.
+
+
+def resolve_tmdb_tv_id(title: str, year: int | None = None,
+                       *, prefer_anime: bool = False) -> str | None:
+    """Best-effort TMDB TV id for a title (for airing data on non-TMDB shows).
+
+    Scores raw TMDB search hits by title similarity, with bonuses for a year
+    match and — when prefer_anime is set — for Japanese-language animation.
+    Without the anime bias a search for "One Piece" would happily return the
+    live-action series instead of the 1999 anime.
+    """
+    if not _tmdb_enabled():
+        return None
+    params = {"api_key": config.TMDB_API_KEY, "query": title,
+              "include_adult": "true", "page": "1"}
+    if year:
+        params["first_air_date_year"] = str(year)
+    try:
+        data = _get_json(f"{_TMDB_BASE}/search/tv?{urllib.parse.urlencode(params)}")
+    except RuntimeError:
+        return None
+
+    best_id: str | None = None
+    best_score = 0.0
+    for item in (data.get("results") or [])[:8]:
+        names = [item.get("name") or "", item.get("original_name") or ""]
+        score = max((title_similarity(title, n) for n in names if n), default=0.0)
+        fa = (item.get("first_air_date") or "")[:4]
+        if year and fa == str(year):
+            score += 0.15
+        if prefer_anime:
+            if item.get("original_language") == "ja":
+                score += 0.15
+            if 16 in (item.get("genre_ids") or []):  # 16 = Animation
+                score += 0.1
+        if score > best_score and item.get("id"):
+            best_score, best_id = score, str(item["id"])
+    return best_id if best_score >= 0.6 else None
+
+
+def get_tmdb_next_air(tv_id: str) -> EpisodeInfo | None:
+    """The next episode scheduled to air for a TMDB TV id, or None."""
+    if not _tmdb_enabled():
+        return None
+    try:
+        data = _get_json(f"{_TMDB_BASE}/tv/{tv_id}?api_key={config.TMDB_API_KEY}")
+    except RuntimeError:
+        return None
+    nxt = data.get("next_episode_to_air")
+    if not nxt or not nxt.get("air_date"):
+        return None
+    return EpisodeInfo(
+        season=int(nxt.get("season_number") or 0),
+        episode=int(nxt.get("episode_number") or 0),
+        title=nxt.get("name") or "",
+        air_date=nxt.get("air_date"),
+    )

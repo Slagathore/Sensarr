@@ -28,9 +28,11 @@ import shows_store
 import torrent_routing
 from media_lookup import (
     EpisodeInfo, MediaResult,
+    best_title_similarity,
     get_jikan_episodes, get_jikan_status,
-    get_tmdb_tv_episodes, get_tmdb_tv_status,
+    get_tmdb_next_air, get_tmdb_tv_episodes, get_tmdb_tv_status,
     get_tvdb_episodes, get_tvdb_series_status,
+    resolve_tmdb_tv_id,
     search_jikan_anime, search_tmdb_shows, search_tvdb_shows,
     title_similarity,
 )
@@ -38,10 +40,24 @@ from torrent_routing import VIDEO_EXTENSIONS, parse_torrent_name
 
 logger = logging.getLogger(__name__)
 
-_IDENTIFY_THRESHOLD = 0.75
+_IDENTIFY_THRESHOLD = 0.72
 
 # Folder names like "Show Name (2023)" — year improves tracker matching.
-_FOLDER_YEAR_RE = re.compile(r"^(?P<name>.+?)\s*\((?P<year>(19|20)\d{2})\)\s*$")
+_FOLDER_YEAR_RE = re.compile(r"\((?P<year>(19|20)\d{2})\)")
+
+# Release-group / quality / codec noise stripped from folder names before a
+# tracker lookup. Anime and hentai folders are especially junk-heavy
+# ("[bonkai77] Title [WEB-DL][1080p][x265]"), which otherwise poisons search.
+_JUNK_WORD_RE = re.compile(
+    r"\b(?:480p|720p|1080p|2160p|4k|x26[45]|h\.?26[45]|hevc|avc|10bit|8bit|"
+    r"web-?dl|web-?rip|bd(?:rip)?|blu-?ray|br-?rip|hdtv|dvd-?rip|remux|batch|"
+    r"complete|dual[\s._-]?audio|multi[\s._-]?sub|eng(?:lish)?[\s._-]?sub(?:bed)?|"
+    r"dub(?:bed)?|aac\d?|ac3|flac|opus|ddp?\d?(?:\.\d)?|hi10p?|uncensored|"
+    r"censored|repack|proper|extended|remastered)\b",
+    re.IGNORECASE,
+)
+# A leading "[date - date]" or "[group]" bracket prefix (hentai folders).
+_LEADING_BRACKET_RE = re.compile(r"^\s*(?:\[[^\]]*\]\s*)+")
 
 # Anime fallback: files numbered without SxxEyy ("Show - 12 [1080p].mkv").
 # Take the last standalone 1-4 digit number that isn't a year/resolution.
@@ -66,34 +82,66 @@ def _typed_roots(media_type: str) -> list[Path]:
     ]
 
 
-def _identify_folder(folder_name: str, media_type: str) -> MediaResult | None:
+def clean_show_folder_name(folder_name: str) -> tuple[str, int | None]:
+    """Reduce a messy folder name to a searchable title + optional year.
+
+    Handles the real-world junk seen in the library: leading [group]/[date]
+    brackets, embedded [quality] tags, underscores/dots as separators, and
+    trailing codec/release noise. Returns ("", None) for non-show folders
+    like "[Unsorted]".
+    """
     name = folder_name
     year: int | None = None
-    m = _FOLDER_YEAR_RE.match(folder_name)
-    if m:
-        name = m.group("name")
-        year = int(m.group("year"))
+    ym = _FOLDER_YEAR_RE.search(name)
+    if ym:
+        year = int(ym.group("year"))
 
-    if media_type == "tv":
-        results = search_tvdb_shows(name, year) or search_tmdb_shows(name, year)
-    elif media_type == "anime":
-        results = search_jikan_anime(name, explicit=False)
-    elif media_type == "xanime":
-        # Jikan (rating=rx) gives us MAL ids that can also sync episodes;
-        # AniDB stays a request-pipeline identification source only.
-        results = search_jikan_anime(name, explicit=True)
-    else:
-        return None
+    name = _LEADING_BRACKET_RE.sub("", name)      # drop leading [group]/[dates]
+    name = re.sub(r"\[[^\]]*\]|\([^)]*\)", " ", name)  # drop remaining bracket groups
+    name = name.replace("_", " ").replace(".", " ")
+    name = _JUNK_WORD_RE.sub(" ", name)
+    # A season/part marker ends the title portion ("Title S2", "Title Season 3").
+    name = re.split(r"\b(?:S\d{1,2}\b|Season\b|Part\b|Cour\b)", name, maxsplit=1,
+                    flags=re.IGNORECASE)[0]
+    name = re.sub(r"[\s\-–~]+$", "", name)
+    name = re.sub(r"\s{2,}", " ", name).strip(" -–_~")
+    return name, year
 
+
+def _score_candidates(query: str, results: list[MediaResult], year: int | None) -> tuple[MediaResult | None, float]:
     best: MediaResult | None = None
     best_score = 0.0
     for r in results:
-        score = title_similarity(name, r.title)
+        score = best_title_similarity(query, r)  # matches romaji OR english
         if year and r.year and year == r.year:
-            score += 0.1
+            score = min(1.0, score + 0.1)
         if score > best_score:
             best, best_score = r, score
-    return best if best is not None and best_score >= _IDENTIFY_THRESHOLD else None
+    return best, best_score
+
+
+def _identify_folder(folder_name: str, media_type: str) -> MediaResult | None:
+    name, year = clean_show_folder_name(folder_name)
+    if len(name) < 2:
+        return None  # nothing searchable survived (e.g. "[Unsorted]")
+
+    if media_type == "tv":
+        # Gather from BOTH sources and pick the best — a wrong-but-nonempty
+        # TVDB result must not block the correct TMDB one (old `or` bug).
+        candidates = search_tvdb_shows(name, year) + search_tmdb_shows(name, year)
+    elif media_type == "anime":
+        candidates = search_jikan_anime(name, explicit=False)
+    elif media_type == "xanime":
+        # Jikan (rating=rx) gives us MAL ids that can also sync episodes;
+        # AniDB stays a request-pipeline identification source only.
+        candidates = search_jikan_anime(name, explicit=True)
+        if not candidates:  # some hentai exists on MAL only as regular entries
+            candidates = search_jikan_anime(name, explicit=False)
+    else:
+        return None
+
+    best, score = _score_candidates(name, candidates, year)
+    return best if best is not None and score >= _IDENTIFY_THRESHOLD else None
 
 
 def scan_library_folders(media_types: tuple[str, ...] = ("tv", "anime", "xanime")) -> ScanResult:
@@ -178,29 +226,62 @@ def _scan_folders_for_episodes(folders: tuple[str, ...]) -> dict[tuple[int, int]
     return found
 
 
+def _sync_airing(show: shows_store.TrackedShow) -> EpisodeInfo | None:
+    """Fetch + store the next-episode-to-air for a show (TMDB is the only
+    source that reliably has it). Resolves a TMDB id for TVDB/Jikan-identified
+    shows. Returns the next EpisodeInfo, or None if nothing is scheduled."""
+    tmdb_id = show.tmdb_id
+    if not tmdb_id:
+        if show.source == "tmdb":
+            tmdb_id = show.external_id
+        else:
+            tmdb_id = resolve_tmdb_tv_id(
+                show.title, show.year,
+                prefer_anime=show.media_type in ("anime", "xanime"),
+            )
+        if tmdb_id:
+            shows_store.set_show_tmdb_id(show.show_id, tmdb_id)
+    if not tmdb_id:
+        return None
+    nxt = get_tmdb_next_air(tmdb_id)
+    shows_store.set_show_airing(
+        show.show_id,
+        next_air_date=nxt.air_date if nxt else None,
+        next_season=nxt.season if nxt else None,
+        next_episode=nxt.episode if nxt else None,
+    )
+    return nxt
+
+
 def sync_show(show_id: int) -> str:
-    """Refresh one show's episode list + on-disk state. Returns a summary."""
+    """Refresh one show's episode list, on-disk state, and airing schedule."""
     show = shows_store.get_show(show_id)
     if show is None:
         return f"show #{show_id} not found"
 
     fetchers = EPISODE_FETCHERS.get(show.source)
-    if fetchers is None:
-        # AniDB-identified or unknown source: no episode API — disk state only.
-        found = _scan_folders_for_episodes(show.folders)
-        shows_store.update_file_state(show_id, found)
-        return f"{show.title}: no episode source ({show.source}); disk state only ({len(found)} files)"
+    episodes: list[EpisodeInfo] = []
+    if fetchers is not None:
+        fetch_episodes, fetch_status = fetchers
+        episodes = fetch_episodes(show.external_id)
+        if episodes:
+            shows_store.replace_episodes(show_id, episodes)
+        shows_store.set_show_status(show_id, fetch_status(show.external_id))
 
-    fetch_episodes, fetch_status = fetchers
-    episodes: list[EpisodeInfo] = fetch_episodes(show.external_id)
-    if episodes:
-        shows_store.replace_episodes(show_id, episodes)
-    shows_store.set_show_status(show_id, fetch_status(show.external_id))
+    # Airing schedule — always via TMDB's next_episode_to_air, since TVDB/
+    # Jikan episode lists are aired-only. Re-read the show so tmdb_id set on a
+    # prior pass is used.
+    refreshed = shows_store.get_show(show_id) or show
+    nxt = _sync_airing(refreshed)
 
     found = _scan_folders_for_episodes(show.folders)
     shows_store.update_file_state(show_id, found)
     missing = len(shows_store.missing_episodes(show_id))
-    return f"{show.title}: {len(episodes)} episodes known, {len(found)} on disk, {missing} missing"
+
+    air_note = f", next airs {nxt.air_date} (S{nxt.season:02d}E{nxt.episode:02d})" if nxt else ""
+    src_note = "" if fetchers is not None else f" [no episode API for {show.source}]"
+    return (f"{show.title}: {len(episodes)} episodes known, {len(found)} on disk, "
+            f"{missing} missing{air_note}{src_note}")
 
 
 def sync_all() -> list[str]:
