@@ -140,6 +140,10 @@ class DesktopApp:
         # Maintenance tab state
         self._maint_results: list[Any] = []
         self._maint_tool_name: str = ""
+        # False while the overnight pre-cache pass runs — result handlers
+        # skip their popups so nothing interrupts an unattended machine.
+        self._maint_popups_ok = True
+        self._last_idle_cache_date: str = ""
         # Per-tool result cache: switching to another tool and back re-renders
         # the last results instantly instead of re-running the walk. Loaded
         # from disk so results survive app restarts (🔄 Re-run refreshes).
@@ -283,6 +287,7 @@ class DesktopApp:
         self._schedule_log_refresh()
         self._schedule_daily_library_check()
         self._schedule_auto_grab()
+        self._schedule_idle_cache()
 
     def _build_ui(self) -> None:
         self.root.columnconfigure(0, weight=1)
@@ -642,6 +647,10 @@ class DesktopApp:
         return self.root if self.root.winfo_viewable() else None
 
     def _show_info(self, title: str, message: str) -> None:
+        if not self._maint_popups_ok:
+            logger.info("Popup suppressed (idle pass) — %s: %s", title,
+                        message.splitlines()[0] if message else "")
+            return
         parent = self._messagebox_parent()
         if parent is None:
             messagebox.showinfo(title, message)
@@ -2382,6 +2391,101 @@ class DesktopApp:
         self.root.after(60 * 60 * 1000, self._daily_check_tick)
 
     # =====================================================================
+    # Overnight pre-cache — warm every expensive scan while nothing happens
+    # =====================================================================
+
+    def _schedule_idle_cache(self) -> None:
+        if not self._quitting:
+            self.root.after(15 * 60 * 1000, self._idle_cache_tick)
+
+    def _idle_cache_tick(self) -> None:
+        if self._quitting:
+            return
+        now = datetime.datetime.now()
+        today_str = now.date().isoformat()
+        downloads_active = any(
+            row.status in ("queued", "downloading")
+            for row in downloads_store.list_downloads(limit=50)
+        )
+        if (config.IDLE_CACHE_ENABLED
+                and self._last_idle_cache_date != today_str
+                and now.hour >= config.IDLE_CACHE_HOUR
+                and not downloads_active):
+            self._last_idle_cache_date = today_str
+            self._run_idle_cache_pass()
+        self.root.after(15 * 60 * 1000, self._idle_cache_tick)
+
+    def _run_idle_cache_pass(self) -> None:
+        """Refresh every expensive scan sequentially, popups suppressed, so
+        each tool opens instantly from cache the next day. One scan at a
+        time — the pass is I/O-bound and deliberately unhurried."""
+        logger.info("Idle pre-cache pass starting.")
+        self._maint_popups_ok = False
+
+        def worker() -> None:
+            import time as _time
+
+            def ui(fn) -> None:
+                self._post_to_ui(fn)
+                _time.sleep(1)  # let the UI thread breathe between renders
+
+            try:
+                from library_index import list_all_files, refresh_library_index
+                try:
+                    refreshed = refresh_library_index()
+                    logger.info("Idle cache: index delta +%d/−%d.",
+                                refreshed.added, refreshed.removed)
+                except Exception:
+                    logger.exception("Idle cache: index refresh failed.")
+
+                steps = [
+                    ("inventory", library_inventory, self._handle_library_inventory_result),
+                    ("duplicates", find_duplicates, self._handle_duplicates_result),
+                    ("sanitize", lambda: sanitize_all(dry_run=True), self._handle_sanitize_result),
+                    ("clean junk", find_junk_files, self._handle_junk_result),
+                    ("unindexed", find_unindexed_files, self._handle_unindexed_result),
+                    ("missing episodes", find_missing_episodes, self._handle_missing_episodes_result),
+                ]
+                for label, compute, handler in steps:
+                    try:
+                        result = compute()
+                        ui(lambda h=handler, r=result: h(r))
+                        logger.info("Idle cache: %s done.", label)
+                    except Exception:
+                        logger.exception("Idle cache: %s failed.", label)
+
+                # Movie-quality scan: probes only new/changed files (ffprobe
+                # durations persist in SQLite) and refreshes the pickled
+                # result the Library tab shows on first click.
+                try:
+                    import pickle
+                    from video_quality import find_low_quality_movies
+                    movies = [
+                        (e.path, e.name, e.size_bytes) for e in list_all_files()
+                        if media_type_for_path(e.root_path) == "movie"
+                    ]
+                    results = find_low_quality_movies(movies)
+                    self._lib_lowqual_cache_path().write_bytes(pickle.dumps({
+                        "results": results, "scanned": len(movies),
+                        "at": datetime.datetime.now().strftime("%b %d %H:%M"),
+                    }))
+                    self._lib_lowqual_showing_cache = False
+                    logger.info("Idle cache: movie-quality scan done (%d flagged).",
+                                len(results))
+                except Exception:
+                    logger.exception("Idle cache: movie-quality scan failed.")
+            finally:
+                def done() -> None:
+                    self._maint_popups_ok = True
+                    self._maint_status_var.set(
+                        "Overnight pre-cache finished — every tool below opens "
+                        "instantly from cache. 🔄 Re-run refreshes any of them.")
+                self._post_to_ui(done)
+                logger.info("Idle pre-cache pass finished.")
+
+        threading.Thread(target=worker, name="idle-cache", daemon=True).start()
+
+    # =====================================================================
     # Maintenance tab — find duplicates
     # =====================================================================
 
@@ -3322,6 +3426,8 @@ class DesktopApp:
         ("PLEX_ACCOUNT_NAME", "Which Plex user are you? (Watchlist/Recs)", "plex_account"),
         # Misc
         ("TOOLTIPS_ENABLED", "Show hover tooltips on buttons", "bool"),
+        ("IDLE_CACHE_ENABLED", "Overnight pre-cache (warm all scans while idle)", "bool"),
+        ("IDLE_CACHE_HOUR", "Pre-cache start hour (0-23)", "int"),
         ("LIBRARY_CHECK_HOUR", "Daily library check hour (0-23)", "int"),
         ("ADMIN_STATUS_REFRESH_SECONDS", "Status refresh interval (seconds)", "int"),
         ("LIBRARY_SEARCH_RESULT_LIMIT", "Library search result limit", "int"),

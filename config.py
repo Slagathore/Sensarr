@@ -318,6 +318,15 @@ ANIDB_CLIENT: str = os.getenv("ANIDB_CLIENT", "plexrequestbot").strip()
 ANIDB_CLIENT_VER: int = int(os.getenv("ANIDB_CLIENT_VER", "1"))
 
 # ---------------------------------------------------------------------------
+# Overnight pre-caching — while the app sits idle, quietly refresh every
+# expensive scan (index delta, inventory, duplicates, sanitize preview,
+# junk, unindexed, missing episodes, movie-quality probe) so each tool
+# opens instantly from cache the next day. Skipped while downloads run.
+# ---------------------------------------------------------------------------
+IDLE_CACHE_ENABLED: bool = _env_bool("IDLE_CACHE_ENABLED", True)
+IDLE_CACHE_HOUR: int = int(os.getenv("IDLE_CACHE_HOUR", "4"))
+
+# ---------------------------------------------------------------------------
 # Daily library check — hour of day (0-23) at which the scheduled check runs
 # The check compares open requests against the Plex library and marks found ones
 # ---------------------------------------------------------------------------

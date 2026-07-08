@@ -31,7 +31,9 @@ class WatchlistTab:
     def __init__(self, parent: ttk.Frame, app) -> None:
         self.app = app
         self._watchlist: list = []
-        self._recs: list = []
+        self._recs: list = []          # currently displayed (filtered)
+        self._recs_all: list = []      # full result set from the last fetch
+        self._top_genres: list[str] = []
         self._status_var = tk.StringVar(
             value="Pull Watchlist to load your Plex watchlist (Plex token required).")
 
@@ -101,9 +103,19 @@ class WatchlistTab:
         self._genre_combo = ttk.Combobox(recs_bar, textvariable=self._genre_var,
                                          width=16, state="readonly", values=["All"])
         self._genre_combo.pack(side=tk.LEFT, padx=(4, 12))
+        ttk.Label(recs_bar, text="Type:").pack(side=tk.LEFT)
+        self._type_var = tk.StringVar(value="All")
+        type_combo = ttk.Combobox(recs_bar, textvariable=self._type_var, width=8,
+                                  state="readonly", values=["All", "movie", "show"])
+        type_combo.pack(side=tk.LEFT, padx=(4, 12))
+        type_combo.bind("<<ComboboxSelected>>", lambda _e: self._render_recs())
         self._inlib_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(recs_bar, text="In-library only",
-                        variable=self._inlib_var).pack(side=tk.LEFT, padx=(0, 12))
+                        variable=self._inlib_var).pack(side=tk.LEFT, padx=(0, 8))
+        self._notinlib_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(recs_bar, text="Not-in-library only",
+                        variable=self._notinlib_var,
+                        command=self._render_recs).pack(side=tk.LEFT, padx=(0, 12))
         get_btn = ttk.Button(recs_bar, text="Get Recommendations", command=self.get_recs)
         get_btn.pack(side=tk.LEFT)
         add_tooltip(get_btn, "Analyse this user's Plex watch history, find their top "
@@ -206,22 +218,36 @@ class WatchlistTab:
                 return
 
             def render() -> None:
-                self._recs = recs
+                self._recs_all = recs
+                self._top_genres = top_genres
                 self._genre_combo.configure(values=["All"] + top_genres)
-                for iid in self._recs_tree.get_children():
-                    self._recs_tree.delete(iid)
-                for idx, r in enumerate(recs):
-                    self._recs_tree.insert(
-                        "", "end", iid=str(idx),
-                        values=(r.title, r.year or "", r.item_type, r.note,
-                                "✓" if r.in_library else ""),
-                    )
-                self._status_var.set(
-                    f"{len(recs)} recommendation(s) — top genres: "
-                    + (", ".join(top_genres[:5]) or "none found"))
+                self._render_recs()
             self.app._post_to_ui(render)
 
         threading.Thread(target=worker, name="wl-recs", daemon=True).start()
+
+    def _render_recs(self) -> None:
+        """Re-render the recs tree applying the type / not-in-library filters
+        (client-side, so toggling them doesn't refetch anything)."""
+        recs = list(getattr(self, "_recs_all", []))
+        type_filter = self._type_var.get()
+        if type_filter != "All":
+            recs = [r for r in recs if r.item_type == type_filter]
+        if self._notinlib_var.get():
+            recs = [r for r in recs if not r.in_library]
+        self._recs = recs
+        for iid in self._recs_tree.get_children():
+            self._recs_tree.delete(iid)
+        for idx, r in enumerate(recs):
+            self._recs_tree.insert(
+                "", "end", iid=str(idx),
+                values=(r.title, r.year or "", r.item_type, r.note,
+                        "✓" if r.in_library else ""),
+            )
+        top_genres = getattr(self, "_top_genres", [])
+        self._status_var.set(
+            f"{len(recs)} recommendation(s) shown — top genres: "
+            + (", ".join(top_genres[:5]) or "none found"))
 
     # ------------------------------------------------------------------
     # Actions
