@@ -471,11 +471,31 @@ def get_recommendations(
     results = [r for _score, r in recs[:limit]]
 
     if not in_library_only and config.TMDB_API_KEY and (genre_filter or top_genres):
-        results.extend(_tmdb_discover_recs(
+        tmdb_recs = _tmdb_discover_recs(
             genre_filter or top_genres[0],
             exclude_titles=watched_titles | {r.title.casefold() for r in results},
             limit=max(5, limit // 3),
-        ))
+        )
+        # Truth in labelling: TMDB doesn't know what's on disk — verify each
+        # suggestion against the local file index before claiming "not in
+        # library". Owned ones get relabelled instead of lying.
+        try:
+            from library_index import list_all_files
+            library_names = " || ".join(
+                e.name.casefold() for e in list_all_files())
+        except Exception:
+            library_names = ""
+        for rec in tmdb_recs:
+            owned = bool(library_names) and rec.title.casefold() in library_names
+            if owned:
+                results.append(Recommendation(
+                    title=rec.title, year=rec.year, item_type=rec.item_type,
+                    genres=rec.genres,
+                    note=rec.note.replace("(not in library)", "— already in your library"),
+                    in_library=True,
+                ))
+            else:
+                results.append(rec)
     return top_genres, results
 
 

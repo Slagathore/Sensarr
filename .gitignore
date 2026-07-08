@@ -53,3 +53,5 @@ Thumbs.db
 .DS_Store
 anidb_titles.dat.gz
 trackers_cache.txt
+maintenance_cache.pkl
+library_lowqual.pkl

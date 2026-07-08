@@ -141,8 +141,10 @@ class DesktopApp:
         self._maint_results: list[Any] = []
         self._maint_tool_name: str = ""
         # Per-tool result cache: switching to another tool and back re-renders
-        # the last results instantly instead of re-running the walk.
+        # the last results instantly instead of re-running the walk. Loaded
+        # from disk so results survive app restarts (🔄 Re-run refreshes).
         self._maint_cache: dict[str, dict[str, Any]] = {}
+        self._maint_load_cache()
         self._maint_tree: ttk.Treeview | None = None
         self._maint_check_vars: list[tk.BooleanVar] = []
         self._maint_status_var = tk.StringVar(value="Select a tool to run.")
@@ -515,6 +517,9 @@ class DesktopApp:
              "Files on disk that aren't in the local search index yet — fix with Reindex."),
             ("Reindex", self.rebuild_library_index_from_ui,
              "Rebuild the local file index used by /search and the Library tab."),
+            ("🔄 Re-run", self._maint_rerun_current,
+             "Results are cached (even across restarts) — this forces a fresh "
+             "scan of the tool currently displayed."),
             ("Apply Selected", self._apply_maint_selection,
              "Perform the action on the rows you've ticked (the checkbox column says what happens)."),
         )
@@ -1298,7 +1303,31 @@ class DesktopApp:
                 paths.append(values[-1])
         return paths
 
+    _LIB_LOWQUAL_CACHE_FILE = "library_lowqual.pkl"
+
+    def _lib_lowqual_cache_path(self) -> Path:
+        return Path(config.APP_DIR) / self._LIB_LOWQUAL_CACHE_FILE
+
     def _lib_search_lowqual(self) -> None:
+        import pickle
+        # First click shows the persisted result from the last scan (survives
+        # restarts); clicking again while that cached view is up re-scans.
+        # Re-scans are cheap anyway: ffprobe runtimes live in SQLite, so only
+        # new/changed files get probed.
+        if not getattr(self, "_lib_lowqual_showing_cache", False):
+            try:
+                path = self._lib_lowqual_cache_path()
+                if path.is_file():
+                    payload = pickle.loads(path.read_bytes())
+                    self._lib_lowqual_showing_cache = True
+                    self._lib_render_lowqual(payload["results"], payload["scanned"])
+                    self._lib_status_var.set(
+                        self._lib_status_var.get()
+                        + f"  (cached {payload['at']} — click again to re-scan)")
+                    return
+            except Exception:
+                logger.debug("Low-quality cache load failed.", exc_info=True)
+        self._lib_lowqual_showing_cache = False
         self._lib_status_var.set("Scanning movies for cams and low-bitrate files…")
 
         def worker() -> None:
@@ -1319,6 +1348,14 @@ class DesktopApp:
                 logger.exception("Low-quality scan failed.")
                 self._post_to_ui(lambda: self._lib_status_var.set(f"Scan failed: {exc}"))
                 return
+            import pickle
+            try:
+                self._lib_lowqual_cache_path().write_bytes(pickle.dumps({
+                    "results": results, "scanned": len(movies),
+                    "at": datetime.datetime.now().strftime("%b %d %H:%M"),
+                }))
+            except Exception:
+                logger.debug("Low-quality cache save failed.", exc_info=True)
             self._post_to_ui(lambda: self._lib_render_lowqual(results, len(movies)))
 
         threading.Thread(target=worker, name="lib-lowqual", daemon=True).start()
@@ -1429,6 +1466,8 @@ class DesktopApp:
                     self._show_warning("Delete", "\n".join(errors[:8]))
                 self._lib_status_var.set(msg)
                 if self._lib_view_mode == "lowqual":
+                    # Deleted rows make the cached scan stale — force fresh.
+                    self._lib_lowqual_showing_cache = True
                     self._lib_search_lowqual()
                 else:
                     self._lib_show_all()
@@ -2141,7 +2180,8 @@ class DesktopApp:
         self._maint_typed_rows = list(typed_rows)
         self._apply_maint_filter()
 
-        # Cache the render so switching tools and back is instant.
+        # Cache the render so switching tools and back is instant — and
+        # persist it so a restart doesn't force another full walk.
         if self._maint_tool_name:
             self._maint_cache[self._maint_tool_name] = {
                 "results": self._maint_results,
@@ -2149,15 +2189,15 @@ class DesktopApp:
                 "cols": (col1, col2, col3),
                 "check_label": check_label,
                 "status": self._maint_status_var.get(),
-                "at": datetime.datetime.now().strftime("%H:%M"),
+                "at": datetime.datetime.now().strftime("%b %d %H:%M"),
             }
+            self._maint_save_cache()
 
     def _maint_render_cached(self, tool: str) -> bool:
-        """Re-render a tool's cached results when SWITCHING to it. Clicking
-        the tool that's already displayed re-runs it fresh. Returns True if
-        the cache was rendered (caller should skip the run)."""
-        if self._maint_tool_name == tool:
-            return False
+        """Render a tool's cached results (kept across app restarts) instead
+        of re-running the walk. Tool buttons ALWAYS prefer the cache; the
+        🔄 Re-run button is the only thing that forces a fresh pass. Returns
+        True if the cache was rendered (caller should skip the run)."""
         cached = self._maint_cache.get(tool)
         if not cached:
             return False
@@ -2170,9 +2210,58 @@ class DesktopApp:
             check_label=cached["check_label"], typed_rows=cached["typed_rows"],
         )
         self._maint_status_var.set(
-            f"{cached['status']}  (cached {cached['at']} — click the tool again to re-run)"
+            f"{cached['status']}  (cached {cached['at']} — 🔄 Re-run to refresh)"
         )
         return True
+
+    def _maint_rerun_current(self) -> None:
+        """Force-refresh the currently displayed maintenance tool."""
+        runners = {
+            "library_inventory": self._run_library_inventory,
+            "find_duplicates": self._run_find_duplicates,
+            "sanitize": self._run_sanitize,
+            "clean_junk": self._run_clean_junk,
+            "missing_episodes": self._run_missing_episodes,
+            "unindexed": self._run_unindexed,
+        }
+        runner = runners.get(self._maint_tool_name)
+        if runner is None:
+            self._show_info("Re-run", "Run one of the cacheable tools first "
+                                      "(Inventory / Duplicates / Sanitize / Clean Junk / "
+                                      "Missing Episodes / Unindexed).")
+            return
+        self._maint_cache.pop(self._maint_tool_name, None)
+        self._maint_tool_name = ""
+        runner()
+
+    _MAINT_CACHE_VERSION = 2
+    _MAINT_CACHE_FILE = "maintenance_cache.pkl"
+
+    def _maint_cache_path(self) -> Path:
+        return Path(config.APP_DIR) / self._MAINT_CACHE_FILE
+
+    def _maint_save_cache(self) -> None:
+        """Persist tool results to disk so a 30k-file walk survives an app
+        restart. Best-effort: a failed save just means a re-run later."""
+        import pickle
+        try:
+            payload = {"version": self._MAINT_CACHE_VERSION, "cache": self._maint_cache}
+            self._maint_cache_path().write_bytes(pickle.dumps(payload))
+        except Exception:
+            logger.debug("Maintenance cache save failed.", exc_info=True)
+
+    def _maint_load_cache(self) -> None:
+        import pickle
+        try:
+            path = self._maint_cache_path()
+            if not path.is_file():
+                return
+            payload = pickle.loads(path.read_bytes())
+            if payload.get("version") == self._MAINT_CACHE_VERSION:
+                self._maint_cache = payload.get("cache", {})
+                logger.info("Maintenance cache loaded: %s", ", ".join(self._maint_cache))
+        except Exception:
+            logger.debug("Maintenance cache load failed (stale format?).", exc_info=True)
 
     def _apply_maint_filter(self) -> None:
         """
@@ -3143,8 +3232,9 @@ class DesktopApp:
             status += f" / {inventory.untyped_files} untyped"
         self._maint_status_var.set(status)
 
-        # One typed row per show — the media-type filter checkboxes can hide
-        # whole categories (e.g. show only TV+Anime, hide Movies/xAnime).
+        # One typed row per show AND per movie title — the media-type filter
+        # checkboxes hide whole categories (Movies-only now actually lists
+        # your movies, not just the stray shows living under a movie root).
         typed_rows: list[tuple[str, tuple[str, str, str, str], Any]] = []
         for show in inventory.shows:
             seasons_summary = ", ".join(
@@ -3161,9 +3251,17 @@ class DesktopApp:
                 ),
                 None,
             ))
+        for movie in inventory.movies:
+            detail = "movie" + (f" -- {movie.file_count} file(s)"
+                                if movie.file_count > 1 else "")
+            typed_rows.append((
+                movie.media_type,
+                ("", movie.title, detail, self._fmt_bytes(movie.total_size_bytes)),
+                None,
+            ))
 
         self._populate_maint_tree(
-            [], col1="Show", col2="Seasons / Episodes", col3="Size",
+            [], col1="Show / Movie", col2="Detail", col3="Size",
             typed_rows=typed_rows,
         )
 

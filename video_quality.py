@@ -199,13 +199,37 @@ def find_low_quality_movies(
     threshold = (config.LOW_QUALITY_MB_PER_MIN
                  if threshold_mb_min is None else threshold_mb_min)
 
-    # Rate + cam status for every movie (probing is the slow part).
+    # Load the entire probe cache in ONE query — the first scan pays the
+    # ffprobe cost per file (persisted to SQLite), reruns and restarts only
+    # probe files that are new or changed size.
+    _init_probe_cache()
+    with db.connect() as conn:
+        cached = {(row[0], row[1]): row[2] for row in conn.execute(
+            "SELECT path, size_bytes, duration_min FROM media_probe")}
+
     scanned: list[tuple[str, str, int, float, bool, bool]] = []
+    new_probes: list[tuple[str, int, float]] = []
     for i, (path, name, size) in enumerate(movie_files):
         if progress is not None and i % 25 == 0:
             progress(i, len(movie_files))
-        rate, exact = mb_per_minute(path, size)
+        minutes = cached.get((path, size))
+        exact = minutes is not None and minutes > 0
+        if not exact:
+            probed = _ffprobe_minutes(path)
+            if probed is not None:
+                minutes, exact = probed, True
+                new_probes.append((path, size, probed))
+            else:
+                minutes = _ASSUMED_MOVIE_MINUTES
+        rate = (size / (1024 * 1024)) / (minutes or _ASSUMED_MOVIE_MINUTES)
         scanned.append((path, name, size, rate, exact, is_cam_release(name)))
+
+    if new_probes:
+        with db.connect() as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO media_probe (path, size_bytes, duration_min) "
+                "VALUES (?, ?, ?)", new_probes)
+            conn.commit()
 
     by_title: dict[str, list[tuple[str, str, int, float, bool, bool]]] = {}
     for entry in scanned:

@@ -105,12 +105,22 @@ class ShowInventory:
 
 
 @dataclass
+class MovieInventory:
+    """Per-movie rollup (files grouped by normalized title)."""
+    title: str
+    media_type: str
+    file_count: int
+    total_size_bytes: int
+
+
+@dataclass
 class LibraryInventory:
     """Aggregate stats for one walk of the library."""
     shows: list[ShowInventory]
     movie_count: int
     movie_size_bytes: int
     untyped_files: int            # files whose category couldn't be guessed
+    movies: list["MovieInventory"] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -338,6 +348,8 @@ def library_inventory() -> LibraryInventory:
     show_eps: dict[str, dict[int, set[int]]] = {}
     show_size: dict[str, int] = {}
     show_type: dict[str, str] = {}
+    # movie title -> [file_count, total_size, media_type]
+    movie_groups: dict[str, list] = {}
     movie_count = 0
     movie_size = 0
     untyped = 0
@@ -366,6 +378,9 @@ def library_inventory() -> LibraryInventory:
         elif norm:
             movie_count += 1
             movie_size += size
+            group = movie_groups.setdefault(norm, [0, 0, _media_type_for_path(f)])
+            group[0] += 1
+            group[1] += size
         else:
             untyped += 1
 
@@ -380,6 +395,13 @@ def library_inventory() -> LibraryInventory:
         ))
     shows.sort(key=lambda s: (-s.total_episodes, s.title))
 
+    movies = [
+        MovieInventory(title=title, media_type=group[2],
+                       file_count=group[0], total_size_bytes=group[1])
+        for title, group in movie_groups.items()
+    ]
+    movies.sort(key=lambda m: m.title)
+
     logger.info(
         "library_inventory: %d show(s) / %d movie file(s) / %d untyped",
         len(shows), movie_count, untyped,
@@ -389,6 +411,7 @@ def library_inventory() -> LibraryInventory:
         movie_count=movie_count,
         movie_size_bytes=movie_size,
         untyped_files=untyped,
+        movies=movies,
     )
 
 
