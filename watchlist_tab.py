@@ -93,6 +93,8 @@ class WatchlistTab:
         self._user_var = tk.StringVar(value=config.PLEX_ACCOUNT_NAME)
         self._user_combo = ttk.Combobox(recs_bar, textvariable=self._user_var,
                                         width=18, state="readonly", values=[])
+        # Refetch on dropdown open so a failed startup fetch self-heals.
+        self._user_combo.configure(postcommand=self._load_accounts)
         self._user_combo.pack(side=tk.LEFT, padx=(4, 12))
         ttk.Label(recs_bar, text="Genre:").pack(side=tk.LEFT)
         self._genre_var = tk.StringVar(value="All")

@@ -1894,6 +1894,11 @@ class DesktopApp:
         self._users_plex_combo = ttk.Combobox(
             allowed_bar, textvariable=self._users_plex_var, width=16,
             state="readonly", values=[])
+        # Refetch whenever the dropdown opens — a failed fetch at startup
+        # (Plex still booting, transient timeout) must not leave it empty
+        # for the whole session.
+        self._users_plex_combo.configure(
+            postcommand=self._load_plex_accounts_for_users_tab)
         self._users_plex_combo.pack(side=tk.RIGHT, padx=(6, 0))
         map_btn = ttk.Button(allowed_bar, text="Map → Plex user",
                              command=self.map_selected_user_to_plex)
@@ -3382,9 +3387,12 @@ class DesktopApp:
                             accounts = list_plex_accounts()
                         except Exception:
                             accounts = []
-                        self._post_to_ui(lambda: c.configure(values=accounts))
+                        if accounts:
+                            self._post_to_ui(lambda: c.configure(values=accounts))
                     threading.Thread(target=worker, name="settings-plex-accounts",
                                      daemon=True).start()
+                # At build time AND on every dropdown open (retry-friendly).
+                combo.configure(postcommand=_fill_accounts)
                 _fill_accounts()
             else:  # "text"
                 var = tk.StringVar(value=current)

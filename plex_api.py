@@ -328,9 +328,23 @@ class WatchlistItem:
     item_type: str      # "movie" | "show"
 
 
-def list_plex_accounts() -> list[str]:
-    """Account names known to this server (for the you-are dropdown)."""
-    return sorted(_account_name_map().values(), key=str.casefold)
+_accounts_cache: list[str] = []
+
+
+def list_plex_accounts(*, force: bool = False) -> list[str]:
+    """Account names known to this server (for the you-are dropdowns).
+
+    Cached after the first success so combobox refreshes are instant; a
+    failed fetch keeps whatever the cache had (possibly empty) so the UI can
+    simply retry on the next dropdown open."""
+    global _accounts_cache
+    if _accounts_cache and not force:
+        return _accounts_cache
+    try:
+        _accounts_cache = sorted(_account_name_map().values(), key=str.casefold)
+    except Exception as exc:
+        logger.debug("Plex account list fetch failed: %s", exc)
+    return _accounts_cache
 
 
 def get_watchlist(limit: int = 100) -> list[WatchlistItem]:
