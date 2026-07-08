@@ -167,6 +167,89 @@ def rebuild_library_index() -> ReindexResult:
     )
 
 
+def list_all_files(*, name_filter: str = "") -> list[LibraryEntry]:
+    """Every indexed file (optionally substring-filtered) — the Library tab's
+    full listing. The index persists in SQLite between sessions; use
+    refresh_library_index() for a cheap delta pass or rebuild for a full one."""
+    initialize_library_index_db()
+    query = "SELECT name, path, root_path, size_bytes, modified_at FROM library_files"
+    params: tuple = ()
+    if name_filter.strip():
+        query += " WHERE search_name LIKE ?"
+        params = (f"%{name_filter.strip().casefold()}%",)
+    query += " ORDER BY name COLLATE NOCASE"
+    with _DB_LOCK, db.connect(_db_path()) as conn:
+        rows = conn.execute(query, params).fetchall()
+    return [LibraryEntry(name=r[0], path=r[1], root_path=r[2],
+                         size_bytes=r[3], modified_at=r[4]) for r in rows]
+
+
+@dataclass(frozen=True)
+class RefreshResult:
+    added: int
+    removed: int
+    updated: int
+    total: int
+
+
+def refresh_library_index() -> RefreshResult:
+    """Delta pass: reconcile the persisted index against the filesystem
+    without a full rebuild — adds new files, drops vanished ones, updates
+    changed sizes. Much faster than rebuild on large libraries."""
+    initialize_library_index_db()
+    valid_paths, _missing = _configured_library_paths()
+    extensions = set(config.LIBRARY_INDEX_EXTENSIONS)
+
+    on_disk: dict[str, tuple[str, str, int, float]] = {}
+    for root_path in valid_paths:
+        for current_root, _dirs, files in os.walk(root_path):
+            for name in files:
+                if extensions and Path(name).suffix.lower() not in extensions:
+                    continue
+                file_path = Path(current_root) / name
+                try:
+                    stat = file_path.stat()
+                except OSError:
+                    continue
+                on_disk[str(file_path)] = (name, str(root_path),
+                                           int(stat.st_size), float(stat.st_mtime))
+
+    with _DB_LOCK, db.connect(_db_path()) as conn:
+        indexed = {row[0]: (int(row[1]), float(row[2])) for row in
+                   conn.execute("SELECT path, size_bytes, modified_at FROM library_files")}
+
+        removed = [p for p in indexed if p not in on_disk]
+        added = [p for p in on_disk if p not in indexed]
+        updated = [p for p, (name, root, size, mtime) in on_disk.items()
+                   if p in indexed and indexed[p] != (size, mtime)]
+
+        conn.executemany("DELETE FROM library_files WHERE path = ?",
+                         [(p,) for p in removed])
+        conn.executemany(
+            """
+            INSERT OR REPLACE INTO library_files
+            (path, name, root_path, search_name, size_bytes, modified_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [(p, on_disk[p][0], on_disk[p][1], on_disk[p][0].casefold(),
+              on_disk[p][2], on_disk[p][3]) for p in added + updated],
+        )
+        conn.commit()
+
+    return RefreshResult(added=len(added), removed=len(removed),
+                         updated=len(updated), total=len(on_disk))
+
+
+def remove_from_index(paths: list[str]) -> None:
+    """Drop deleted files from the index immediately (no rescan needed)."""
+    if not paths:
+        return
+    with _DB_LOCK, db.connect(_db_path()) as conn:
+        conn.executemany("DELETE FROM library_files WHERE path = ?",
+                         [(p,) for p in paths])
+        conn.commit()
+
+
 def indexed_file_count() -> int:
     initialize_library_index_db()
     with _DB_LOCK, db.connect(_db_path()) as conn:

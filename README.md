@@ -1,4 +1,6 @@
-# PlexResetButton
+# Plexxarr
+
+*(formerly PlexResetButton — the old repo URL redirects)*
 
 [![Ko-fi](https://img.shields.io/badge/Ko--fi-half%20a%20coffee%20%E2%98%95-ff5f5f)](https://ko-fi.com/sparklemuffin)
 
@@ -78,8 +80,8 @@ Use the **Status tab → 🩺 Health Check** button to verify every dependency a
 ### Running from source instead
 
 ```powershell
-git clone https://github.com/Slagathore/PlexResetButton.git
-cd PlexResetButton
+git clone https://github.com/Slagathore/Plexxarr.git
+cd Plexxarr
 python -m pip install -r requirements.txt   # Python 3.11+
 Copy-Item .env.example .env ; notepad .env  # paste your bot token
 python main.py

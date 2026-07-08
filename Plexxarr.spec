@@ -27,7 +27,7 @@ hiddenimports = (
     # New modules are imported dynamically enough that we pin them explicitly.
     + ["sv_ttk", "send2trash", "shows_tab", "shows_store", "show_tracker",
        "downloads_store", "download_manager", "torrent_search", "torrent_routing",
-       "auth_store", "db", "ui_helpers", "health"]
+       "auth_store", "db", "ui_helpers", "health", "watchlist_tab", "video_quality", "subtitles"]
 )
 
 
@@ -51,7 +51,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="PlexResetButton",
+    name="Plexxarr",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -72,5 +72,5 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name="PlexResetButton",
+    name="Plexxarr",
 )

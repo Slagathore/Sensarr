@@ -75,6 +75,15 @@ class AllowedUser:
     source: str
     added_at: str
     claimed_at: str | None
+    plex_username: str | None = None
+
+
+def set_plex_username(row_id: int, plex_username: str | None) -> None:
+    """Map (or clear) an allowed user's Plex account name."""
+    with _AUTH_LOCK, db.connect() as conn:
+        conn.execute("UPDATE allowed_users SET plex_username = ? WHERE id = ?",
+                     (plex_username or None, row_id))
+        conn.commit()
 
 
 def _normalize_name(name: str) -> str:
@@ -88,6 +97,12 @@ def initialize_auth_db() -> None:
     with _AUTH_LOCK, db.connect() as conn:
         conn.execute(_SCHEMA)
         conn.execute(_REQUESTS_SCHEMA)
+
+        # Migration: map a Telegram user to their Plex account name (for the
+        # Watchlist/Recs tab and per-user features).
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(allowed_users)").fetchall()}
+        if existing and "plex_username" not in existing:
+            conn.execute("ALTER TABLE allowed_users ADD COLUMN plex_username TEXT")
 
         # First run: grandfather in everyone who has ever filed a request.
         row = conn.execute("SELECT COUNT(*) FROM allowed_users").fetchone()
@@ -195,7 +210,8 @@ def list_allowed_users() -> list[AllowedUser]:
     with _AUTH_LOCK, db.connect() as conn:
         rows = conn.execute(
             """
-            SELECT id, telegram_user_id, display_name, username, source, added_at, claimed_at
+            SELECT id, telegram_user_id, display_name, username, source, added_at,
+                   claimed_at, plex_username
             FROM allowed_users ORDER BY id
             """
         ).fetchall()

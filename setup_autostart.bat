@@ -2,7 +2,7 @@
 setlocal EnableDelayedExpansion
 
 echo ============================================
-echo  PlexResetButton - Autostart Setup
+echo  Plexxarr - Autostart Setup
 echo ============================================
 echo.
 
@@ -26,6 +26,9 @@ set "EXE_PATH="
 for /f "delims=" %%D in ('dir /b /ad /on "%SCRIPT_DIR%\dist" 2^>nul') do (
     if exist "%SCRIPT_DIR%\dist\%%D\PlexResetButton\PlexResetButton.exe" (
         set "EXE_PATH=%SCRIPT_DIR%\dist\%%D\PlexResetButton\PlexResetButton.exe"
+    )
+    if exist "%SCRIPT_DIR%\dist\%%D\Plexxarr\Plexxarr.exe" (
+        set "EXE_PATH=%SCRIPT_DIR%\dist\%%D\Plexxarr\Plexxarr.exe"
     )
 )
 if not defined EXE_PATH (
@@ -56,7 +59,7 @@ if defined EXE_PATH (
 :: Recreate the task (/f overwrites any existing one so re-running this after
 :: a new build repoints autostart at the newest binary).
 schtasks /create ^
-  /tn "PlexResetButton" ^
+  /tn "Plexxarr" ^
   /tr "!TASK_TARGET!" ^
   /sc onlogon ^
   /rl highest ^
@@ -71,7 +74,7 @@ if %errorlevel% neq 0 (
 
 echo.
 echo ============================================
-echo  Done! PlexResetButton will start at logon
+echo  Done! Plexxarr will start at logon
 echo  from the newest build. Re-run this script
 echo  after each rebuild to repoint autostart.
 echo.

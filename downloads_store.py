@@ -49,6 +49,9 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     ("downloads", "show_id", "INTEGER"),
     ("downloads", "season", "INTEGER"),
     ("downloads", "episode", "INTEGER"),
+    # Quality-replacement grabs: the old (cam/low-quality) file to delete
+    # once this download has moved into the library.
+    ("downloads", "replace_path", "TEXT"),
 ]
 
 _SCHEMA_HISTORY = """
@@ -86,6 +89,7 @@ class DownloadRow:
     show_id: int | None = None
     season: int | None = None
     episode: int | None = None
+    replace_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -101,7 +105,8 @@ class HistoryRow:
 _DOWNLOAD_COLUMNS = (
     "id, request_id, title, magnet, source, media_type, status, progress, "
     "staging_dir, planned_dest, planned_name, route_reason, auto_rename, "
-    "auto_move, error, created_at, completed_at, show_id, season, episode"
+    "auto_move, error, created_at, completed_at, show_id, season, episode, "
+    "replace_path"
 )
 
 
@@ -124,6 +129,7 @@ def _row_to_download(row) -> DownloadRow:
         route_reason=row[11], auto_rename=bool(row[12]), auto_move=bool(row[13]),
         error=row[14], created_at=row[15], completed_at=row[16],
         show_id=row[17], season=row[18], episode=row[19],
+        replace_path=row[20],
     )
 
 
@@ -133,7 +139,7 @@ def create_download(
     planned_name: str | None, route_reason: str | None,
     auto_rename: bool, auto_move: bool,
     show_id: int | None = None, season: int | None = None,
-    episode: int | None = None,
+    episode: int | None = None, replace_path: str | None = None,
 ) -> int:
     initialize_downloads_db()
     with _DL_LOCK, db.connect() as conn:
@@ -142,12 +148,13 @@ def create_download(
             INSERT INTO downloads
                 (request_id, title, magnet, source, media_type, staging_dir,
                  planned_dest, planned_name, route_reason, auto_rename, auto_move,
-                 show_id, season, episode)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 show_id, season, episode, replace_path)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (request_id, title, magnet, source, media_type, staging_dir,
              planned_dest, planned_name, route_reason,
-             int(auto_rename), int(auto_move), show_id, season, episode),
+             int(auto_rename), int(auto_move), show_id, season, episode,
+             replace_path),
         )
         conn.commit()
         download_id = int(cursor.lastrowid or 0)

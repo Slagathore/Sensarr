@@ -96,8 +96,8 @@ def _parse_id_list(raw: str) -> tuple[int, ...]:
 TELEGRAM_ALLOWED_USER_IDS: tuple[int, ...] = _parse_id_list(
     os.getenv("TELEGRAM_ALLOWED_USER_IDS", "")
 )
-APP_PRODUCT_NAME: str = "Plex Reset Button"
-APP_VERSION: str = "1.0"
+APP_PRODUCT_NAME: str = "Plexxarr"
+APP_VERSION: str = "1.1"
 
 # How long (seconds) to pause between each process-gone check after Exit is clicked.
 # Plex can take 10-30s to fully stop — 3s intervals × 10 retries = 30s total window.
@@ -255,11 +255,33 @@ DOWNLOAD_ROOT_OVERRIDE: str = os.getenv("DOWNLOAD_ROOT_OVERRIDE", "").strip()
 # 0 = no preference (pick by seeders alone). Used by the torrent pickers to
 # prefer results whose size best matches the target, and shown in Settings as
 # both MB/min and an approximate total (movies ≈ 2 h, episodes ≈ 30 min).
+# Default 10 MB/min ≈ 1.2 GB per 2h movie / 300 MB per 30-min episode.
 # ---------------------------------------------------------------------------
-SIZE_PREF_MB_PER_MIN_MOVIE: float = float(os.getenv("SIZE_PREF_MB_PER_MIN_MOVIE", "0"))
-SIZE_PREF_MB_PER_MIN_TV: float = float(os.getenv("SIZE_PREF_MB_PER_MIN_TV", "0"))
-SIZE_PREF_MB_PER_MIN_ANIME: float = float(os.getenv("SIZE_PREF_MB_PER_MIN_ANIME", "0"))
-SIZE_PREF_MB_PER_MIN_XANIME: float = float(os.getenv("SIZE_PREF_MB_PER_MIN_XANIME", "0"))
+SIZE_PREF_MB_PER_MIN_MOVIE: float = float(os.getenv("SIZE_PREF_MB_PER_MIN_MOVIE", "10"))
+SIZE_PREF_MB_PER_MIN_TV: float = float(os.getenv("SIZE_PREF_MB_PER_MIN_TV", "10"))
+SIZE_PREF_MB_PER_MIN_ANIME: float = float(os.getenv("SIZE_PREF_MB_PER_MIN_ANIME", "10"))
+SIZE_PREF_MB_PER_MIN_XANIME: float = float(os.getenv("SIZE_PREF_MB_PER_MIN_XANIME", "10"))
+
+# Hard ceiling, same units (0 = no cap). Auto-grab NEVER takes a result whose
+# implied MB/min exceeds this — the answer to "only one result at 2× target".
+SIZE_MAX_MB_PER_MIN_MOVIE: float = float(os.getenv("SIZE_MAX_MB_PER_MIN_MOVIE", "0"))
+SIZE_MAX_MB_PER_MIN_TV: float = float(os.getenv("SIZE_MAX_MB_PER_MIN_TV", "0"))
+SIZE_MAX_MB_PER_MIN_ANIME: float = float(os.getenv("SIZE_MAX_MB_PER_MIN_ANIME", "0"))
+SIZE_MAX_MB_PER_MIN_XANIME: float = float(os.getenv("SIZE_MAX_MB_PER_MIN_XANIME", "0"))
+
+# Never auto-download cam/telesync releases (movies). Manual grabs still obey
+# the user's click.
+BLOCK_CAMS: bool = _env_bool("BLOCK_CAMS", True)
+
+# Movies with less than this MB per minute of runtime are "low quality" in
+# the Library tab's quality scan.
+LOW_QUALITY_MB_PER_MIN: float = float(os.getenv("LOW_QUALITY_MB_PER_MIN", "5"))
+
+# Subtitle language for the Library tab's "Find Subtitles" (ISO 639-1).
+SUBTITLE_LANGUAGE: str = os.getenv("SUBTITLE_LANGUAGE", "en").strip()
+
+# Which Plex account is YOU — used by the Watchlist/Recs tab.
+PLEX_ACCOUNT_NAME: str = os.getenv("PLEX_ACCOUNT_NAME", "").strip()
 
 # ---------------------------------------------------------------------------
 # External media database API keys
@@ -274,17 +296,16 @@ OMDB_API_KEY: str = os.getenv("OMDB_API_KEY", "").strip()
 
 # ---------------------------------------------------------------------------
 # Ollama — used for fuzzy title matching and 'Other' request categorization
-# The Ollama *daemon* runs locally (https://ollama.com), but note: the default
-# model tag ends in ":cloud", which means Ollama relays the prompt to its
-# hosted cloud service for inference — request text (user titles, including
-# xanime requests) LEAVES THIS MACHINE and is processed by ollama.com under
-# their privacy policy. This is a deliberate choice (no local GPU inference
-# required). To keep everything on-box instead, set OLLAMA_MODEL to a local
-# tag you have pulled (e.g. "llama3.1:8b") — the code needs no other change.
+# Default is a small LOCAL model (llama3.2:3b, ~2 GB) because it works for a
+# brand-new Ollama install with NO account: ":cloud" model tags relay
+# inference through ollama.com and require `ollama signin` first. If you have
+# an Ollama account and prefer cloud inference (no local GPU/CPU load), set a
+# ":cloud" tag — note request text then leaves this machine and is processed
+# by ollama.com under their privacy policy.
 # OLLAMA_HOST defaults to http://localhost:11434 (standard Ollama install).
 # ---------------------------------------------------------------------------
 OLLAMA_HOST: str = os.getenv("OLLAMA_HOST", "http://localhost:11434").strip()
-OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "gemini-3-flash-preview:cloud").strip()
+OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "llama3.2:3b").strip()
 
 # ---------------------------------------------------------------------------
 # AniDB — used for xAnime (explicit anime) title lookup

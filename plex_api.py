@@ -314,6 +314,205 @@ def get_watch_history(limit: int = 200) -> list[WatchHistoryEntry]:
     return rows
 
 
+# ---------------------------------------------------------------------------
+# Watchlist (plex.tv discover API — account-level, uses the same token)
+# ---------------------------------------------------------------------------
+
+_DISCOVER_URL = "https://discover.provider.plex.tv"
+
+
+@dataclass(frozen=True)
+class WatchlistItem:
+    title: str
+    year: int | None
+    item_type: str      # "movie" | "show"
+
+
+def list_plex_accounts() -> list[str]:
+    """Account names known to this server (for the you-are dropdown)."""
+    return sorted(_account_name_map().values(), key=str.casefold)
+
+
+def get_watchlist(limit: int = 100) -> list[WatchlistItem]:
+    """The account's Plex watchlist, via the plex.tv discover API."""
+    import json as _json
+    import urllib.request as _rq
+    if not config.PLEX_TOKEN:
+        raise RuntimeError("Plex token required — click 'Get Plex Token' first.")
+    req = _rq.Request(
+        f"{_DISCOVER_URL}/library/sections/watchlist/all"
+        f"?X-Plex-Container-Start=0&X-Plex-Container-Size={limit}",
+        headers={"Accept": "application/json", "X-Plex-Token": config.PLEX_TOKEN},
+    )
+    with _rq.urlopen(req, timeout=20) as resp:
+        payload = _json.loads(resp.read().decode("utf-8", errors="replace"))
+    items = _as_list(_media_container(payload).get("Metadata"))
+    out: list[WatchlistItem] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        out.append(WatchlistItem(
+            title=str(item.get("title") or "Unknown"),
+            year=_safe_int(item.get("year")) or None,
+            item_type=str(item.get("type") or "movie"),
+        ))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Recommendations — genre affinity from one user's watch history
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Recommendation:
+    title: str
+    year: int | None
+    item_type: str          # "movie" | "show"
+    genres: tuple[str, ...]
+    note: str               # "because you watch Action, Sci-Fi"
+    in_library: bool
+
+
+def get_recommendations(
+    account_name: str | None, *, in_library_only: bool = True,
+    genre_filter: str | None = None, limit: int = 40,
+) -> tuple[list[str], list[Recommendation]]:
+    """(top_genres, recommendations) for one Plex user.
+
+    Tallies genres from the user's recent watch history, then surfaces
+    UNWATCHED library items in those genres. With in_library_only=False,
+    TMDB discover adds popular titles you don't have yet (TMDB key needed).
+
+    Caveat: per-item viewCount comes from the admin token's perspective;
+    Plex doesn't expose other users' watched flags through this API, so
+    "unwatched" means unwatched-by-the-server-account.
+    """
+    names = _account_name_map()
+    account_id = next(
+        (i for i, n in names.items() if n.casefold() == (account_name or "").casefold()),
+        None,
+    )
+    history = _history_entries(300)
+    mine = ([h for h in history if _safe_int(h.get("accountID"), -1) == account_id]
+            if account_id is not None else history)
+
+    watched_titles: set[str] = set()
+    rating_keys: list[str] = []
+    for h in mine:
+        watched_titles.add(str(h.get("grandparentTitle") or h.get("title") or "").casefold())
+        rk = str(h.get("grandparentRatingKey") or h.get("ratingKey") or "")
+        if rk and rk not in rating_keys:
+            rating_keys.append(rk)
+
+    genre_count: dict[str, int] = {}
+    for rk in rating_keys[:30]:
+        try:
+            payload = _request_json(f"/library/metadata/{rk}")
+        except Exception:
+            continue
+        for meta in _as_list(_media_container(payload).get("Metadata")):
+            if not isinstance(meta, dict):
+                continue
+            for g in _as_list(meta.get("Genre")):
+                if isinstance(g, dict) and g.get("tag"):
+                    tag = str(g["tag"])
+                    genre_count[tag] = genre_count.get(tag, 0) + 1
+    top_genres = [g for g, _n in sorted(genre_count.items(), key=lambda kv: -kv[1])][:8]
+    wanted = ({genre_filter} if genre_filter else set(top_genres))
+
+    recs: list[tuple[int, Recommendation]] = []
+    for section in _library_sections():
+        section_type = str(section.get("type") or "")
+        if section_type not in ("movie", "show"):
+            continue
+        key = str(section.get("key") or "")
+        if not key:
+            continue
+        try:
+            items = _section_items(key)
+        except Exception:
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if _safe_int(item.get("viewCount")) > 0:
+                continue
+            title = str(item.get("title") or "")
+            if not title or title.casefold() in watched_titles:
+                continue
+            genres = tuple(
+                str(g["tag"]) for g in _as_list(item.get("Genre"))
+                if isinstance(g, dict) and g.get("tag")
+            )
+            overlap = [g for g in genres if g in wanted]
+            if not overlap:
+                continue
+            recs.append((len(overlap), Recommendation(
+                title=title, year=_safe_int(item.get("year")) or None,
+                item_type=section_type, genres=genres,
+                note="because you watch " + ", ".join(overlap[:3]),
+                in_library=True,
+            )))
+    recs.sort(key=lambda pair: -pair[0])
+    results = [r for _score, r in recs[:limit]]
+
+    if not in_library_only and config.TMDB_API_KEY and (genre_filter or top_genres):
+        results.extend(_tmdb_discover_recs(
+            genre_filter or top_genres[0],
+            exclude_titles=watched_titles | {r.title.casefold() for r in results},
+            limit=max(5, limit // 3),
+        ))
+    return top_genres, results
+
+
+# TMDB genre-name → id (movie discover). Only common ones; unknown names skip.
+_TMDB_GENRE_IDS = {
+    "action": 28, "adventure": 12, "animation": 16, "comedy": 35, "crime": 80,
+    "documentary": 99, "drama": 18, "family": 10751, "fantasy": 14,
+    "history": 36, "horror": 27, "music": 10402, "mystery": 9648,
+    "romance": 10749, "science fiction": 878, "sci-fi": 878, "thriller": 53,
+    "war": 10752, "western": 37,
+}
+
+
+def _tmdb_discover_recs(genre_name: str, *, exclude_titles: set[str],
+                        limit: int) -> list[Recommendation]:
+    """Popular TMDB movies in a genre that aren't in the library yet."""
+    import json as _json
+    import urllib.request as _rq
+    genre_id = _TMDB_GENRE_IDS.get(genre_name.casefold())
+    if genre_id is None:
+        return []
+    try:
+        req = _rq.Request(
+            "https://api.themoviedb.org/3/discover/movie"
+            f"?api_key={config.TMDB_API_KEY}&with_genres={genre_id}"
+            "&sort_by=popularity.desc&vote_count.gte=500",
+            headers={"Accept": "application/json"},
+        )
+        with _rq.urlopen(req, timeout=15) as resp:
+            data = _json.loads(resp.read().decode("utf-8", errors="replace"))
+    except Exception:
+        logger.debug("TMDB discover failed.", exc_info=True)
+        return []
+    out: list[Recommendation] = []
+    for item in data.get("results", []):
+        title = str(item.get("title") or "")
+        if not title or title.casefold() in exclude_titles:
+            continue
+        year = None
+        if item.get("release_date"):
+            year = _safe_int(str(item["release_date"])[:4]) or None
+        out.append(Recommendation(
+            title=title, year=year, item_type="movie",
+            genres=(genre_name,), note=f"popular {genre_name} (not in library)",
+            in_library=False,
+        ))
+        if len(out) >= limit:
+            break
+    return out
+
+
 def _library_sections() -> list[dict[str, Any]]:
     payload = _request_json("/library/sections")
     return [

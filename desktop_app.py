@@ -46,6 +46,7 @@ from download_manager import DownloadManager
 from health import format_health_report
 from shows_tab import ShowsTab
 from torrent_search import TorrentResult, format_size, search_torrents
+from watchlist_tab import WatchlistTab
 from ui_helpers import add_tooltip, make_sortable
 
 logger = logging.getLogger(__name__)
@@ -99,7 +100,7 @@ class DesktopApp:
     def __init__(self) -> None:
         self.bot_service = TelegramBotService()
         self.root = tk.Tk()
-        self.root.title("Plex Reset Button")
+        self.root.title("Plexxarr")
         self.root.geometry("860x620")
         self.root.minsize(760, 520)
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
@@ -113,6 +114,9 @@ class DesktopApp:
         style = ttk.Style(self.root)
         style.configure("Danger.TButton", foreground=_DOT_RED, font=("Segoe UI", 9, "bold"))
         initialize_queue_db()
+        # Run auth migrations even when the Telegram bot isn't configured —
+        # the Users tab reads these tables regardless.
+        auth_store.initialize_auth_db()
 
         self.status_var = tk.StringVar(value="Starting...")
         self.bot_status_var = tk.StringVar(value="Telegram bot: starting")
@@ -288,7 +292,7 @@ class DesktopApp:
 
         ttk.Label(
             header,
-            text="Plex Reset Button",
+            text="Plexxarr",
             font=("Segoe UI", 18, "bold"),
         ).grid(row=0, column=0, sticky="w")
 
@@ -318,7 +322,7 @@ class DesktopApp:
             text=("😺 Like the app? You could help me get more catnip for my "
                   "many, many cats — they NEED their zoomies! 🐈"),
             foreground="#ff5f5f", cursor="hand2",
-            font=("Segoe UI", 12, "bold underline"),
+            font=("Segoe UI", 12, "underline"),
         )
         kofi_label.pack(side=tk.LEFT)
         kofi_label.bind("<Button-1>", lambda _e: webbrowser.open_new_tab(config.KOFI_URL))
@@ -353,6 +357,7 @@ class DesktopApp:
         requests_tab = ttk.Frame(notebook, padding=12)
         downloads_tab = ttk.Frame(notebook, padding=12)
         shows_tab = ttk.Frame(notebook, padding=12)
+        watchlist_tab = ttk.Frame(notebook, padding=12)
         library_tab = ttk.Frame(notebook, padding=12)
         metrics_tab = ttk.Frame(notebook, padding=12)
         maintenance_tab = ttk.Frame(notebook, padding=12)
@@ -363,6 +368,7 @@ class DesktopApp:
         notebook.add(requests_tab, text="Requests")
         notebook.add(downloads_tab, text="Downloads")
         notebook.add(shows_tab, text="Shows")
+        notebook.add(watchlist_tab, text="Watchlist/Recs")
         notebook.add(library_tab, text="Library")
         notebook.add(metrics_tab, text="Metrics")
         notebook.add(maintenance_tab, text="Maintenance")
@@ -373,11 +379,13 @@ class DesktopApp:
         self._users_tab = users_tab
         self._downloads_tab = downloads_tab
         self._maintenance_tab = maintenance_tab
+        self._settings_tab = settings_tab
         self._build_downloads_tab(downloads_tab)
         self._build_users_tab(users_tab)
-        # Shows tab lives in its own module (shows_tab.py) — the first tab
-        # split out of this class; new tabs should follow that pattern.
+        # Tabs split out of this class into their own modules — the pattern
+        # new tabs should follow.
         self.shows_tab = ShowsTab(shows_tab, self)
+        self.watchlist_tab = WatchlistTab(watchlist_tab, self)
 
         status_tab.columnconfigure(0, weight=1)
         status_tab.rowconfigure(1, weight=1)
@@ -471,42 +479,7 @@ class DesktopApp:
         # Double-click a request to open its torrent-source search in Firefox.
         self.requests_tree.bind("<Double-1>", self._on_request_activated)
 
-        library_toolbar = ttk.Frame(library_tab)
-        library_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        library_toolbar.columnconfigure(1, weight=1)
-
-        ttk.Label(library_toolbar, text="Search").grid(row=0, column=0, sticky="w")
-        library_search_entry = ttk.Entry(library_toolbar, textvariable=self.library_search_var)
-        library_search_entry.grid(row=0, column=1, padx=(6, 12), sticky="ew")
-        library_search_entry.bind("<Return>", lambda _event: self.search_library_from_ui())
-        ttk.Button(library_toolbar, text="Search", command=self.search_library_from_ui).grid(row=0, column=2, padx=(0, 6))
-        ttk.Button(library_toolbar, text="Reindex", command=self.rebuild_library_index_from_ui).grid(row=0, column=3, padx=(0, 6))
-        ttk.Button(library_toolbar, text="Refresh Summary", command=self.refresh_library_summary).grid(row=0, column=4)
-
-        self.library_summary_text = scrolledtext.ScrolledText(
-            library_tab, wrap=tk.WORD, height=7, font=("Consolas", 10), state=tk.DISABLED,
-        )
-        self.library_summary_text.grid(row=1, column=0, sticky="ew", pady=(0, 8))
-
-        library_results_frame = ttk.Frame(library_tab)
-        library_results_frame.grid(row=2, column=0, sticky="nsew")
-        library_results_frame.columnconfigure(0, weight=1)
-        library_results_frame.rowconfigure(0, weight=1)
-
-        self.library_results_tree = ttk.Treeview(
-            library_results_frame, columns=("name", "root", "path"), show="headings", height=12,
-        )
-        self.library_results_tree.heading("name", text="Name")
-        self.library_results_tree.heading("root", text="Library Root")
-        self.library_results_tree.heading("path", text="Path")
-        self.library_results_tree.column("name", width=240, anchor=tk.W, stretch=False)
-        self.library_results_tree.column("root", width=220, anchor=tk.W, stretch=False)
-        self.library_results_tree.column("path", width=420, anchor=tk.W)
-        self.library_results_tree.grid(row=0, column=0, sticky="nsew")
-
-        library_scroll = ttk.Scrollbar(library_results_frame, orient=tk.VERTICAL, command=self.library_results_tree.yview)
-        library_scroll.grid(row=0, column=1, sticky="ns")
-        self.library_results_tree.configure(yscrollcommand=library_scroll.set)
+        self._build_library_tab(library_tab)
 
         metrics_toolbar = ttk.Frame(metrics_tab)
         metrics_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
@@ -628,7 +601,7 @@ class DesktopApp:
             MenuItem("Get Plex Token", lambda icon, item: self.authenticate_plex_account()),
             MenuItem("Quit", lambda icon, item: self.request_exit()),
         )
-        return Icon("PlexResetButton", image, "Plex Reset Button", menu)
+        return Icon("Plexxarr", image, "Plexxarr", menu)
 
     def _create_tray_image(self) -> PillowImage:
         icon = Image.new("RGBA", (64, 64), (24, 28, 36, 255))
@@ -1122,51 +1095,6 @@ class DesktopApp:
             self._library_metrics_refresh_pending = False
             self.refresh_library_metrics()
 
-    def search_library_from_ui(self) -> None:
-        if self.library_results_tree is None:
-            return
-
-        query = self.library_search_var.get().strip()
-        if not query:
-            self._show_warning("Missing search", "Enter a title or keyword to search for.")
-            return
-
-        # Run the search off the Tk main thread — on a large index a
-        # synchronous search freezes the whole window.
-        self.status_var.set(f'Searching library for "{query}"…')
-
-        def worker() -> None:
-            try:
-                results = search_library(query)
-            except Exception as exc:
-                logger.exception("Library search failed.")
-                self._post_to_ui(lambda: self._handle_library_search_error(query, str(exc)))
-                return
-            self._post_to_ui(lambda: self._handle_library_search_results(query, results))
-
-        threading.Thread(target=worker, name="ui-library-search", daemon=True).start()
-
-    def _handle_library_search_error(self, query: str, error: str) -> None:
-        self.status_var.set(f'Library search for "{query}" failed')
-        self._show_warning("Library search failed", error)
-
-    def _handle_library_search_results(self, query: str, results: list[Any]) -> None:
-        if self.library_results_tree is None:
-            return
-        for item_id in self.library_results_tree.get_children():
-            self.library_results_tree.delete(item_id)
-
-        for index, entry in enumerate(results):
-            self.library_results_tree.insert(
-                "", "end", iid=str(index),
-                values=(entry.name, entry.root_path, entry.path),
-            )
-
-        self.status_var.set(f'Library search for "{query}" returned {len(results)} result(s)')
-        self.last_action_var.set("Last action: library search")
-        if not results:
-            self._show_info("No results", f'No indexed library matches for "{query}".')
-
     def rebuild_library_index_from_ui(self) -> None:
         def worker() -> None:
             try:
@@ -1182,9 +1110,358 @@ class DesktopApp:
     def _handle_library_reindex_result(self, message: str) -> None:
         self.refresh_library_summary()
         self.refresh_library_metrics()
+        self._lib_show_all()
         self.status_var.set(message.splitlines()[0] if message else "Library reindex complete")
         self.last_action_var.set("Last action: library reindex")
         self._show_info("Library Reindex", message)
+
+    # =====================================================================
+    # Library tab — full persistent listing + movie quality tools
+    # =====================================================================
+
+    _LIB_TYPE_LABELS = (("movie", "Movies"), ("tv", "TV"), ("anime", "Anime"),
+                        ("xanime", "xAnime"), ("mixed", "Mixed"))
+
+    def _build_library_tab(self, tab: ttk.Frame) -> None:
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(2, weight=1)
+        # "all" = plain listing, "lowqual" = quality-scan results.
+        self._lib_view_mode = "all"
+        self._lib_rows: list[Any] = []      # per-row payload (entry or LowQualityMovie)
+
+        toolbar = ttk.Frame(tab)
+        toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        toolbar.columnconfigure(1, weight=1)
+        ttk.Label(toolbar, text="Filter").grid(row=0, column=0, sticky="w")
+        entry = ttk.Entry(toolbar, textvariable=self.library_search_var)
+        entry.grid(row=0, column=1, sticky="ew", padx=(6, 10))
+        entry.bind("<Return>", lambda _e: self._lib_show_all())
+        for col, (text, command, tip) in enumerate((
+            ("Show All", self._lib_show_all,
+             "List every indexed file (the index persists between sessions)."),
+            ("Refresh", self._lib_refresh,
+             "Quick delta pass: add new files, drop deleted ones — no full rebuild."),
+            ("Reindex", self.rebuild_library_index_from_ui,
+             "Full rebuild of the file index from scratch."),
+        ), start=2):
+            btn = ttk.Button(toolbar, text=text, command=command)
+            btn.grid(row=0, column=col, padx=(0, 6))
+            add_tooltip(btn, tip)
+
+        self._lib_type_vars: dict[str, tk.BooleanVar] = {}
+        for col, (tag, label) in enumerate(self._LIB_TYPE_LABELS, start=5):
+            var = tk.BooleanVar(value=(tag == "movie"))  # movies-only by default
+            self._lib_type_vars[tag] = var
+            ttk.Checkbutton(toolbar, text=label, variable=var,
+                            command=self._lib_filters_changed).grid(row=0, column=col, padx=2)
+
+        # Movie tools — surfaced only while the Movies filter is the only one on.
+        self._lib_movie_bar = ttk.Frame(tab)
+        self._lib_movie_bar.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        ttk.Label(self._lib_movie_bar, text="Subs:").pack(side=tk.LEFT)
+        from subtitles import LANGUAGE_CHOICES
+        self._lib_lang_var = tk.StringVar(value=config.SUBTITLE_LANGUAGE)
+        ttk.Combobox(self._lib_movie_bar, textvariable=self._lib_lang_var, width=5,
+                     state="readonly", values=[code for code, _n in LANGUAGE_CHOICES],
+                     ).pack(side=tk.LEFT, padx=(4, 4))
+        for text, command, tip in (
+            ("Find Subtitles for Selected", self._lib_find_subs,
+             "Download subtitles (in the chosen language) next to each selected movie. "
+             "Needs the 'subliminal' package installed."),
+            ("Search Low-Quality Movies", self._lib_search_lowqual,
+             "Scan movies for cam/telesync releases and files under "
+             f"{config.LOW_QUALITY_MB_PER_MIN:g} MB/min. Cams list first, worst first. "
+             "Flags copies as redundant when a better version already exists."),
+            ("Replace Selected with Non-Cam", self._lib_replace_selected,
+             "For each selected low-quality movie: search for a proper (non-cam, "
+             "size-appropriate) release, download it, and delete the old file once "
+             "the new one is in place."),
+        ):
+            btn = ttk.Button(self._lib_movie_bar, text=text, command=command)
+            btn.pack(side=tk.LEFT, padx=(0, 6))
+            add_tooltip(btn, tip)
+        del_btn = ttk.Button(self._lib_movie_bar, text="Delete Selected Files…",
+                             style="Danger.TButton", command=self._lib_delete_selected)
+        del_btn.pack(side=tk.LEFT, padx=(6, 0))
+        add_tooltip(del_btn, "Delete the selected files (recycle bin). Asks for confirmation.")
+
+        tree_frame = ttk.Frame(tab)
+        tree_frame.grid(row=2, column=0, sticky="nsew")
+        tree_frame.columnconfigure(0, weight=1)
+        tree_frame.rowconfigure(0, weight=1)
+        tree = ttk.Treeview(
+            tree_frame, columns=("name", "type", "size", "rate", "note", "path"),
+            show="headings", selectmode="extended",
+        )
+        for col, text, width, stretch in (
+            ("name", "Name", 300, True), ("type", "Type", 60, False),
+            ("size", "Size", 80, False), ("rate", "MB/min", 70, False),
+            ("note", "Quality note", 240, True), ("path", "Path", 300, True),
+        ):
+            tree.heading(col, text=text)
+            tree.column(col, width=width, anchor=tk.W, stretch=stretch)
+        tree.grid(row=0, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=tree.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        tree.configure(yscrollcommand=scroll.set)
+        make_sortable(tree)
+        self.library_results_tree = tree
+
+        self._lib_status_var = tk.StringVar(
+            value="Click Show All to list the library (persisted index — no rescan needed).")
+        ttk.Label(tab, textvariable=self._lib_status_var,
+                  font=("Segoe UI", 9, "italic")).grid(row=3, column=0, sticky="w", pady=(4, 0))
+        self._lib_filters_changed(initial=True)
+
+    def _lib_movies_only(self) -> bool:
+        return (self._lib_type_vars["movie"].get()
+                and not any(v.get() for tag, v in self._lib_type_vars.items()
+                            if tag != "movie"))
+
+    def _lib_filters_changed(self, initial: bool = False) -> None:
+        if self._lib_movies_only():
+            self._lib_movie_bar.grid()
+        else:
+            self._lib_movie_bar.grid_remove()
+        if not initial:
+            self._lib_show_all()
+
+    def _lib_active_types(self) -> set[str]:
+        return {tag for tag, v in self._lib_type_vars.items() if v.get()}
+
+    def _lib_show_all(self) -> None:
+        query = self.library_search_var.get()
+        active = self._lib_active_types()
+        self._lib_status_var.set("Loading library listing…")
+
+        def worker() -> None:
+            from library_index import list_all_files
+            entries = list_all_files(name_filter=query)
+            rows = []
+            type_cache: dict[str, str] = {}
+            for e in entries:
+                mtype = type_cache.get(e.root_path)
+                if mtype is None:
+                    mtype = media_type_for_path(e.root_path)
+                    type_cache[e.root_path] = mtype
+                if mtype not in active:
+                    continue
+                rows.append((e, mtype))
+            self._post_to_ui(lambda: self._lib_render_all(rows))
+
+        threading.Thread(target=worker, name="lib-show-all", daemon=True).start()
+
+    def _lib_render_all(self, rows: list[tuple[Any, str]]) -> None:
+        tree = self.library_results_tree
+        if tree is None:
+            return
+        self._lib_view_mode = "all"
+        self._lib_rows = [e for e, _t in rows]
+        for iid in tree.get_children():
+            tree.delete(iid)
+        for idx, (e, mtype) in enumerate(rows):
+            tree.insert("", "end", iid=str(idx),
+                        values=(e.name, mtype, self._fmt_bytes(e.size_bytes),
+                                "", "", e.path))
+        self._lib_status_var.set(
+            f"{len(rows)} file(s) shown. Select rows for bulk actions; "
+            "Ctrl+A selects everything visible.")
+
+    def _lib_refresh(self) -> None:
+        self._lib_status_var.set("Refreshing index against the filesystem…")
+
+        def worker() -> None:
+            from library_index import refresh_library_index
+            try:
+                result = refresh_library_index()
+            except Exception as exc:
+                self._post_to_ui(lambda: self._lib_status_var.set(f"Refresh failed: {exc}"))
+                return
+
+            def done() -> None:
+                self._lib_status_var.set(
+                    f"Index refreshed: +{result.added} new, −{result.removed} gone, "
+                    f"{result.updated} changed ({result.total} total).")
+                self._lib_show_all()
+            self._post_to_ui(done)
+
+        threading.Thread(target=worker, name="lib-refresh", daemon=True).start()
+
+    def _lib_selected_paths(self) -> list[str]:
+        tree = self.library_results_tree
+        if tree is None:
+            return []
+        paths = []
+        for iid in tree.selection():
+            values = tree.item(iid, "values")
+            if values:
+                paths.append(values[-1])
+        return paths
+
+    def _lib_search_lowqual(self) -> None:
+        self._lib_status_var.set("Scanning movies for cams and low-bitrate files…")
+
+        def worker() -> None:
+            from library_index import list_all_files
+            from video_quality import find_low_quality_movies
+            movies = [
+                (e.path, e.name, e.size_bytes) for e in list_all_files()
+                if media_type_for_path(e.root_path) == "movie"
+            ]
+
+            def progress(done: int, total: int) -> None:
+                self._post_to_ui(lambda: self._lib_status_var.set(
+                    f"Analysing movie {done}/{total}…"))
+
+            try:
+                results = find_low_quality_movies(movies, progress=progress)
+            except Exception as exc:
+                logger.exception("Low-quality scan failed.")
+                self._post_to_ui(lambda: self._lib_status_var.set(f"Scan failed: {exc}"))
+                return
+            self._post_to_ui(lambda: self._lib_render_lowqual(results, len(movies)))
+
+        threading.Thread(target=worker, name="lib-lowqual", daemon=True).start()
+
+    def _lib_render_lowqual(self, results: list[Any], scanned: int) -> None:
+        tree = self.library_results_tree
+        if tree is None:
+            return
+        self._lib_view_mode = "lowqual"
+        self._lib_rows = results
+        for iid in tree.get_children():
+            tree.delete(iid)
+        for idx, m in enumerate(results):
+            notes = []
+            if m.cam_hit:
+                notes.append(f"⚠ {m.cam_hit}")
+            if not m.rate_exact:
+                notes.append("rate assumes 2h (install ffmpeg for exact)")
+            if m.redundant_with:
+                notes.append(f"redundant — better file at {m.redundant_with}")
+            tree.insert("", "end", iid=str(idx),
+                        values=(m.name, "movie", self._fmt_bytes(m.size_bytes),
+                                f"{m.rate_mb_min:.1f}", " · ".join(notes), m.path))
+        redundant = sum(1 for m in results if m.redundant_with)
+        self._lib_status_var.set(
+            f"{len(results)} low-quality movie(s) of {scanned} scanned — cams first, "
+            f"worst bitrate first. {redundant} are redundant (a better copy exists) "
+            "and can just be deleted; select the rest and click Replace.")
+
+    def _lib_replace_selected(self) -> None:
+        if self._lib_view_mode != "lowqual":
+            self._show_warning("Run the scan first",
+                               "Click 'Search Low-Quality Movies' and select rows from "
+                               "its results to replace.")
+            return
+        tree = self.library_results_tree
+        if tree is None:
+            return
+        selected = [self._lib_rows[int(iid)] for iid in tree.selection()
+                    if int(iid) < len(self._lib_rows)]
+        if not selected:
+            self._show_warning("Nothing selected", "Select low-quality movies to replace.")
+            return
+        redundant = [m for m in selected if m.redundant_with]
+        if redundant and not self._ask_yes_no(
+            "Redundant copies included",
+            f"{len(redundant)} of the selected files already have a better version in "
+            "the library — replacing them downloads ANOTHER copy. Usually you just "
+            "delete those instead.\n\nContinue anyway?",
+        ):
+            return
+        if not self._ask_yes_no(
+            "Replace with non-cam versions",
+            f"Search for and download proper (non-cam) versions of {len(selected)} "
+            "movie(s)? Each old file is deleted automatically once its replacement "
+            "finishes and moves into the library.",
+        ):
+            return
+        self._lib_status_var.set(f"Searching replacements for {len(selected)} movie(s)…")
+
+        def worker() -> None:
+            from maintenance import _normalize_title
+            started = 0
+            skipped: list[str] = []
+            for m in selected:
+                title = _normalize_title(m.name)
+                year_match = re.search(r"\((\d{4})\)", m.name) or re.search(r"\b(19|20)\d{2}\b", m.name)
+                query = f"{title} {year_match.group(0).strip('()')}" if year_match else title
+                download_id = self.download_manager.replace_low_quality_movie(query, m.path)
+                if download_id is not None:
+                    started += 1
+                else:
+                    skipped.append(m.name)
+
+            def done() -> None:
+                msg = f"Started {started} replacement download(s)"
+                if skipped:
+                    msg += f"; no acceptable non-cam release found for {len(skipped)}"
+                self._lib_status_var.set(msg + " — see the Downloads tab.")
+                self.refresh_downloads()
+            self._post_to_ui(done)
+
+        threading.Thread(target=worker, name="lib-replace", daemon=True).start()
+
+    def _lib_delete_selected(self) -> None:
+        paths = self._lib_selected_paths()
+        if not paths:
+            self._show_warning("Nothing selected", "Select files to delete first.")
+            return
+        preview = "\n".join(f"  {p}" for p in paths[:10])
+        if len(paths) > 10:
+            preview += f"\n  … and {len(paths) - 10} more"
+        if not self._ask_yes_no(
+            "Delete files",
+            f"Delete {len(paths)} file(s) (to the recycle bin)?\n\n{preview}",
+        ):
+            return
+
+        def worker() -> None:
+            from library_index import remove_from_index
+            deleted, errors, _empty = delete_files_with_cleanup(paths)
+            remove_from_index(deleted)
+
+            def done() -> None:
+                msg = f"Deleted {len(deleted)} file(s)"
+                if errors:
+                    msg += f" — {len(errors)} error(s)"
+                    self._show_warning("Delete", "\n".join(errors[:8]))
+                self._lib_status_var.set(msg)
+                if self._lib_view_mode == "lowqual":
+                    self._lib_search_lowqual()
+                else:
+                    self._lib_show_all()
+            self._post_to_ui(done)
+
+        threading.Thread(target=worker, name="lib-delete", daemon=True).start()
+
+    def _lib_find_subs(self) -> None:
+        paths = self._lib_selected_paths()
+        if not paths:
+            self._show_warning("Nothing selected", "Select movies to fetch subtitles for.")
+            return
+        language = self._lib_lang_var.get() or "en"
+        self._lib_status_var.set(f"Fetching {language} subtitles for {len(paths)} file(s)…")
+
+        def worker() -> None:
+            from subtitles import download_subtitles
+
+            def progress(done: int, total: int, name: str) -> None:
+                self._post_to_ui(lambda: self._lib_status_var.set(
+                    f"Subtitles {done + 1}/{total}: {name[:50]}"))
+
+            saved, errors = download_subtitles(paths, language, progress=progress)
+
+            def done() -> None:
+                self._lib_status_var.set(
+                    f"Subtitles saved for {saved}/{len(paths)} file(s)"
+                    + (f" — {len(errors)} issue(s)" if errors else ""))
+                if errors:
+                    self._show_warning("Subtitles", "\n".join(errors[:10]))
+            self._post_to_ui(done)
+
+        threading.Thread(target=worker, name="lib-subs", daemon=True).start()
 
     # =====================================================================
     # Downloads tab — in-app torrent search, grab, routing, history
@@ -1612,20 +1889,55 @@ class DesktopApp:
         history_btn.pack(side=tk.RIGHT, padx=(6, 6))
         add_tooltip(history_btn, "Who watched what on Plex, most recent first "
                                  "(needs a Plex token).")
+        # Map a Telegram user to a Plex account (drives per-user features).
+        self._users_plex_var = tk.StringVar()
+        self._users_plex_combo = ttk.Combobox(
+            allowed_bar, textvariable=self._users_plex_var, width=16,
+            state="readonly", values=[])
+        self._users_plex_combo.pack(side=tk.RIGHT, padx=(6, 0))
+        map_btn = ttk.Button(allowed_bar, text="Map → Plex user",
+                             command=self.map_selected_user_to_plex)
+        map_btn.pack(side=tk.RIGHT)
+        add_tooltip(map_btn, "Link the selected Telegram user to the chosen Plex "
+                             "account — used by Watchlist/Recs and history features.")
 
         allowed_tree = ttk.Treeview(
-            tab, columns=("id", "user_id", "name", "username", "source", "claimed"),
+            tab, columns=("id", "user_id", "name", "username", "plex", "source", "claimed"),
             show="headings", height=8, selectmode="browse",
         )
         for col, text, width, stretch in (
             ("id", "#", 40, False), ("user_id", "Telegram ID", 110, False),
-            ("name", "Name", 200, True), ("username", "Username", 140, False),
-            ("source", "Source", 150, False), ("claimed", "Claimed", 140, False),
+            ("name", "Name", 180, True), ("username", "Username", 130, False),
+            ("plex", "Plex user", 120, False),
+            ("source", "Source", 140, False), ("claimed", "Claimed", 130, False),
         ):
             allowed_tree.heading(col, text=text)
             allowed_tree.column(col, width=width, anchor=tk.W, stretch=stretch)
         allowed_tree.grid(row=3, column=0, sticky="nsew")
         self._users_allowed_tree = allowed_tree
+        self._load_plex_accounts_for_users_tab()
+
+    def _load_plex_accounts_for_users_tab(self) -> None:
+        def worker() -> None:
+            try:
+                from plex_api import list_plex_accounts
+                accounts = list_plex_accounts()
+            except Exception:
+                accounts = []
+            self._post_to_ui(
+                lambda: self._users_plex_combo.configure(values=[""] + accounts))
+
+        threading.Thread(target=worker, name="ui-plex-accounts", daemon=True).start()
+
+    def map_selected_user_to_plex(self) -> None:
+        if self._users_allowed_tree is None:
+            return
+        selected = self._users_allowed_tree.selection()
+        if not selected:
+            self._show_warning("No user selected", "Select an allowed user first.")
+            return
+        auth_store.set_plex_username(int(selected[0]), self._users_plex_var.get() or None)
+        self.refresh_users_tab()
 
     def refresh_users_tab(self) -> None:
         if self._users_pending_tree is None or self._users_allowed_tree is None:
@@ -1646,7 +1958,8 @@ class DesktopApp:
             self._users_allowed_tree.insert(
                 "", "end", iid=str(u.row_id),
                 values=(u.row_id, u.telegram_user_id or "—", u.display_name or "",
-                        f"@{u.username}" if u.username else "", u.source,
+                        f"@{u.username}" if u.username else "",
+                        u.plex_username or "", u.source,
                         u.claimed_at or "unclaimed"),
             )
 
@@ -2898,6 +3211,12 @@ class DesktopApp:
         ("QBITTORRENT_URL", "qBittorrent Web UI URL", "text"),
         ("QBITTORRENT_USERNAME", "qBittorrent username", "text"),
         ("QBITTORRENT_PASSWORD", "qBittorrent password", "secret"),
+        # Quality rules
+        ("BLOCK_CAMS", "Don't auto-download cams/telesyncs (movies)", "bool"),
+        ("LOW_QUALITY_MB_PER_MIN", "Low-quality threshold (MB per minute)", "text"),
+        ("SUBTITLE_LANGUAGE", "Subtitle language (en, es, fr, …)", "text"),
+        # Plex identity
+        ("PLEX_ACCOUNT_NAME", "Which Plex user are you? (Watchlist/Recs)", "plex_account"),
         # Misc
         ("TOOLTIPS_ENABLED", "Show hover tooltips on buttons", "bool"),
         ("LIBRARY_CHECK_HOUR", "Daily library check hour (0-23)", "int"),
@@ -3051,6 +3370,22 @@ class DesktopApp:
                     cell, text="Browse...",
                     command=lambda v=var: self._settings_browse_file(v),
                 ).grid(row=0, column=1, padx=(6, 0))
+            elif kind == "plex_account":
+                var = tk.StringVar(value=current)
+                combo = ttk.Combobox(form_frame, textvariable=var, width=24, values=[])
+                combo.grid(row=row, column=1, sticky="w")
+
+                def _fill_accounts(c=combo) -> None:
+                    def worker() -> None:
+                        try:
+                            from plex_api import list_plex_accounts
+                            accounts = list_plex_accounts()
+                        except Exception:
+                            accounts = []
+                        self._post_to_ui(lambda: c.configure(values=accounts))
+                    threading.Thread(target=worker, name="settings-plex-accounts",
+                                     daemon=True).start()
+                _fill_accounts()
             else:  # "text"
                 var = tk.StringVar(value=current)
                 ttk.Entry(form_frame, textvariable=var).grid(row=row, column=1, sticky="ew")
@@ -3067,12 +3402,34 @@ class DesktopApp:
 
         ttk.Label(button_bar, textvariable=self._settings_status_var,
                   font=("Segoe UI", 10, "italic"), foreground="#0a6").grid(row=0, column=0, sticky="w")
+        # Only shown while no bot token is configured — the app is useful
+        # without Telegram, but this keeps the path back to it obvious.
+        self._settings_telegram_btn = ttk.Button(
+            button_bar, text="📱 Set up Telegram bot…", style="Accent.TButton",
+            command=self.open_setup_wizard)
+        self._settings_telegram_btn.grid(row=0, column=1, padx=(0, 6))
+        add_tooltip(self._settings_telegram_btn,
+                    "No bot token is configured yet — the Telegram side is off. "
+                    "Click to run the setup wizard whenever you're ready.")
+        qbit_dl = ttk.Button(button_bar, text="Get qBittorrent",
+                             command=lambda: webbrowser.open_new_tab(
+                                 "https://www.qbittorrent.org/download"))
+        qbit_dl.grid(row=0, column=2, padx=(0, 6))
+        add_tooltip(qbit_dl, "Opens the qBittorrent download page. After installing: "
+                             "Tools → Options → Web UI → enable it, set a password, "
+                             "then fill in the fields above and Test Connection.")
+        qbit_test = ttk.Button(button_bar, text="Test qBittorrent",
+                               command=self._settings_test_qbittorrent)
+        qbit_test.grid(row=0, column=3, padx=(0, 6))
+        add_tooltip(qbit_test, "Try logging in to the qBittorrent Web UI with the "
+                               "URL/username/password entered above.")
         ttk.Button(button_bar, text="Setup Wizard…",
-                   command=self.open_setup_wizard).grid(row=0, column=1, padx=(0, 6))
+                   command=self.open_setup_wizard).grid(row=0, column=4, padx=(0, 6))
         ttk.Button(button_bar, text="Reload from .env",
-                   command=self._settings_reload_from_disk).grid(row=0, column=2, padx=(0, 6))
+                   command=self._settings_reload_from_disk).grid(row=0, column=5, padx=(0, 6))
         ttk.Button(button_bar, text="Save Settings",
-                   command=self._settings_save).grid(row=0, column=3)
+                   command=self._settings_save).grid(row=0, column=6)
+        self._update_telegram_setup_button()
 
         # Populate the path list from current config.
         self._settings_load_paths_from_config()
@@ -3105,31 +3462,76 @@ class DesktopApp:
             wraplength=720, foreground=_MUTED_TEXT,
         ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
 
-        for row, (key, label, minutes) in enumerate(self._SIZE_PREF_FIELDS, start=1):
-            ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=3)
-            var = tk.DoubleVar(value=float(getattr(config, key, 0.0)))
-            readout = tk.StringVar()
+        grid_row = 1
+        for key, label, minutes in self._SIZE_PREF_FIELDS:
+            max_key = key.replace("SIZE_PREF_", "SIZE_MAX_")
+            for slider_key, slider_label, empty_text in (
+                (key, label, "no preference"),
+                (max_key, f"{label} — max acceptable", "no cap"),
+            ):
+                ttk.Label(frame, text=slider_label).grid(
+                    row=grid_row, column=0, sticky="w", padx=(0, 8), pady=3)
+                var = tk.DoubleVar(value=float(getattr(config, slider_key, 0.0)))
+                readout = tk.StringVar()
 
-            def update_readout(_v: str = "", *, var=var, readout=readout, minutes=minutes) -> None:
-                mb_min = round(float(var.get()) * 2) / 2  # snap to 0.5 steps
-                var.set(mb_min)
-                if mb_min <= 0:
-                    readout.set("no preference")
-                    return
-                total_mb = mb_min * minutes
-                total = (f"{total_mb / 1024:.1f} GB" if total_mb >= 1024
-                         else f"{total_mb:.0f} MB")
-                runtime = "2 h movie" if minutes == 120 else "30 min episode"
-                readout.set(f"{mb_min:.1f} MB/min  ≈  {total} per {runtime}")
+                def update_readout(_v: str = "", *, var=var, readout=readout,
+                                   minutes=minutes, empty_text=empty_text) -> None:
+                    mb_min = round(float(var.get()) * 2) / 2  # snap to 0.5 steps
+                    var.set(mb_min)
+                    if mb_min <= 0:
+                        readout.set(empty_text)
+                        return
+                    total_mb = mb_min * minutes
+                    total = (f"{total_mb / 1024:.1f} GB" if total_mb >= 1024
+                             else f"{total_mb:.0f} MB")
+                    runtime = "2 h movie" if minutes == 120 else "30 min episode"
+                    readout.set(f"{mb_min:.1f} MB/min  ≈  {total} per {runtime}")
 
-            scale = ttk.Scale(frame, from_=0.0, to=60.0, variable=var,
-                              command=update_readout)
-            scale.grid(row=row, column=1, sticky="ew", pady=3)
-            ttk.Label(frame, textvariable=readout, width=34).grid(
-                row=row, column=2, sticky="w", padx=(10, 0), pady=3)
-            update_readout()
-            self._settings_vars[key] = var
-            self._size_pref_keys.append(key)
+                scale = ttk.Scale(frame, from_=0.0, to=60.0, variable=var,
+                                  command=update_readout)
+                scale.grid(row=grid_row, column=1, sticky="ew", pady=3)
+                ttk.Label(frame, textvariable=readout, width=34).grid(
+                    row=grid_row, column=2, sticky="w", padx=(10, 0), pady=3)
+                update_readout()
+                self._settings_vars[slider_key] = var
+                self._size_pref_keys.append(slider_key)
+                grid_row += 1
+
+    def _update_telegram_setup_button(self) -> None:
+        """Show the 'Set up Telegram bot' button only while no token exists."""
+        btn = getattr(self, "_settings_telegram_btn", None)
+        if btn is None:
+            return
+        if config.TELEGRAM_BOT_TOKEN:
+            btn.grid_remove()
+        else:
+            btn.grid()
+
+    def _settings_test_qbittorrent(self) -> None:
+        # Test with the values currently typed into the form (unsaved edits
+        # included) so the user can iterate without saving each time.
+        url = str(self._settings_vars.get("QBITTORRENT_URL", tk.StringVar()).get()).strip()
+        user = str(self._settings_vars.get("QBITTORRENT_USERNAME", tk.StringVar()).get()).strip()
+        password = str(self._settings_vars.get("QBITTORRENT_PASSWORD", tk.StringVar()).get())
+        self._settings_status_var.set("Testing qBittorrent connection…")
+
+        def worker() -> None:
+            import urllib.parse as _up
+            import urllib.request as _rq
+            try:
+                body = _up.urlencode({"username": user, "password": password}).encode()
+                req = _rq.Request(url.rstrip("/") + "/api/v2/auth/login", data=body)
+                with _rq.urlopen(req, timeout=10) as resp:
+                    ok = "Ok" in resp.read().decode("utf-8", errors="replace")
+                msg = ("✔ qBittorrent connection works — enable the checkbox and Save."
+                       if ok else "Login refused — check the username/password "
+                                  "(qBittorrent → Options → Web UI).")
+            except Exception as exc:
+                msg = (f"Could not reach qBittorrent at {url}: {exc}. Is it running "
+                       "with the Web UI enabled?")
+            self._post_to_ui(lambda: self._settings_status_var.set(msg))
+
+        threading.Thread(target=worker, name="qbit-test", daemon=True).start()
 
     # ---- Settings helpers ---------------------------------------------------
 
@@ -3315,6 +3717,7 @@ class DesktopApp:
         self._settings_load_paths_from_config()
         self.refresh_library_summary()
         self.refresh_library_metrics()
+        self._update_telegram_setup_button()
 
         self._settings_status_var.set("Saved and applied")
 
@@ -3357,18 +3760,32 @@ class DesktopApp:
         ttk.Label(step1, wraplength=600, justify=tk.LEFT, text=(
             "Telegram doesn't allow apps to create bots automatically — a human "
             "has to ask @BotFather once. It takes about a minute:\n"
-            "  1. Click the button below to open @BotFather.\n"
-            "  2. Send /newbot, pick a display name and a unique username.\n"
-            "  3. Copy the token it gives you and paste it here."
+            "  1. Get Telegram if you don't have it (button below — phone or desktop).\n"
+            "  2. Open @BotFather and send /newbot, pick a name and a unique username.\n"
+            "  3. Copy the token it gives you and paste it here.\n\n"
+            "No Telegram? No problem — everything except the remote bot works "
+            "without it. Skip for now and a 'Set up Telegram bot' button stays "
+            "on the Settings tab until you're ready."
         )).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
-        ttk.Button(step1, text="Open @BotFather",
+        btn_row1 = ttk.Frame(step1)
+        btn_row1.grid(row=1, column=0, columnspan=3, sticky="w", pady=(0, 6))
+        ttk.Button(btn_row1, text="Get Telegram",
+                   command=lambda: webbrowser.open_new_tab("https://telegram.org/apps")
+                   ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btn_row1, text="Open @BotFather",
                    command=lambda: webbrowser.open_new_tab("https://t.me/BotFather")
-                   ).grid(row=1, column=0, padx=(0, 8))
+                   ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btn_row1, text="Skip — set up Telegram later",
+                   command=lambda: (status_var.set(
+                       "Telegram skipped — find 'Set up Telegram bot…' on the "
+                       "Settings tab when you're ready."))
+                   ).pack(side=tk.LEFT)
         token_var = tk.StringVar(value=config.TELEGRAM_BOT_TOKEN)
-        ttk.Entry(step1, textvariable=token_var, show="•").grid(row=1, column=1, sticky="ew")
+        ttk.Entry(step1, textvariable=token_var, show="•").grid(row=2, column=1, sticky="ew")
+        ttk.Label(step1, text="Token:").grid(row=2, column=0, sticky="w")
         ttk.Button(step1, text="Validate && Save", style="Accent.TButton",
                    command=lambda: self._wizard_validate_token(token_var.get().strip(), status_var)
-                   ).grid(row=1, column=2, padx=(8, 0))
+                   ).grid(row=2, column=2, padx=(8, 0))
 
         # --- Step 2: library folders ------------------------------------
         step2 = ttk.LabelFrame(win, text="2 · Library folders", padding=10)
@@ -3378,7 +3795,8 @@ class DesktopApp:
             "Everything — search, tracking, downloads — keys off these."
         )).pack(anchor="w", pady=(0, 6))
         ttk.Button(step2, text="Open Settings → Library Paths",
-                   command=lambda: self._notebook.select(8) if self._notebook else None
+                   command=lambda: (self._notebook.select(self._settings_tab)
+                                    if self._notebook is not None else None)
                    ).pack(anchor="w")
 
         # --- Step 3: optional components --------------------------------
@@ -3457,6 +3875,7 @@ class DesktopApp:
 
             def apply() -> None:
                 status_var.set(f"Token valid — bot is @{username}. Starting bot…")
+                self._update_telegram_setup_button()
                 if not self.bot_service.running:
                     try:
                         self.bot_service.start()

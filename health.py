@@ -22,7 +22,7 @@ import config
 
 logger = logging.getLogger(__name__)
 
-GITHUB_REPO = "Slagathore/PlexResetButton"
+GITHUB_REPO = "Slagathore/Plexxarr"
 
 _PLEX_DOWNLOADS_URL = "https://plex.tv/api/downloads/5.json"
 _TIMEOUT = 10

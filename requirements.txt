@@ -30,3 +30,7 @@ sv-ttk>=2.6.0
 # Recycle-bin deletes for the Maintenance tab (falls back to permanent
 # unlink if missing)
 send2trash>=1.8.0
+
+# Subtitle fetching for the Library tab (optional at runtime — the button
+# explains how to install it if missing)
+subliminal>=2.2.0

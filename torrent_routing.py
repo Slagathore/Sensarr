@@ -232,6 +232,33 @@ def plan_route(torrent_name: str, media_type: str, *, request_title: str | None 
 
         folder, score, root = find_show_folder(search_title, media_type)
         if folder is None or score < _SHOW_MATCH_THRESHOLD:
+            # Completely new show: when the title is CANONICAL (came from the
+            # request queue / tracker, not parsed out of a torrent name),
+            # create "<type root>/<Show Name>/Season NN" on the type's root
+            # with the most free space — anime under the anime root, hentai
+            # under xanime, etc. Torrent-parsed titles still go to staging;
+            # guessing a folder name from release junk is how messes happen.
+            if request_title and request_title.strip():
+                type_roots = [p for p in config.media_paths_for_types(media_type)
+                              if Path(p).is_dir()]
+                new_root = pick_root_by_free_space(type_roots)
+                if new_root is not None:
+                    show_name = sanitize_for_filesystem(request_title.strip())
+                    show_dir = Path(new_root) / show_name
+                    season = parsed.season if parsed.season is not None else (
+                        1 if parsed.episode is not None else None)
+                    dest = show_dir / f"Season {season:02d}" if season is not None else show_dir
+                    new_filename = (
+                        f"{show_name} - S{season:02d}E{parsed.episode:02d}"
+                        if season is not None and parsed.episode is not None else None
+                    )
+                    return RoutePlan(
+                        confident=True, dest_dir=str(dest), parsed=parsed,
+                        show_folder=str(show_dir),
+                        season_folder=dest.name if season is not None else None,
+                        new_filename=new_filename, library_root=new_root,
+                        reason=f"new show — creating '{show_name}' under {Path(new_root).name}",
+                    )
             hint = f"best guess '{folder.name}' scored {score:.0%}" if folder is not None else "no show folders found"
             return RoutePlan(
                 confident=False, dest_dir=staging, parsed=parsed,

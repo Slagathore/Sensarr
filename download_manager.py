@@ -66,25 +66,53 @@ def _resolve_runner_path() -> Path:
 _RUNNER_PATH = _resolve_runner_path()
 
 
-def pick_best_result(results: list[TorrentResult], media_type: str) -> TorrentResult:
+def _size_prefs(media_type: str) -> tuple[float, float, int]:
+    """(preferred MB/min, max MB/min, assumed runtime minutes) per type."""
+    prefs = {
+        "movie": (config.SIZE_PREF_MB_PER_MIN_MOVIE, config.SIZE_MAX_MB_PER_MIN_MOVIE, 120),
+        "tv": (config.SIZE_PREF_MB_PER_MIN_TV, config.SIZE_MAX_MB_PER_MIN_TV, 30),
+        "anime": (config.SIZE_PREF_MB_PER_MIN_ANIME, config.SIZE_MAX_MB_PER_MIN_ANIME, 30),
+        "xanime": (config.SIZE_PREF_MB_PER_MIN_XANIME, config.SIZE_MAX_MB_PER_MIN_XANIME, 30),
+    }
+    return prefs.get(media_type, (0.0, 0.0, 30))
+
+
+def filter_viable_results(results: list[TorrentResult], media_type: str,
+                          *, block_cams: bool | None = None) -> list[TorrentResult]:
+    """Auto-grab hard filters (vetoes, not preferences):
+    - size 0 is never downloaded (unverifiable garbage)
+    - cam/telesync releases are dropped for movies when BLOCK_CAMS is on
+    - results whose implied MB/min exceeds the max slider are dropped
+    """
+    from video_quality import is_cam_release
+
+    block = config.BLOCK_CAMS if block_cams is None else block_cams
+    _pref, max_rate, minutes = _size_prefs(media_type)
+
+    viable = [r for r in results if r.size_bytes > 0]
+    if block and media_type == "movie":
+        viable = [r for r in viable if not is_cam_release(r.title)]
+    if max_rate > 0:
+        cap = max_rate * minutes * 1024 * 1024
+        viable = [r for r in viable if r.size_bytes <= cap]
+    return viable
+
+
+def pick_best_result(results: list[TorrentResult],
+                     media_type: str) -> TorrentResult | None:
     """Best auto-grab candidate honouring the admin's size preference.
 
-    With no preference set (0), the top-seeded result wins as before. With a
-    MB/min target, prefer the result whose size lands closest to the target
-    (2 h for movies, 30 min for episodes) on a log scale, using seeders as
-    the tie-breaker — a 4 GB episode shouldn't win over an 800 MB one just
-    because it has three more seeders.
+    Assumes hard filters (filter_viable_results) already ran. With no
+    preference set (0), the top-seeded result wins. With a MB/min target,
+    prefer the result whose size lands closest to the target (2 h for
+    movies, 30 min for episodes) on a log scale, seeders as tie-breaker.
     """
-    pref = {
-        "movie": config.SIZE_PREF_MB_PER_MIN_MOVIE,
-        "tv": config.SIZE_PREF_MB_PER_MIN_TV,
-        "anime": config.SIZE_PREF_MB_PER_MIN_ANIME,
-        "xanime": config.SIZE_PREF_MB_PER_MIN_XANIME,
-    }.get(media_type, 0.0)
-    if pref <= 0 or not results:
+    if not results:
+        return None
+    pref, _max_rate, minutes = _size_prefs(media_type)
+    if pref <= 0:
         return results[0]
 
-    minutes = 120 if media_type == "movie" else 30
     target_bytes = pref * minutes * 1024 * 1024
 
     import math
@@ -199,6 +227,18 @@ class _QBitClient:
         torrents = self._get_json(f"/api/v2/torrents/info?tag={urllib.parse.quote(tag)}")
         return torrents[0] if torrents else None
 
+    def files(self, torrent_hash: str) -> list[dict]:
+        return self._get_json(f"/api/v2/torrents/files?hash={torrent_hash}") or []
+
+    def set_file_priority(self, torrent_hash: str, file_ids: list[int], priority: int) -> None:
+        if not file_ids:
+            return
+        self._post("/api/v2/torrents/filePrio", {
+            "hash": torrent_hash,
+            "id": "|".join(str(i) for i in file_ids),
+            "priority": str(priority),
+        })
+
     def delete_by_tag(self, tag: str, *, delete_files: bool) -> None:
         info = self.info_by_tag(tag)
         if info is None:
@@ -235,6 +275,7 @@ class DownloadManager:
         auto_rename: bool | None = None,
         auto_move: bool | None = None,
         episode_context: tuple[int, int, int] | None = None,  # (show_id, season, episode)
+        replace_path: str | None = None,  # old low-quality file to delete after move
     ) -> int:
         """Start downloading a search result. Returns the download row id."""
         auto_rename = config.TORRENT_AUTO_RENAME if auto_rename is None else auto_rename
@@ -265,6 +306,7 @@ class DownloadManager:
             route_reason=plan.reason,
             auto_rename=auto_rename, auto_move=auto_move,
             show_id=show_id, season=season, episode=episode,
+            replace_path=replace_path,
         )
         if episode_context is not None:
             shows_store.set_episode_grab(
@@ -334,10 +376,19 @@ class DownloadManager:
             except Exception:
                 logger.exception("Auto-grab search failed for request #%s", req.request_id)
                 continue
-            if not results:
+            viable = filter_viable_results(results, media_type)
+            if not viable:
                 continue
-            best = pick_best_result(results, media_type)
-            if best.seeders <= 0:
+            seeded = [r for r in viable if r.seeders > 0]
+            if not seeded:
+                # Nothing has seeders — race a handful and keep the winner.
+                started.extend(self.start_zero_seeder_race(
+                    viable, media_type,
+                    request_id=req.request_id, request_title=query,
+                ))
+                continue
+            best = pick_best_result(seeded, media_type)
+            if best is None:
                 continue
             download_id = self.grab(
                 best, request_id=req.request_id, request_title=query,
@@ -418,20 +469,138 @@ class DownloadManager:
                 except Exception:
                     logger.exception("Auto-grab search failed for %s", query)
                     continue
-                results = [r for r in results if r.seeders > 0]
-                if not results:
+                viable = filter_viable_results(results, show.media_type)
+                if not viable:
+                    continue
+                seeded = [r for r in viable if r.seeders > 0]
+                if not seeded:
+                    started.extend(self.start_zero_seeder_race(
+                        viable, show.media_type,
+                        episode_context=(show.show_id, ep.season, ep.episode),
+                    ))
+                    continue
+                best = pick_best_result(seeded, show.media_type)
+                if best is None:
                     continue
                 download_id = self.grab(
-                    pick_best_result(results, show.media_type),
+                    best,
                     episode_context=(show.show_id, ep.season, ep.episode),
                     auto_rename=True, auto_move=True,
                 )
                 logger.info(
                     "Auto-grabbed %s → download #%s (%s, %s seeders)",
-                    query, download_id, results[0].title, results[0].seeders,
+                    query, download_id, best.title, best.seeders,
                 )
                 started.append(download_id)
         return started
+
+    # ------------------------------------------------------------------
+    # Zero-seeder race — when nothing has seeders, try several at once
+    # ------------------------------------------------------------------
+
+    def start_zero_seeder_race(
+        self, results: list[TorrentResult], media_type: str, *,
+        request_id: int | None = None, request_title: str | None = None,
+        episode_context: tuple[int, int, int] | None = None,
+    ) -> list[int]:
+        """All results report 0 seeders: grab up to 5 and monitor for an hour.
+
+        Rules (per Cole): if one finishes, cancel the rest. At the hour mark,
+        keep the single most-progressed download (if any moved at all) and
+        cancel the others; if nothing progressed, cancel them all.
+        """
+        pref, _mx, minutes = _size_prefs(media_type)
+        target = pref * minutes * 1024 * 1024 if pref > 0 else None
+
+        import math
+
+        def rank(r: TorrentResult):
+            if target and r.size_bytes:
+                return abs(math.log2(r.size_bytes / target))
+            return 0.0
+
+        picks = sorted(results, key=rank)[:5]
+        ids = [
+            self.grab(r, request_id=request_id, request_title=request_title,
+                      episode_context=episode_context)
+            for r in picks
+        ]
+        logger.info("Zero-seeder race started: %d candidate download(s) %s", len(ids), ids)
+        threading.Thread(target=self._race_monitor, args=(ids,),
+                         name="dl-zero-seeder-race", daemon=True).start()
+        return ids
+
+    def _race_monitor(self, ids: list[int], *, duration_s: int = 3600) -> None:
+        deadline = time.time() + duration_s
+
+        def cancel_all_except(keep: int | None) -> None:
+            for did in ids:
+                if did == keep:
+                    continue
+                row = downloads_store.get_download(did)
+                if row is not None and row.status in ("queued", "downloading"):
+                    self.cancel(did)
+
+        while time.time() < deadline:
+            time.sleep(120)
+            rows = [downloads_store.get_download(d) for d in ids]
+            finished = [r for r in rows if r is not None
+                        and r.status in ("downloaded", "moved")]
+            if finished:
+                # Two finished at once? Keep the bigger file (better quality).
+                winner = max(finished, key=lambda r: r.progress).download_id
+                cancel_all_except(winner)
+                logger.info("Zero-seeder race won by download #%s", winner)
+                return
+            alive = [r for r in rows if r is not None
+                     and r.status in ("queued", "downloading")]
+            if not alive:
+                return  # everything errored/cancelled on its own
+
+        rows = [downloads_store.get_download(d) for d in ids]
+        progressing = [r for r in rows if r is not None
+                       and r.status == "downloading" and r.progress > 0.0]
+        if progressing:
+            winner = max(progressing, key=lambda r: r.progress).download_id
+            logger.info("Zero-seeder race: keeping #%s after 1h, cancelling rest", winner)
+            cancel_all_except(winner)
+        else:
+            logger.info("Zero-seeder race: nothing progressed in 1h — cancelling all")
+            cancel_all_except(None)
+
+    # ------------------------------------------------------------------
+    # Quality replacement — swap a cam/low-bitrate movie for a proper one
+    # ------------------------------------------------------------------
+
+    def replace_low_quality_movie(self, title_query: str, old_path: str) -> int | None:
+        """Search for a NON-cam release of a movie and download it; the old
+        file is deleted automatically once the new one lands in the library.
+
+        Hard rules: never a cam/telesync (regardless of the global toggle —
+        that's what we're replacing), never size 0, and at least the
+        low-quality threshold in MB/min so we don't swap junk for junk.
+        Returns the download id, or None when nothing acceptable was found.
+        """
+        try:
+            results = search_torrents(title_query, "movie", limit=25)
+        except Exception:
+            logger.exception("Replacement search failed for %s", title_query)
+            return None
+
+        viable = filter_viable_results(results, "movie", block_cams=True)
+        floor_bytes = config.LOW_QUALITY_MB_PER_MIN * 120 * 1024 * 1024
+        viable = [r for r in viable if r.size_bytes >= floor_bytes and r.seeders > 0]
+        best = pick_best_result(viable, "movie")
+        if best is None:
+            logger.info("No acceptable non-cam replacement found for %s", title_query)
+            return None
+        download_id = self.grab(
+            best, request_title=title_query,
+            auto_rename=True, auto_move=True, replace_path=old_path,
+        )
+        logger.info("Replacement grab for %s → download #%s (%s)",
+                    title_query, download_id, best.title)
+        return download_id
 
     # ------------------------------------------------------------------
     # Runner subprocess
@@ -468,6 +637,7 @@ class DownloadManager:
         error_message: str | None = None
         last_progress_at = time.time()
         last_progress = -1.0
+        files_pruned = False
         try:
             while True:
                 time.sleep(3)
@@ -481,6 +651,16 @@ class DownloadManager:
                         error_message = "torrent never appeared in qBittorrent"
                         break
                     continue
+                # Season pack, single wanted episode: deselect every other
+                # video file so only the target episode downloads.
+                if (not files_pruned and row.season is not None
+                        and row.episode is not None and info.get("hash")):
+                    files_pruned = True
+                    try:
+                        self._qbit_prune_to_episode(
+                            client, str(info["hash"]), row.season, row.episode)
+                    except Exception:
+                        logger.debug("qBittorrent file pruning failed.", exc_info=True)
                 progress = float(info.get("progress") or 0.0)
                 state = str(info.get("state") or "")
                 if progress > last_progress:
@@ -522,6 +702,36 @@ class DownloadManager:
         outcome = self._post_process(download_id, request_title=request_title)
         logger.info("Download #%s post-process: %s", download_id, outcome)
         self._notify(download_id)
+
+    @staticmethod
+    def _qbit_prune_to_episode(client: _QBitClient, torrent_hash: str,
+                               season: int, episode: int) -> None:
+        """Inside a multi-file torrent, keep only the wanted episode's video
+        (plus subtitles); everything else is set to priority 0 (skip)."""
+        files = client.files(torrent_hash)
+        if len(files) < 2:
+            return
+        keep_exts = torrent_routing.VIDEO_EXTENSIONS | torrent_routing.SUBTITLE_EXTENSIONS
+        wanted_videos: list[int] = []
+        skip: list[int] = []
+        for idx, f in enumerate(files):
+            name = Path(str(f.get("name") or "")).name
+            suffix = Path(name).suffix.lower()
+            file_id = int(f.get("index", idx))
+            if suffix not in keep_exts:
+                skip.append(file_id)
+                continue
+            parsed = torrent_routing.parse_torrent_name(name)
+            matches = (parsed.episode == episode
+                       and (parsed.season is None or parsed.season == season))
+            if suffix in torrent_routing.VIDEO_EXTENSIONS:
+                (wanted_videos if matches else skip).append(file_id)
+        # Only prune when we positively identified the target episode —
+        # otherwise download everything rather than guess wrong.
+        if wanted_videos:
+            client.set_file_priority(torrent_hash, skip, 0)
+            logger.info("qBittorrent: pruned pack to S%02dE%02d (%d file(s) skipped)",
+                        season, episode, len(skip))
 
     def _run_download_node(self, download_id: int, magnet: str, staging: str,
                            request_title: str | None) -> None:
@@ -725,6 +935,32 @@ class DownloadManager:
         if moved_any:
             downloads_store.set_status(download_id, "moved", completed=True)
             self._cleanup_staging_leftovers(row)
+            # Quality replacement: the new file is in place — retire the old
+            # cam/low-bitrate copy it replaces (recycle bin when available).
+            if row.replace_path:
+                old = Path(row.replace_path)
+                if old.is_file():
+                    try:
+                        try:
+                            from send2trash import send2trash
+                            send2trash(str(old))
+                        except ImportError:
+                            old.unlink()
+                        downloads_store.add_history(
+                            download_id, "replaced", before=str(old),
+                            after=f"deleted — superseded by download #{download_id}",
+                        )
+                        try:
+                            from library_index import remove_from_index
+                            remove_from_index([str(old)])
+                        except Exception:
+                            pass
+                        logger.info("Replaced low-quality file: %s", old)
+                    except OSError as exc:
+                        downloads_store.add_history(
+                            download_id, "error", before=str(old),
+                            after=f"could not delete replaced file: {exc}",
+                        )
             # Close the loop for tracked episodes: mark it on-disk right away
             # instead of waiting for the next full sync.
             if row.show_id is not None and row.season is not None and row.episode is not None:

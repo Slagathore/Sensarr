@@ -8,7 +8,7 @@ set "DIST_ROOT=%SCRIPT_DIR%\dist\%BUILD_STAMP%"
 set "WORK_ROOT=%SCRIPT_DIR%\build\%BUILD_STAMP%"
 
 echo ============================================
-echo  PlexResetButton - Windows EXE Build
+echo  Plexxarr - Windows EXE Build
 echo ============================================
 echo.
 
@@ -33,7 +33,7 @@ if %errorlevel% neq 0 (
 
 del "%PYINSTALLER_CHECK_LOG%" >nul 2>nul
 
-python -m PyInstaller --noconfirm --clean --distpath "%DIST_ROOT%" --workpath "%WORK_ROOT%" "%SCRIPT_DIR%\PlexResetButton.spec"
+python -m PyInstaller --noconfirm --clean --distpath "%DIST_ROOT%" --workpath "%WORK_ROOT%" "%SCRIPT_DIR%\Plexxarr.spec"
 if %errorlevel% neq 0 (
     echo.
     echo ERROR: Build failed.
@@ -48,7 +48,7 @@ if %errorlevel% neq 0 (
 :: _internal, so we copy them out and npm install here. This makes every build
 :: self-sufficient for the Downloads pipeline (Node.js must be on PATH).
 :: --------------------------------------------------------------------------
-set "EXE_RUNNER=%DIST_ROOT%\PlexResetButton\torrent_runner"
+set "EXE_RUNNER=%DIST_ROOT%\Plexxarr\torrent_runner"
 where node >nul 2>nul
 if %errorlevel% neq 0 (
     echo.
@@ -70,7 +70,7 @@ if %errorlevel% neq 0 (
 
 echo.
 echo Build complete.
-echo Executable bundle: %DIST_ROOT%\PlexResetButton
+echo Executable bundle: %DIST_ROOT%\Plexxarr
 echo Run setup_autostart.bat to point logon-autostart at this new build.
 pause
 endlocal
