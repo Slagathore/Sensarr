@@ -52,3 +52,4 @@ downloads/
 Thumbs.db
 .DS_Store
 anidb_titles.dat.gz
+trackers_cache.txt
