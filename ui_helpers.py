@@ -63,14 +63,17 @@ def make_sortable(tree: ttk.Treeview, *, on_sorted=None) -> None:
 
 
 def bind_smooth_vscroll(canvas: tk.Canvas) -> None:
-    """Page-level mouse-wheel scrolling for a canvas that isn't choppy.
+    """Page-level mouse-wheel scrolling without lag or ghost afterimages.
 
-    Sets a small scroll increment (default canvas units are huge, which is
-    the choppiness) and steps several units per wheel notch. Widgets that
-    scroll themselves (trees, listboxes, text) are left alone so they don't
-    double-scroll.
+    The smearing came from Tk redrawing a widget-heavy embedded frame once
+    PER WHEEL EVENT — high-resolution wheels/touchpads fire dozens of small
+    events per flick, each triggering a partial repaint. Here the deltas
+    are accumulated and applied at most once per frame (~16 ms), followed
+    by update_idletasks() so each step paints completely before the next.
+    Widgets that scroll themselves (trees, listboxes, text) are left alone.
     """
-    canvas.configure(yscrollincrement=14)
+    canvas.configure(yscrollincrement=1)  # pixel-precise positioning
+    state = {"pending": 0, "scheduled": False}
 
     def _self_scrolling(widget) -> bool:
         w = widget
@@ -80,10 +83,28 @@ def bind_smooth_vscroll(canvas: tk.Canvas) -> None:
             w = getattr(w, "master", None)
         return False
 
+    def _flush() -> None:
+        state["scheduled"] = False
+        pixels = state["pending"]
+        state["pending"] = 0
+        if pixels:
+            try:
+                canvas.yview_scroll(pixels, "units")
+                canvas.update_idletasks()  # complete this paint before more input
+            except tk.TclError:
+                pass
+
     def _wheel(event) -> None:
         if _self_scrolling(event.widget):
             return
-        canvas.yview_scroll(int(-event.delta / 120) * 4, "units")
+        # 120 delta-units (one notch) ≈ 60 px of travel.
+        state["pending"] += int(-event.delta / 2)
+        if not state["scheduled"]:
+            state["scheduled"] = True
+            try:
+                canvas.after(16, _flush)
+            except tk.TclError:
+                state["scheduled"] = False
 
     canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _wheel), add="+")
     canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"), add="+")
