@@ -352,6 +352,14 @@ TORRENT_AUTO_GRAB: bool = _env_bool("TORRENT_AUTO_GRAB", False)
 TORRENT_STALL_TIMEOUT_SECONDS: int = int(
     os.getenv("TORRENT_STALL_TIMEOUT_SECONDS", "900")
 )
+# Built-in engine queue: at most this many downloads run at once; the rest
+# wait as 'queued'. 3-5 is the sweet spot — more just splits bandwidth and
+# stalls everything (the 22-at-once request burst proved it). qBittorrent
+# mode uses qBit's own queueing instead.
+MAX_ACTIVE_DOWNLOADS: int = int(os.getenv("MAX_ACTIVE_DOWNLOADS", "4"))
+# A running download that makes NO progress for this many minutes gets
+# rotated back to the queue when something else is waiting.
+DOWNLOAD_SLOW_ROTATE_MINUTES: int = int(os.getenv("DOWNLOAD_SLOW_ROTATE_MINUTES", "10"))
 # Path to the Node.js executable used to run the webtorrent downloader.
 NODE_PATH: str = os.getenv("NODE_PATH_EXE", "node")
 

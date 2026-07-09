@@ -304,7 +304,13 @@ class DownloadManager:
         # download_id → qBittorrent tag, for cancel when delegating to qBit.
         self._qbit_tags: dict[int, str] = {}
         self._lock = threading.Lock()
+        # Queue bookkeeping: last observed (progress, when) per active row,
+        # and when a slow download was last rotated (sorts it to the back).
+        self._progress_seen: dict[int, tuple[float, float]] = {}
+        self._rotate_cooldown: dict[int, float] = {}
         downloads_store.initialize_downloads_db()
+        threading.Thread(target=self._queue_monitor, name="dl-queue-monitor",
+                         daemon=True).start()
 
     # ------------------------------------------------------------------
     # Public API
@@ -357,14 +363,100 @@ class DownloadManager:
                 episode_context[0], episode_context[1], episode_context[2], download_id,
             )
 
-        thread = threading.Thread(
-            target=self._run_download,
-            args=(download_id, result.magnet, str(staging), request_title),
-            name=f"torrent-dl-{download_id}",
-            daemon=True,
-        )
-        thread.start()
+        if config.QBITTORRENT_ENABLED:
+            # qBittorrent has its own queue/active limits — hand over directly.
+            threading.Thread(
+                target=self._run_download,
+                args=(download_id, result.magnet, str(staging), request_title),
+                name=f"torrent-dl-{download_id}", daemon=True,
+            ).start()
+        else:
+            # Built-in engine: rows start as 'queued'; the pump runs at most
+            # MAX_ACTIVE_DOWNLOADS at once and rotates stale ones out.
+            self._maybe_start_next()
         return download_id
+
+    # ------------------------------------------------------------------
+    # Built-in engine queue: cap concurrent downloads, rotate stalled ones
+    # ------------------------------------------------------------------
+
+    def _active_node_count(self) -> int:
+        with self._lock:
+            return sum(1 for p in self._processes.values() if p.poll() is None)
+
+    def _maybe_start_next(self) -> None:
+        """Start queued downloads while there's headroom (node engine only)."""
+        if config.QBITTORRENT_ENABLED:
+            return
+        budget = max(1, config.MAX_ACTIVE_DOWNLOADS) - self._active_node_count()
+        if budget <= 0:
+            return
+        queued = sorted(
+            (r for r in downloads_store.list_downloads(limit=300)
+             if r.status == "queued"),
+            # Recently-rotated slowpokes go to the back of the line.
+            key=lambda r: (self._rotate_cooldown.get(r.download_id, 0), r.download_id),
+        )
+        for row in queued[:budget]:
+            with self._lock:
+                if row.download_id in self._processes:
+                    continue
+            self._start_row(row)
+
+    def _start_row(self, row: downloads_store.DownloadRow) -> None:
+        downloads_store.set_status(row.download_id, "downloading")
+        request_title = None
+        if row.request_id is not None:
+            req = get_request(row.request_id)
+            if req is not None:
+                request_title = _ascii_preferring_title(req.resolved_title, req.content)
+        threading.Thread(
+            target=self._run_download,
+            args=(row.download_id, row.magnet,
+                  row.staging_dir or config.TORRENT_DOWNLOAD_DIR, request_title),
+            name=f"torrent-dl-{row.download_id}", daemon=True,
+        ).start()
+        self._notify(row.download_id)
+
+    def _queue_monitor(self) -> None:
+        """Every minute: pump the queue, and rotate out any active download
+        that hasn't moved in DOWNLOAD_SLOW_ROTATE_MINUTES while others wait."""
+        while True:
+            time.sleep(60)
+            try:
+                if config.QBITTORRENT_ENABLED:
+                    continue
+                rows = downloads_store.list_downloads(limit=300)
+                queued_waiting = any(r.status == "queued" for r in rows)
+                now = time.time()
+                for row in rows:
+                    if row.status != "downloading":
+                        self._progress_seen.pop(row.download_id, None)
+                        continue
+                    seen = self._progress_seen.get(row.download_id)
+                    if seen is None or seen[0] != row.progress:
+                        self._progress_seen[row.download_id] = (row.progress, now)
+                        continue
+                    stale_s = now - seen[1]
+                    if (queued_waiting
+                            and stale_s > config.DOWNLOAD_SLOW_ROTATE_MINUTES * 60):
+                        logger.info(
+                            "Download #%s made no progress for %.0f min — rotating "
+                            "it back to the queue.", row.download_id, stale_s / 60)
+                        with self._lock:
+                            proc = self._processes.get(row.download_id)
+                        if proc is not None and proc.poll() is None:
+                            proc.kill()
+                        downloads_store.set_status(row.download_id, "queued")
+                        downloads_store.add_history(
+                            row.download_id, "rotated", before=None,
+                            after=f"no progress for {stale_s / 60:.0f} min — requeued")
+                        self._rotate_cooldown[row.download_id] = now
+                        self._progress_seen.pop(row.download_id, None)
+                        self._notify(row.download_id)
+                self._maybe_start_next()
+            except Exception:
+                logger.exception("Download queue monitor pass failed.")
 
     def cancel(self, download_id: int) -> bool:
         with self._lock:
@@ -379,12 +471,16 @@ class DownloadManager:
                 logger.exception("qBittorrent cancel failed for #%s", download_id)
                 return False
         elif proc is None or proc.poll() is not None:
-            return False
+            row = downloads_store.get_download(download_id)
+            if row is None or row.status != "queued":
+                return False
+            # Still waiting in the queue — cancelling is just a status flip.
         else:
             proc.kill()
         downloads_store.set_status(download_id, "cancelled", completed=True)
         downloads_store.add_history(download_id, "cancelled", before=None, after=None)
         self._notify(download_id)
+        self._maybe_start_next()
         return True
 
     # ------------------------------------------------------------------
@@ -587,6 +683,16 @@ class DownloadManager:
             return False
         return True
 
+    @staticmethod
+    def _result_matches_query(result_title: str, query: str) -> bool:
+        """Movie/other auto-grabs: the release must actually resemble what
+        was asked for — containment or fuzzy match on the parsed title."""
+        if query.casefold() in result_title.casefold():
+            return True
+        parsed = torrent_routing.parse_torrent_name(result_title)
+        return torrent_routing._folder_similarity(
+            parsed.show_title or result_title, query) >= 0.55
+
     def _match_tracked_show(self, title: str) -> shows_store.TrackedShow | None:
         best: shows_store.TrackedShow | None = None
         best_score = 0.0
@@ -764,7 +870,11 @@ class DownloadManager:
                 logger.exception("Auto-grab search failed for request #%s", req.request_id)
                 continue
             viable = filter_viable_results(results, media_type)
+            viable = [r for r in viable if self._result_matches_query(r.title, query)]
             if not viable:
+                logger.info("Request #%s (%s): no acceptable result this pass — "
+                            "will retry on the next auto-grab cycle.",
+                            req.request_id, query)
                 continue
             seeded = [r for r in viable if r.seeders > 0]
             if not seeded:
@@ -1171,6 +1281,7 @@ class DownloadManager:
                 after=error_message or f"exit {proc.returncode}",
             )
             self._notify(download_id)
+            self._maybe_start_next()
             return
 
         downloads_store.set_progress(download_id, 1.0)
@@ -1189,6 +1300,7 @@ class DownloadManager:
         outcome = self._post_process(download_id, request_title=request_title)
         logger.info("Download #%s post-process: %s", download_id, outcome)
         self._notify(download_id)
+        self._maybe_start_next()
 
     # ------------------------------------------------------------------
     # Post-processing: rename + move with full history

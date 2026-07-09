@@ -3579,6 +3579,8 @@ class DesktopApp:
         # Torrent pipeline
         ("TORRENT_DOWNLOAD_DIR", "Torrent staging folder", "path"),
         ("TORRENT_STALL_TIMEOUT_SECONDS", "Torrent stall timeout (seconds)", "int"),
+        ("MAX_ACTIVE_DOWNLOADS", "Max simultaneous downloads (rest queue)", "int"),
+        ("DOWNLOAD_SLOW_ROTATE_MINUTES", "Rotate a no-progress download after (minutes)", "int"),
         ("DOWNLOAD_ROOT_OVERRIDE", "Force new downloads to folder/drive (blank = most free space)", "path"),
         # qBittorrent (optional download engine)
         ("QBITTORRENT_ENABLED", "Use qBittorrent instead of the built-in downloader", "bool"),
