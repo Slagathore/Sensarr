@@ -439,6 +439,22 @@ def mapping_for_anidb(anidb_id: int | str) -> dict | None:
             "default_tvdb_season": row[5], "episode_offset": row[6]}
 
 
+def titles_for_anidb(anidb_id: int | str) -> list[str]:
+    """Every known title/synonym for one AniDB entry (empty when unknown)."""
+    if not available():
+        return []
+    conn = _connect()
+    try:
+        row = conn.execute("SELECT id FROM anime WHERE anidb_id = ?",
+                           (int(anidb_id),)).fetchone()
+        if row is None:
+            return []
+        return [r[0] for r in conn.execute(
+            "SELECT title FROM titles WHERE anime_id = ?", (row[0],))]
+    finally:
+        conn.close()
+
+
 def episode_count_for_anidb(anidb_id: int | str) -> int | None:
     if not available():
         return None

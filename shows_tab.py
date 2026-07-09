@@ -27,7 +27,7 @@ from tkinter import filedialog, ttk
 import config
 import show_tracker
 import shows_store
-from ui_helpers import Spinner, add_tooltip, make_sortable
+from ui_helpers import Spinner, add_tooltip, bind_smooth_vscroll, make_sortable
 
 logger = logging.getLogger(__name__)
 
@@ -67,9 +67,13 @@ class ShowsTab:
              "Folders the last scan couldn't match to any tracker — identify "
              "them by hand here instead of digging through the log."),
             ("Fix Titles (English)", self.fix_titles,
-             "Rename AniDB-identified shows to their official English titles (offline, safe to re-run)."),
+             "Rename AniDB-identified shows to their official English titles — IN THE APP "
+             "ONLY, files and folders on disk are never touched (the Folders column still "
+             "shows the original folder name). Offline, safe to re-run."),
             ("⬇ Grab Missing Now", self.grab_missing_now,
-             "Search torrents for missing episodes right now (respects your size preference)."),
+             "Search torrents for missing episodes of the SELECTED show(s). With nothing "
+             "selected it runs the full auto-grab pass over every eligible show. Respects "
+             "your size preferences."),
         ):
             btn = ttk.Button(toolbar, text=text, command=command)
             btn.pack(side=tk.LEFT, padx=(0, 6))
@@ -89,14 +93,27 @@ class ShowsTab:
         ttk.Label(toolbar, textvariable=self._status_var,
                   font=("Segoe UI", 9, "italic")).pack(side=tk.LEFT, padx=(10, 0))
 
-        panes = ttk.PanedWindow(parent, orient=tk.VERTICAL)
-        panes.grid(row=1, column=0, sticky="nsew")
+        # The whole body below the toolbar scrolls as one page, so the
+        # tracked-shows and missing sections can both be tall.
+        body_canvas = tk.Canvas(parent, highlightthickness=0)
+        body_canvas.grid(row=1, column=0, sticky="nsew")
+        body_scroll = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=body_canvas.yview)
+        body_scroll.grid(row=1, column=1, sticky="ns")
+        body_canvas.configure(yscrollcommand=body_scroll.set)
+        body = ttk.Frame(body_canvas)
+        body_id = body_canvas.create_window((0, 0), window=body, anchor="nw")
+        body.bind("<Configure>",
+                  lambda _e: body_canvas.configure(scrollregion=body_canvas.bbox("all")))
+        body_canvas.bind("<Configure>",
+                         lambda e: body_canvas.itemconfigure(body_id, width=e.width))
+        bind_smooth_vscroll(body_canvas)
+        body.columnconfigure(0, weight=1)
 
         # ------------------------------------------------------------------
         # Upcoming — per-date boxes on a horizontally scrollable strip
         # ------------------------------------------------------------------
-        upcoming_frame = ttk.LabelFrame(panes, text="Upcoming (next 14 days) — right-click an entry to silence or auto-download", padding=6)
-        panes.add(upcoming_frame, weight=1)
+        upcoming_frame = ttk.LabelFrame(body, text="Upcoming (next 14 days) — right-click an entry to silence or keep-at-100%", padding=6)
+        upcoming_frame.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         upcoming_frame.columnconfigure(0, weight=1)
         upcoming_frame.rowconfigure(0, weight=1)
 
@@ -118,8 +135,8 @@ class ShowsTab:
         # ------------------------------------------------------------------
         # Tracked shows — search + type filter + sortable tree
         # ------------------------------------------------------------------
-        shows_frame = ttk.LabelFrame(panes, text="Tracked shows", padding=6)
-        panes.add(shows_frame, weight=3)
+        shows_frame = ttk.LabelFrame(body, text="Tracked shows", padding=6)
+        shows_frame.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         shows_frame.columnconfigure(0, weight=1)
         shows_frame.rowconfigure(1, weight=1)
 
@@ -169,8 +186,8 @@ class ShowsTab:
         # ------------------------------------------------------------------
         # Missing episodes
         # ------------------------------------------------------------------
-        missing_frame = ttk.LabelFrame(panes, text="Missing episodes (selected show)", padding=6)
-        panes.add(missing_frame, weight=2)
+        missing_frame = ttk.LabelFrame(body, text="Missing episodes (selected show)", padding=6)
+        missing_frame.grid(row=2, column=0, sticky="ew")
         missing_frame.columnconfigure(0, weight=1)
         missing_frame.rowconfigure(1, weight=1)
 
@@ -273,9 +290,52 @@ class ShowsTab:
                 meta.append((show.show_id, f"{show.title} S{ep.season:02d}E{ep.episode:02d}"))
             listbox.bind("<Button-3>", self._on_upcoming_right_click)
             listbox.bind("<Button-1>", self._on_upcoming_left_click)
+            listbox.bind("<Motion>", self._on_upcoming_motion)
+            listbox.bind("<Leave>", lambda _e: self._hide_upcoming_tip())
             self._upcoming_boxes.append((listbox, meta))
         if hasattr(self.app, "_apply_dark_widget_styles"):
             self.app._apply_dark_widget_styles(self._upcoming_inner)
+
+    def _on_upcoming_motion(self, event) -> None:
+        """Hover tooltip with the FULL entry text when it's clipped."""
+        listbox = event.widget
+        index = listbox.nearest(event.y)
+        if index < 0 or index >= listbox.size():
+            self._hide_upcoming_tip()
+            return
+        text = listbox.get(index)
+        # Only tip when the text is actually wider than the box.
+        try:
+            import tkinter.font as tkfont
+            width_px = tkfont.nametofont("TkDefaultFont").measure(text)
+        except Exception:
+            width_px = len(text) * 8
+        if width_px <= listbox.winfo_width() - 8:
+            self._hide_upcoming_tip()
+            return
+        tip = getattr(self, "_upcoming_tip", None)
+        if tip is not None and getattr(self, "_upcoming_tip_text", "") == text:
+            return
+        self._hide_upcoming_tip()
+        tip = tk.Toplevel(listbox)
+        tip.wm_overrideredirect(True)
+        tip.wm_geometry(f"+{event.x_root + 14}+{event.y_root + 12}")
+        tip.attributes("-topmost", True)
+        tk.Label(tip, text=text, bg="#2b2b2b", fg="#e8e8e8",
+                 relief=tk.SOLID, borderwidth=1, font=("Segoe UI", 9),
+                 padx=6, pady=3).pack()
+        self._upcoming_tip = tip
+        self._upcoming_tip_text = text
+
+    def _hide_upcoming_tip(self) -> None:
+        tip = getattr(self, "_upcoming_tip", None)
+        if tip is not None:
+            try:
+                tip.destroy()
+            except tk.TclError:
+                pass
+        self._upcoming_tip = None
+        self._upcoming_tip_text = ""
 
     def _on_upcoming_left_click(self, event) -> None:
         """Clicking an already-selected upcoming entry unselects it."""
@@ -305,8 +365,8 @@ class ShowsTab:
             label=f"🔕 Silence releases of '{show.title}'",
             command=lambda: (shows_store.set_show_silenced(show_id, True), self.refresh()),
         )
-        auto_label = ("Stop auto-downloading on release" if show.auto_grab
-                      else "⬇ Auto-download when it releases")
+        auto_label = ("Stop keeping at 100%" if show.auto_grab
+                      else "✅ Keep show at 100% (finish missing + grab new releases)")
         menu.add_command(
             label=auto_label,
             command=lambda: (shows_store.set_show_auto_grab(show_id, not show.auto_grab),
@@ -347,7 +407,8 @@ class ShowsTab:
                              self.refresh()),
         )
         menu.add_command(
-            label=("Stop auto-downloading" if show.auto_grab else "⬇ Auto-download new episodes"),
+            label=("Stop keeping at 100%" if show.auto_grab
+                   else "✅ Keep show at 100% (finish missing + grab new releases)"),
             command=lambda: (shows_store.set_show_auto_grab(show.show_id, not show.auto_grab),
                              self.refresh()),
         )
@@ -800,11 +861,16 @@ class ShowsTab:
         self.refresh()
 
     def grab_missing_now(self) -> None:
-        """Run one auto-grab pass immediately (rename+move forced on)."""
+        """Grab missing episodes for the selected show(s) — or run the full
+        auto-grab pass when nothing is selected (rename+move forced on)."""
+        selected = self._selected_show_ids() or None
+        label = (f"Searching torrents for missing episodes of {len(selected)} "
+                 "selected show(s)…" if selected
+                 else "Searching torrents for missing episodes (all eligible shows)…")
         self._run_guarded(
-            "Grab Missing", "shows-grab-missing",
-            "Searching torrents for missing episodes…",
-            self.app.download_manager.auto_grab_missing_episodes,
+            "Grab Missing", "shows-grab-missing", label,
+            lambda: self.app.download_manager.auto_grab_missing_episodes(
+                show_ids=selected),
             lambda started: (
                 f"Started {len(started)} download(s) — see the Downloads tab"
                 if started else "No grabbable missing episodes found this pass"

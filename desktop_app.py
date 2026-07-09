@@ -289,9 +289,42 @@ class DesktopApp:
         self._schedule_daily_library_check()
         self._schedule_auto_grab()
         self._schedule_idle_cache()
+        self._schedule_midnight_rollover()
         # Local anime metadata (manami + anime-lists dumps): build/refresh in
         # the background when missing or older than a week.
         anime_db.ensure_fresh(background=True)
+
+    def _schedule_midnight_rollover(self) -> None:
+        """At 00:05 every day: re-render Upcoming (yesterday's box must not
+        linger) and kick an auto-grab pass so keep-at-100% shows get their
+        just-aired episodes without waiting for the 6-hour cadence."""
+        if self._quitting:
+            return
+        now = datetime.datetime.now()
+        target = (now + datetime.timedelta(days=1)).replace(
+            hour=0, minute=5, second=0, microsecond=0)
+        self.root.after(int((target - now).total_seconds() * 1000),
+                        self._midnight_rollover_tick)
+
+    def _midnight_rollover_tick(self) -> None:
+        if self._quitting:
+            return
+        logger.info("Midnight rollover: refreshing Upcoming + auto-grab kick.")
+        self.shows_tab.refresh()
+        self._last_shows_grab_pass = 0.0  # let the next auto-grab tick run now
+
+        def worker() -> None:
+            try:
+                started = self.download_manager.auto_grab_missing_episodes()
+                if started:
+                    self._post_to_ui(self.refresh_downloads)
+            except Exception:
+                logger.exception("Midnight auto-grab pass failed.")
+
+        if config.SHOWS_AUTO_GRAB or any(s.auto_grab for s in
+                                         __import__("shows_store").list_shows()):
+            threading.Thread(target=worker, name="midnight-grab", daemon=True).start()
+        self._schedule_midnight_rollover()
 
     def _build_ui(self) -> None:
         self.root.columnconfigure(0, weight=1)
@@ -590,12 +623,68 @@ class DesktopApp:
         self._build_settings_tab(settings_tab)
 
         # -----------------------------------------------------------------
-        # Logs tab
+        # Logs tab — app log + the file-change ledger + missing-file view
         # -----------------------------------------------------------------
+        logs_nb = ttk.Notebook(logs_tab)
+        logs_nb.grid(row=0, column=0, sticky="nsew")
+        app_log_frame = ttk.Frame(logs_nb, padding=6)
+        changes_frame = ttk.Frame(logs_nb, padding=6)
+        missing_frame = ttk.Frame(logs_nb, padding=6)
+        logs_nb.add(app_log_frame, text="App Log")
+        logs_nb.add(changes_frame, text="File Changes")
+        logs_nb.add(missing_frame, text="Missing Files")
+        for fr in (app_log_frame, changes_frame, missing_frame):
+            fr.columnconfigure(0, weight=1)
+            fr.rowconfigure(1, weight=1)
+        app_log_frame.rowconfigure(0, weight=1)
+
         self.log_text = scrolledtext.ScrolledText(
-            logs_tab, wrap=tk.WORD, font=("Consolas", 10), state=tk.DISABLED,
+            app_log_frame, wrap=tk.WORD, font=("Consolas", 10), state=tk.DISABLED,
         )
         self.log_text.grid(row=0, column=0, sticky="nsew")
+
+        ttk.Label(changes_frame, text=(
+            "Every add / remove / rename / replacement the app can see — its own "
+            "actions are labelled; anything else was done outside the app. Populated "
+            "by the nightly index refresh and every in-app file operation."),
+            wraplength=900, font=("Segoe UI", 9, "italic")).grid(row=0, column=0, sticky="w", pady=(0, 4))
+        changes_tree = ttk.Treeview(
+            changes_frame, columns=("at", "event", "path", "detail"), show="headings")
+        for col, text, width, stretch in (("at", "When", 130, False),
+                                          ("event", "Event", 80, False),
+                                          ("path", "Path", 420, True),
+                                          ("detail", "Detail", 380, True)):
+            changes_tree.heading(col, text=text)
+            changes_tree.column(col, width=width, anchor=tk.W, stretch=stretch)
+        changes_tree.grid(row=1, column=0, sticky="nsew")
+        changes_scroll = ttk.Scrollbar(changes_frame, orient=tk.VERTICAL,
+                                       command=changes_tree.yview)
+        changes_scroll.grid(row=1, column=1, sticky="ns")
+        changes_tree.configure(yscrollcommand=changes_scroll.set)
+        make_sortable(changes_tree)
+        self._file_changes_tree = changes_tree
+
+        ttk.Label(missing_frame, text=(
+            "Files that USED to be indexed but are gone — renames and replacements "
+            "are excluded (they're paired automatically). 'Outside the app' means "
+            "no Plexxarr action touched it."),
+            wraplength=900, font=("Segoe UI", 9, "italic")).grid(row=0, column=0, sticky="w", pady=(0, 4))
+        missing_tree = ttk.Treeview(
+            missing_frame, columns=("at", "path", "detail"), show="headings")
+        for col, text, width, stretch in (("at", "Last seen removed", 140, False),
+                                          ("path", "Path", 480, True),
+                                          ("detail", "What we know", 380, True)):
+            missing_tree.heading(col, text=text)
+            missing_tree.column(col, width=width, anchor=tk.W, stretch=stretch)
+        missing_tree.grid(row=1, column=0, sticky="nsew")
+        missing_scroll = ttk.Scrollbar(missing_frame, orient=tk.VERTICAL,
+                                       command=missing_tree.yview)
+        missing_scroll.grid(row=1, column=1, sticky="ns")
+        missing_tree.configure(yscrollcommand=missing_scroll.set)
+        make_sortable(missing_tree)
+        self._missing_files_tree = missing_tree
+        logs_nb.bind("<<NotebookTabChanged>>",
+                     lambda _e: self._refresh_file_ledger_views())
 
         summary = ttk.Frame(self.root, padding=(16, 0, 16, 16))
         summary.grid(row=4, column=0, sticky="ew")
@@ -1619,6 +1708,7 @@ class DesktopApp:
         downloads_scroll = ttk.Scrollbar(downloads_frame, orient=tk.VERTICAL, command=downloads_tree.yview)
         downloads_scroll.grid(row=1, column=1, sticky="ns")
         downloads_tree.configure(yscrollcommand=downloads_scroll.set)
+        downloads_tree.bind("<Button-3>", self._on_download_right_click)
         make_sortable(downloads_tree)
         self._dl_downloads_tree = downloads_tree
 
@@ -1807,6 +1897,56 @@ class DesktopApp:
     def _handle_apply_route_result(self, outcome: str) -> None:
         self._dl_status_var.set(outcome)
         self.refresh_downloads()
+
+    def _on_download_right_click(self, event: Any) -> None:
+        tree = self._dl_downloads_tree
+        if tree is None:
+            return
+        iid = tree.identify_row(event.y)
+        if not iid:
+            return
+        tree.selection_set(iid)
+        download_id = int(iid)
+        row = downloads_store.get_download(download_id)
+        if row is None:
+            return
+
+        def run(op, label: str) -> None:
+            def worker() -> None:
+                try:
+                    outcome = op(download_id)
+                except Exception as exc:
+                    outcome = f"{label} failed: {exc}"
+                self._post_to_ui(lambda: (self._dl_status_var.set(f"#{download_id}: {outcome}"),
+                                          self.refresh_downloads()))
+            threading.Thread(target=worker, name=f"dl-{label}", daemon=True).start()
+
+        dm = self.download_manager
+        menu = tk.Menu(tree, tearoff=0)
+        menu.add_command(label="⏸ Stop / Pause", command=lambda: run(dm.stop, "stop"))
+        menu.add_command(label="▶ Restart / Resume", command=lambda: run(dm.restart, "restart"))
+        menu.add_command(label="🔍 Recheck data", command=lambda: run(dm.recheck, "recheck"))
+        menu.add_separator()
+        menu.add_command(label="Remove (keep files)",
+                         command=lambda: run(lambda d: dm.remove(d, delete_files=False), "remove"))
+
+        def remove_with_files() -> None:
+            if self._ask_yes_no("Remove and delete files",
+                                f"Remove download #{download_id} AND recycle its "
+                                "staged files? (Files already moved into the "
+                                "library are not touched.)"):
+                run(lambda d: dm.remove(d, delete_files=True), "remove+delete")
+        menu.add_command(label="🗑 Remove and delete files…", command=remove_with_files)
+        menu.add_separator()
+        menu.add_command(
+            label=f"🔎 Search again for '{row.title[:40]}…'",
+            command=lambda: self.open_downloads_search(
+                row.title, row.media_type,
+                episode_context=((row.show_id, row.season, row.episode)
+                                 if row.show_id is not None and row.season is not None
+                                 and row.episode is not None else None)),
+        )
+        menu.tk_popup(event.x_root, event.y_root)
 
     def cancel_selected_download(self) -> None:
         download_id = self._selected_download_id()
@@ -2102,6 +2242,25 @@ class DesktopApp:
         self.refresh_library_metrics()
         self.refresh_users_tab()  # keep the pending-request badge current
         self._schedule_status_refresh()
+
+    def _refresh_file_ledger_views(self) -> None:
+        """Fill the File Changes / Missing Files trees from the ledger."""
+        try:
+            from library_index import list_file_events, list_missing_files
+        except ImportError:
+            return
+        tree = getattr(self, "_file_changes_tree", None)
+        if tree is not None:
+            for iid in tree.get_children():
+                tree.delete(iid)
+            for e in list_file_events(limit=1000):
+                tree.insert("", "end", values=(e.at, e.event, e.path, e.detail))
+        tree = getattr(self, "_missing_files_tree", None)
+        if tree is not None:
+            for iid in tree.get_children():
+                tree.delete(iid)
+            for e in list_missing_files(limit=1000):
+                tree.insert("", "end", values=(e.at, e.path, e.detail))
 
     def _refresh_logs(self) -> None:
         if self.log_text is None:
@@ -3474,19 +3633,10 @@ class DesktopApp:
         inner.bind("<Configure>", _on_inner_configure)
         canvas.bind("<Configure>", _on_canvas_configure)
 
-        # Mouse wheel scrolling — bind only while pointer is over the canvas
-        # so it doesn't hijack scrolling on other tabs.
-        def _on_mousewheel(event: Any) -> None:
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-        def _bind_wheel(_e: Any) -> None:
-            canvas.bind_all("<MouseWheel>", _on_mousewheel)
-
-        def _unbind_wheel(_e: Any) -> None:
-            canvas.unbind_all("<MouseWheel>")
-
-        canvas.bind("<Enter>", _bind_wheel)
-        canvas.bind("<Leave>", _unbind_wheel)
+        # Smooth mouse-wheel scrolling (small increments, several per notch);
+        # bound only while the pointer is over this canvas.
+        from ui_helpers import bind_smooth_vscroll
+        bind_smooth_vscroll(canvas)
 
         inner.columnconfigure(0, weight=1)
 

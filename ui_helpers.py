@@ -62,6 +62,33 @@ def make_sortable(tree: ttk.Treeview, *, on_sorted=None) -> None:
         tree.heading(col, command=lambda c=col: sort_by(c))
 
 
+def bind_smooth_vscroll(canvas: tk.Canvas) -> None:
+    """Page-level mouse-wheel scrolling for a canvas that isn't choppy.
+
+    Sets a small scroll increment (default canvas units are huge, which is
+    the choppiness) and steps several units per wheel notch. Widgets that
+    scroll themselves (trees, listboxes, text) are left alone so they don't
+    double-scroll.
+    """
+    canvas.configure(yscrollincrement=14)
+
+    def _self_scrolling(widget) -> bool:
+        w = widget
+        while w is not None and w is not canvas:
+            if isinstance(w, (ttk.Treeview, tk.Listbox, tk.Text)):
+                return True
+            w = getattr(w, "master", None)
+        return False
+
+    def _wheel(event) -> None:
+        if _self_scrolling(event.widget):
+            return
+        canvas.yview_scroll(int(-event.delta / 120) * 4, "units")
+
+    canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _wheel), add="+")
+    canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"), add="+")
+
+
 def add_tooltip(widget: tk.Misc, text: str, *, delay_ms: int = 500) -> None:
     """Hover tooltip for any widget. Honours config.TOOLTIPS_ENABLED at
     show time, so the Settings toggle applies without a restart."""

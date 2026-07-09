@@ -549,6 +549,12 @@ def delete_files_with_cleanup(
             deleted.append(raw_path)
             candidate_parents.add(parent)
             logger.info("Deleted (to recycle bin): %s", raw_path)
+            try:
+                from library_index import log_file_event
+                log_file_event("removed", raw_path,
+                               "deleted via Plexxarr (user-confirmed, recycle bin)")
+            except Exception:
+                pass
         except OSError as exc:
             errors.append(f"Delete failed for {raw_path}: {exc}")
 

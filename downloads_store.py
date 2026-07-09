@@ -52,6 +52,10 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     # Quality-replacement grabs: the old (cam/low-quality) file to delete
     # once this download has moved into the library.
     ("downloads", "replace_path", "TEXT"),
+    # Exact file list reported by the download engine — post-processing uses
+    # THIS instead of fuzzy staging-folder matching (which once swapped two
+    # simultaneous downloads' files).
+    ("downloads", "files_json", "TEXT"),
 ]
 
 _SCHEMA_HISTORY = """
@@ -90,6 +94,7 @@ class DownloadRow:
     season: int | None = None
     episode: int | None = None
     replace_path: str | None = None
+    files_json: str | None = None
 
 
 @dataclass(frozen=True)
@@ -106,14 +111,52 @@ _DOWNLOAD_COLUMNS = (
     "id, request_id, title, magnet, source, media_type, status, progress, "
     "staging_dir, planned_dest, planned_name, route_reason, auto_rename, "
     "auto_move, error, created_at, completed_at, show_id, season, episode, "
-    "replace_path"
+    "replace_path, files_json"
 )
+
+
+_SCHEMA_DEFERRALS = """
+CREATE TABLE IF NOT EXISTS grab_deferrals (
+    key        TEXT PRIMARY KEY,
+    first_seen TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+)
+"""
+
+
+def check_grab_deferral(key: str, *, wait_hours: float = 24.0) -> bool:
+    """Oversize-only-result cooldown for ROUTINE grabs: first sighting
+    records the key and returns False (wait); once wait_hours have passed
+    it returns True (go ahead). Cleared on a successful grab."""
+    import datetime as _dt
+    with _DL_LOCK, db.connect() as conn:
+        conn.execute(_SCHEMA_DEFERRALS)
+        row = conn.execute(
+            "SELECT first_seen FROM grab_deferrals WHERE key = ?", (key,)).fetchone()
+        if row is None:
+            conn.execute("INSERT INTO grab_deferrals (key) VALUES (?)", (key,))
+            conn.commit()
+            return False
+    try:
+        # SQLite CURRENT_TIMESTAMP is naive UTC.
+        first = _dt.datetime.fromisoformat(row[0]).replace(tzinfo=_dt.timezone.utc)
+    except ValueError:
+        return True
+    now = _dt.datetime.now(_dt.timezone.utc)
+    return (now - first).total_seconds() >= wait_hours * 3600
+
+
+def clear_grab_deferral(key: str) -> None:
+    with _DL_LOCK, db.connect() as conn:
+        conn.execute(_SCHEMA_DEFERRALS)
+        conn.execute("DELETE FROM grab_deferrals WHERE key = ?", (key,))
+        conn.commit()
 
 
 def initialize_downloads_db() -> None:
     with _DL_LOCK, db.connect() as conn:
         conn.execute(_SCHEMA_DOWNLOADS)
         conn.execute(_SCHEMA_HISTORY)
+        conn.execute(_SCHEMA_DEFERRALS)
         for table, column, col_def in _MIGRATIONS:
             existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
             if existing and column not in existing:
@@ -129,7 +172,7 @@ def _row_to_download(row) -> DownloadRow:
         route_reason=row[11], auto_rename=bool(row[12]), auto_move=bool(row[13]),
         error=row[14], created_at=row[15], completed_at=row[16],
         show_id=row[17], season=row[18], episode=row[19],
-        replace_path=row[20],
+        replace_path=row[20], files_json=row[21],
     )
 
 
@@ -160,6 +203,23 @@ def create_download(
         download_id = int(cursor.lastrowid or 0)
     add_history(download_id, "grabbed", before=None, after=title)
     return download_id
+
+
+def delete_download(download_id: int) -> None:
+    """Drop a download row (torrent-client 'remove'). History rows stay —
+    the audit trail must survive the row."""
+    with _DL_LOCK, db.connect() as conn:
+        conn.execute("DELETE FROM downloads WHERE id = ?", (download_id,))
+        conn.commit()
+
+
+def set_files(download_id: int, relative_paths: list[str]) -> None:
+    """Record the engine-reported file list (paths relative to staging)."""
+    import json as _json
+    with _DL_LOCK, db.connect() as conn:
+        conn.execute("UPDATE downloads SET files_json = ? WHERE id = ?",
+                     (_json.dumps(relative_paths), download_id))
+        conn.commit()
 
 
 def set_status(download_id: int, status: str, *, error: str | None = None,

@@ -80,6 +80,9 @@ def pick_root_by_free_space(candidates: list[str]) -> str | None:
 _EPISODE_PATTERNS = [
     re.compile(r"\bS(?P<season>\d{1,2})[\s._-]*E(?P<episode>\d{1,3})(?:v\d+)?\b", re.IGNORECASE),
     re.compile(r"\b(?P<season>\d{1,2})x(?P<episode>\d{2,3})(?:v\d+)?\b", re.IGNORECASE),
+    # "[Raze] Dandadan S2 - 11 (...)" — season token, separator, episode.
+    re.compile(r"\bS(?P<season>\d{1,2})\s*[-._]\s*(?P<episode>\d{1,3})(?:v\d+)?\b",
+               re.IGNORECASE),
 ]
 _SEASON_ONLY_PATTERNS = [
     re.compile(r"\bS(?P<season>\d{1,2})\b(?![\s._-]*E\d)", re.IGNORECASE),

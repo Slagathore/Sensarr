@@ -182,20 +182,39 @@ def _score_candidates(query: str, results: list[MediaResult], year: int | None) 
     return best, best_score
 
 
+# A bare year at the END of a cleaned folder name ("Invincible 2021") — most
+# such folders mean "(2021)" without the parentheses, but a few titles
+# legitimately end in a year ("Space Battleship Yamato 2199"), so both
+# interpretations are tried and the better identification wins.
+_TRAILING_BARE_YEAR_RE = re.compile(r"^(?P<name>.+?)[\s._-]+(?P<year>(?:19|20)\d{2})$")
+
+
+def _identify_variant(name: str, year: int | None, media_type: str
+                      ) -> tuple[MediaResult | None, float]:
+    if media_type == "tv":
+        # Gather from BOTH sources and pick the best — a wrong-but-nonempty
+        # TVDB result must not block the correct TMDB one (old `or` bug).
+        candidates = search_tvdb_shows(name, year) + search_tmdb_shows(name, year)
+        return _score_candidates(name, candidates, year)
+    if media_type in ("anime", "xanime"):
+        return _best_anime_match(name, year, explicit=(media_type == "xanime"))
+    return None, 0.0
+
+
 def _identify_folder(folder_name: str, media_type: str) -> MediaResult | None:
     name, year = clean_show_folder_name(folder_name)
     if len(name) < 2:
         return None  # nothing searchable survived (e.g. "[Unsorted]")
 
-    if media_type == "tv":
-        # Gather from BOTH sources and pick the best — a wrong-but-nonempty
-        # TVDB result must not block the correct TMDB one (old `or` bug).
-        candidates = search_tvdb_shows(name, year) + search_tmdb_shows(name, year)
-        best, score = _score_candidates(name, candidates, year)
-    elif media_type in ("anime", "xanime"):
-        best, score = _best_anime_match(name, year, explicit=(media_type == "xanime"))
-    else:
-        return None
+    best, score = _identify_variant(name, year, media_type)
+
+    # Unparenthesised trailing year: retry with it stripped + used as a hint.
+    m = _TRAILING_BARE_YEAR_RE.match(name) if year is None else None
+    if m and score < _HIGH_CONFIDENCE:
+        alt_best, alt_score = _identify_variant(
+            m.group("name").strip(), int(m.group("year")), media_type)
+        if alt_score > score:
+            best, score = alt_best, alt_score
 
     return best if best is not None and score >= _IDENTIFY_THRESHOLD else None
 
@@ -400,8 +419,10 @@ def _parse_episode_from_file(name: str) -> tuple[int | None, int] | None:
     if m and not _NOT_EPISODE.match(m.group(1)):
         return (default_season, int(m.group(1)))
 
-    # Fallback: strip bracket groups, then take the LAST plausible number.
+    # Fallback: strip bracket groups, decimals ("143.8561 fps"), and fps
+    # tokens, then take the LAST plausible number.
     cleaned = re.sub(r"\[[^\]]*\]|\([^)]*\)", " ", stem)
+    cleaned = re.sub(r"\b\d+\.\d+\b|\b\d+\s*fps\b", " ", cleaned, flags=re.IGNORECASE)
     candidates = [
         tok for tok in _ABS_EP_RE.findall(cleaned)
         if not _NOT_EPISODE.match(tok)

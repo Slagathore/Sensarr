@@ -62,3 +62,22 @@ def test_pick_root_prefers_override_drive(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "DOWNLOAD_ROOT_OVERRIDE", "")
     assert torrent_routing.pick_root_by_free_space([str(a), str(b)]) in (str(a), str(b))
     assert torrent_routing.pick_root_by_free_space([]) is None
+
+
+def test_ascii_preferring_title_and_movie_episode_filter():
+    from download_manager import _ascii_preferring_title, _looks_like_episode_release
+    # The kanji-folder incident: resolved title was native-script, user text ASCII.
+    assert _ascii_preferring_title("逐玉", "Pursuit of jade") == "Pursuit of jade"
+    assert _ascii_preferring_title("The Cleaning Lady", "tcl") == "The Cleaning Lady"
+    assert _ascii_preferring_title(None, "something") == "something"
+    # Movie grabs must reject show-marked releases.
+    assert _looks_like_episode_release("The Cleaning Lady S04E09 1080p WEB")
+    assert _looks_like_episode_release("Show 3x07 HDTV")
+    assert not _looks_like_episode_release("Heat 1995 1080p BluRay")
+
+
+def test_dandadan_style_episode_parse():
+    from show_tracker import _parse_episode_from_file
+    got = _parse_episode_from_file(
+        "[Raze] Dandadan S2 - 11 (Dual-Audio) x265 10bit 1080p 143.8561 fps.mkv")
+    assert got == (2, 11)

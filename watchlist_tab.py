@@ -109,13 +109,15 @@ class WatchlistTab:
                                   state="readonly", values=["All", "movie", "show"])
         type_combo.pack(side=tk.LEFT, padx=(4, 12))
         type_combo.bind("<<ComboboxSelected>>", lambda _e: self._render_recs())
-        self._inlib_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(recs_bar, text="In-library only",
-                        variable=self._inlib_var).pack(side=tk.LEFT, padx=(0, 8))
-        self._notinlib_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(recs_bar, text="Not-in-library only",
-                        variable=self._notinlib_var,
-                        command=self._render_recs).pack(side=tk.LEFT, padx=(0, 12))
+        # One selector instead of two checkboxes — "In-library only" plus
+        # "Not-in-library only" both ticked used to intersect to zero rows.
+        ttk.Label(recs_bar, text="Show:").pack(side=tk.LEFT)
+        self._libmode_var = tk.StringVar(value="Everything")
+        libmode = ttk.Combobox(recs_bar, textvariable=self._libmode_var, width=14,
+                               state="readonly",
+                               values=["Everything", "In library", "Not in library"])
+        libmode.pack(side=tk.LEFT, padx=(4, 12))
+        libmode.bind("<<ComboboxSelected>>", lambda _e: self._render_recs())
         get_btn = ttk.Button(recs_bar, text="Get Recommendations", command=self.get_recs)
         get_btn.pack(side=tk.LEFT)
         add_tooltip(get_btn, "Analyse this user's Plex watch history, find their top "
@@ -209,7 +211,7 @@ class WatchlistTab:
                 from plex_api import get_recommendations
                 top_genres, recs = get_recommendations(
                     user or None,
-                    in_library_only=self._inlib_var.get(),
+                    in_library_only=(self._libmode_var.get() == "In library"),
                     genre_filter=None if genre in ("", "All") else genre,
                 )
             except Exception as exc:
@@ -219,8 +221,9 @@ class WatchlistTab:
 
             def render() -> None:
                 self._recs_all = recs
-                self._top_genres = top_genres
-                self._genre_combo.configure(values=["All"] + top_genres)
+                if top_genres:  # keep the previous genre list on a dud fetch
+                    self._top_genres = top_genres
+                    self._genre_combo.configure(values=["All"] + top_genres)
                 self._render_recs()
             self.app._post_to_ui(render)
 
@@ -233,7 +236,10 @@ class WatchlistTab:
         type_filter = self._type_var.get()
         if type_filter != "All":
             recs = [r for r in recs if r.item_type == type_filter]
-        if self._notinlib_var.get():
+        mode = self._libmode_var.get()
+        if mode == "In library":
+            recs = [r for r in recs if r.in_library]
+        elif mode == "Not in library":
             recs = [r for r in recs if not r.in_library]
         self._recs = recs
         for iid in self._recs_tree.get_children():

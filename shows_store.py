@@ -203,7 +203,11 @@ def list_shows() -> list[TrackedShow]:
             """
             SELECT s.id, s.title, s.media_type, s.source, s.external_id,
                    s.external_url, s.status, s.year, s.added_at, s.last_synced,
-                   (SELECT COUNT(*) FROM episodes e WHERE e.show_id = s.id AND e.season > 0),
+                   -- Undated no-file rows are unaired "TBA" placeholders
+                   -- (e.g. an announced next season) — not real inventory,
+                   -- so they don't inflate the known-episode count.
+                   (SELECT COUNT(*) FROM episodes e WHERE e.show_id = s.id AND e.season > 0
+                        AND (e.air_date IS NOT NULL OR e.has_file = 1)),
                    (SELECT COUNT(*) FROM episodes e WHERE e.show_id = s.id AND e.season > 0 AND e.has_file = 1),
                    (SELECT COUNT(*) FROM episodes e WHERE e.show_id = s.id AND e.season > 0
                         AND e.has_file = 0 AND e.air_date IS NOT NULL AND e.air_date <= ?),

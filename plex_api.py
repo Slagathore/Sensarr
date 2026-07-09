@@ -409,6 +409,10 @@ def get_recommendations(
     history = _history_entries(300)
     mine = ([h for h in history if _safe_int(h.get("accountID"), -1) == account_id]
             if account_id is not None else history)
+    if not mine:
+        # Account filter matched nothing (fresh user / name mismatch) — fall
+        # back to everyone's history rather than returning zero genres.
+        mine = history
 
     watched_titles: set[str] = set()
     rating_keys: list[str] = []

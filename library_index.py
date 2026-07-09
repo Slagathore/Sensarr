@@ -98,7 +98,128 @@ def initialize_library_index_db() -> None:
             ON library_files (search_name)
             """
         )
+        # Permanent ledger of everything appearing/disappearing on disk —
+        # "my Futurama vanished and I have no idea when or why" insurance.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS file_events (
+                id     INTEGER PRIMARY KEY AUTOINCREMENT,
+                at     TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                event  TEXT NOT NULL,      -- added|removed|changed|renamed|replaced
+                path   TEXT NOT NULL,
+                detail TEXT
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_file_events_path ON file_events (path)"
+        )
         conn.commit()
+
+
+def log_file_event(event: str, path: str, detail: str = "") -> None:
+    """Append one ledger row. Called by every code path that adds, moves,
+    renames, replaces, or deletes a library file — plus the index refresh,
+    which catches changes made OUTSIDE the app."""
+    initialize_library_index_db()
+    with _DB_LOCK, db.connect(_db_path()) as conn:
+        conn.execute(
+            "INSERT INTO file_events (event, path, detail) VALUES (?, ?, ?)",
+            (event, path, detail),
+        )
+        conn.commit()
+
+
+@dataclass(frozen=True)
+class FileEvent:
+    at: str
+    event: str
+    path: str
+    detail: str
+
+
+def list_file_events(limit: int = 500) -> list[FileEvent]:
+    initialize_library_index_db()
+    with _DB_LOCK, db.connect(_db_path()) as conn:
+        rows = conn.execute(
+            "SELECT at, event, path, COALESCE(detail, '') FROM file_events"
+            " ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    return [FileEvent(*row) for row in rows]
+
+
+def list_missing_files(limit: int = 500) -> list[FileEvent]:
+    """Files that USED to be indexed but are gone — excluding ones the
+    ledger knows were renamed or replaced, and ones that later came back."""
+    initialize_library_index_db()
+    with _DB_LOCK, db.connect(_db_path()) as conn:
+        rows = conn.execute(
+            """
+            SELECT e.at, e.event, e.path, COALESCE(e.detail, '')
+            FROM file_events e
+            WHERE e.event = 'removed'
+              AND e.path NOT IN (SELECT path FROM library_files)
+              AND e.id = (SELECT MAX(id) FROM file_events e2 WHERE e2.path = e.path)
+            ORDER BY e.id DESC LIMIT ?
+            """, (limit,)).fetchall()
+    return [FileEvent(*row) for row in rows]
+
+
+def _diff_and_log_events(conn, old: dict[str, tuple[str, int]],
+                         new: dict[str, tuple[str, int]]) -> None:
+    """Write ledger rows for an index diff, pairing renames/replacements so
+    they don't read as scary deletions.
+
+    - rename: same size, same folder OR same filename elsewhere
+    - replaced: same folder + same episode/name stem prefix, different size
+    - everything else: added / removed (removed = 'outside the app' unless
+      an app code path already logged its own event for that path)
+    """
+    removed = {p: v for p, v in old.items() if p not in new}
+    added = {p: v for p, v in new.items() if p not in old}
+    changed = [p for p in new if p in old and old[p][1] != new[p][1]]
+
+    consumed_added: set[str] = set()
+    for r_path, (r_name, r_size) in list(removed.items()):
+        match = None
+        kind = ""
+        r_dir = str(Path(r_path).parent)
+        for a_path, (a_name, a_size) in added.items():
+            if a_path in consumed_added:
+                continue
+            a_dir = str(Path(a_path).parent)
+            if a_size == r_size and (a_dir == r_dir or a_name == r_name):
+                match, kind = a_path, "renamed"
+                break
+            if a_dir == r_dir and Path(a_name).stem[:12].casefold() == Path(r_name).stem[:12].casefold():
+                match, kind = a_path, "replaced"
+                break
+        if match:
+            consumed_added.add(match)
+            conn.execute(
+                "INSERT INTO file_events (event, path, detail) VALUES (?, ?, ?)",
+                (kind, r_path, f"→ {match}"))
+            del removed[r_path]
+
+    for p, (_n, size) in removed.items():
+        already = conn.execute(
+            "SELECT event FROM file_events WHERE path = ? ORDER BY id DESC LIMIT 1",
+            (p,)).fetchone()
+        if already and already[0] in ("removed", "replaced"):
+            continue  # an app action already explained this one
+        conn.execute(
+            "INSERT INTO file_events (event, path, detail) VALUES ('removed', ?, ?)",
+            (p, f"disappeared from disk ({_format_bytes(size)}) — deleted outside "
+                "the app, or before this ledger could see why"))
+    for p, (_n, size) in added.items():
+        if p in consumed_added:
+            continue
+        conn.execute(
+            "INSERT INTO file_events (event, path, detail) VALUES ('added', ?, ?)",
+            (p, f"new on disk ({_format_bytes(size)})"))
+    for p in changed:
+        conn.execute(
+            "INSERT INTO file_events (event, path, detail) VALUES ('changed', ?, ?)",
+            (p, f"size {_format_bytes(old[p][1])} → {_format_bytes(new[p][1])}"))
 
 
 def rebuild_library_index() -> ReindexResult:
@@ -107,6 +228,10 @@ def rebuild_library_index() -> ReindexResult:
     extensions = set(config.LIBRARY_INDEX_EXTENSIONS)
 
     with _DB_LOCK, db.connect(_db_path()) as conn:
+        old_snapshot = {
+            row[0]: (row[1], int(row[2])) for row in conn.execute(
+                "SELECT path, name, size_bytes FROM library_files")
+        }
         conn.execute("DELETE FROM library_files")
 
         batch: list[tuple[str, str, str, str, int, float]] = []
@@ -158,6 +283,12 @@ def rebuild_library_index() -> ReindexResult:
                 batch,
             )
 
+        new_snapshot = {
+            row[0]: (row[1], int(row[2])) for row in conn.execute(
+                "SELECT path, name, size_bytes FROM library_files")
+        }
+        if old_snapshot:  # first-ever build isn't 35k "added" rows of noise
+            _diff_and_log_events(conn, old_snapshot, new_snapshot)
         conn.commit()
 
     return ReindexResult(
@@ -217,6 +348,10 @@ def refresh_library_index() -> RefreshResult:
     with _DB_LOCK, db.connect(_db_path()) as conn:
         indexed = {row[0]: (int(row[1]), float(row[2])) for row in
                    conn.execute("SELECT path, size_bytes, modified_at FROM library_files")}
+        old_snapshot = {
+            row[0]: (row[1], int(row[2])) for row in conn.execute(
+                "SELECT path, name, size_bytes FROM library_files")
+        }
 
         removed = [p for p in indexed if p not in on_disk]
         added = [p for p in on_disk if p not in indexed]
@@ -234,6 +369,9 @@ def refresh_library_index() -> RefreshResult:
             [(p, on_disk[p][0], on_disk[p][1], on_disk[p][0].casefold(),
               on_disk[p][2], on_disk[p][3]) for p in added + updated],
         )
+        new_snapshot = {p: (v[0], v[2]) for p, v in on_disk.items()}
+        if old_snapshot:
+            _diff_and_log_events(conn, old_snapshot, new_snapshot)
         conn.commit()
 
     return RefreshResult(added=len(added), removed=len(removed),
