@@ -144,10 +144,46 @@ class WatchlistTab:
         self._recs_tree = recs_tree
 
         self._load_accounts()
+        self._load_persisted_recs()
 
     # ------------------------------------------------------------------
     # Data
     # ------------------------------------------------------------------
+
+    def _recs_cache_path(self):
+        from pathlib import Path
+        return Path(config.APP_DIR) / "watchlist_recs.pkl"
+
+    def _load_persisted_recs(self) -> None:
+        """Last fetch survives restarts — the tab is never empty if recs
+        have EVER been generated. Get Recommendations refreshes."""
+        import pickle
+        try:
+            path = self._recs_cache_path()
+            if not path.is_file():
+                return
+            payload = pickle.loads(path.read_bytes())
+            self._recs_all = payload.get("recs", [])
+            self._top_genres = payload.get("genres", [])
+            if self._top_genres:
+                self._genre_combo.configure(values=["All"] + self._top_genres)
+            self._render_recs()
+            self._status_var.set(
+                f"Loaded last recommendations (from {payload.get('at', '?')}) — "
+                "Get Recommendations refreshes.")
+        except Exception:
+            logger.debug("Persisted recs load failed.", exc_info=True)
+
+    def _persist_recs(self) -> None:
+        import datetime
+        import pickle
+        try:
+            self._recs_cache_path().write_bytes(pickle.dumps({
+                "recs": self._recs_all, "genres": self._top_genres,
+                "at": datetime.datetime.now().strftime("%b %d %H:%M"),
+            }))
+        except Exception:
+            logger.debug("Persisted recs save failed.", exc_info=True)
 
     def _load_accounts(self) -> None:
         def worker() -> None:
@@ -225,6 +261,7 @@ class WatchlistTab:
                     self._top_genres = top_genres
                     self._genre_combo.configure(values=["All"] + top_genres)
                 self._render_recs()
+                self._persist_recs()
             self.app._post_to_ui(render)
 
         threading.Thread(target=worker, name="wl-recs", daemon=True).start()

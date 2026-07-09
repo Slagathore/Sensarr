@@ -1399,6 +1399,15 @@ class DownloadManager:
         dest_dir = Path(plan.dest_dir)
         moved_any = False
         for src in files:
+            # Multi-sub packs carry subtitles for every language — only the
+            # configured language (and untagged defaults) move to the library.
+            if src.suffix.lower() in torrent_routing.SUBTITLE_EXTENSIONS:
+                try:
+                    from subtitles import subtitle_language_ok
+                    if not subtitle_language_ok(src):
+                        continue
+                except ImportError:
+                    pass
             target_name = src.name
             if do_rename and src.suffix.lower() in torrent_routing.VIDEO_EXTENSIONS:
                 new_stem = self._episode_stem_for_file(

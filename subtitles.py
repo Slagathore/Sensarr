@@ -23,6 +23,56 @@ LANGUAGE_CHOICES: tuple[tuple[str, str], ...] = (
 )
 
 
+# Language tokens seen in subtitle filenames / folder names, per ISO code.
+_LANG_ALIASES: dict[str, set[str]] = {
+    "en": {"en", "eng", "english", "en-us", "en-gb", "engl"},
+    "es": {"es", "spa", "spanish", "espanol", "español", "es-la", "es-es", "lat", "latino"},
+    "fr": {"fr", "fre", "fra", "french", "francais", "français"},
+    "de": {"de", "ger", "deu", "german", "deutsch"},
+    "it": {"it", "ita", "italian"},
+    "pt": {"pt", "por", "portuguese", "pt-br", "pt-pt", "brazilian"},
+    "ja": {"ja", "jpn", "japanese"},
+    "ko": {"ko", "kor", "korean"},
+    "zh": {"zh", "chi", "zho", "chinese", "chs", "cht", "zh-cn", "zh-tw", "mandarin"},
+    "ru": {"ru", "rus", "russian"},
+    "ar": {"ar", "ara", "arabic"},
+    "hi": {"hi", "hin", "hindi"},
+    "nl": {"nl", "dut", "nld", "dutch"},
+    "sv": {"sv", "swe", "swedish"},
+    "pl": {"pl", "pol", "polish"},
+}
+_ALL_LANG_TOKENS: set[str] = set().union(*_LANG_ALIASES.values())
+
+
+def subtitle_language_ok(path, preferred: str | None = None) -> bool:
+    """Should this subtitle file be kept, given the user's language setting?
+
+    Multi-sub release packs ship .ass/.srt files for EVERY language; when a
+    download is moved into the library, only the preferred language (and
+    untagged subs, which are usually the release's default) come along.
+    """
+    import config as _config
+    from pathlib import Path as _Path
+
+    preferred = (preferred or _config.SUBTITLE_LANGUAGE or "en").casefold()
+    wanted = _LANG_ALIASES.get(preferred, {preferred})
+
+    p = _Path(path)
+    # Tokens from the filename ("Show.S01E01.por.ass") and parent folders
+    # ("Subs/French/…").
+    tokens: set[str] = set()
+    stem_parts = p.stem.replace("[", ".").replace("]", ".").replace("(", ".") \
+                       .replace(")", ".").replace("_", ".").replace("-", ".").split(".")
+    tokens.update(t.strip().casefold() for t in stem_parts if t.strip())
+    for parent in list(p.parents)[:3]:
+        tokens.add(parent.name.strip().casefold())
+
+    found_langs = tokens & _ALL_LANG_TOKENS
+    if not found_langs:
+        return True  # untagged — keep (usually the release default track)
+    return bool(found_langs & wanted)
+
+
 def subtitles_available() -> bool:
     try:
         import subliminal  # noqa: F401

@@ -432,7 +432,7 @@ class DesktopApp:
         self.watchlist_tab = WatchlistTab(watchlist_tab, self)
 
         status_tab.columnconfigure(0, weight=1)
-        status_tab.rowconfigure(1, weight=1)
+        status_tab.rowconfigure(2, weight=1)
         requests_tab.columnconfigure(0, weight=1)
         requests_tab.rowconfigure(1, weight=1)
         requests_tab.rowconfigure(2, weight=0)
@@ -446,7 +446,7 @@ class DesktopApp:
         logs_tab.rowconfigure(0, weight=1)
 
         status_toolbar = ttk.Frame(status_tab)
-        status_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        status_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         health_btn = ttk.Button(status_toolbar, text="🩺 Health Check",
                                 command=lambda: self.run_health_check(include_updates=False))
         health_btn.grid(row=0, column=0, padx=(0, 6))
@@ -461,10 +461,49 @@ class DesktopApp:
         plex_btn.grid(row=0, column=2)
         add_tooltip(plex_btn, "Show which Plex processes are running right now.")
 
+        # Frozen header: the vitals stay pinned while activity streams below.
+        vitals = ttk.Frame(status_tab)
+        vitals.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        self._status_plex_dot = ttk.Label(vitals, text="●", foreground=_DOT_GRAY)
+        self._status_plex_dot.pack(side=tk.LEFT)
+        ttk.Label(vitals, textvariable=self.plex_status_var).pack(side=tk.LEFT, padx=(4, 16))
+        self._status_bot_dot = ttk.Label(vitals, text="●", foreground=_DOT_AMBER)
+        self._status_bot_dot.pack(side=tk.LEFT)
+        ttk.Label(vitals, textvariable=self.bot_status_var).pack(side=tk.LEFT, padx=(4, 16))
+        self._activity_summary_var = tk.StringVar(value="")
+        ttk.Label(vitals, textvariable=self._activity_summary_var,
+                  font=("Segoe UI", 9, "italic")).pack(side=tk.LEFT)
+
+        status_panes = ttk.PanedWindow(status_tab, orient=tk.VERTICAL)
+        status_panes.grid(row=2, column=0, sticky="nsew")
+
+        activity_frame = ttk.LabelFrame(
+            status_panes, text="Live activity — downloads, renames, moves", padding=4)
+        status_panes.add(activity_frame, weight=3)
+        activity_frame.columnconfigure(0, weight=1)
+        activity_frame.rowconfigure(0, weight=1)
+        activity_tree = ttk.Treeview(
+            activity_frame, columns=("when", "what", "detail"), show="headings")
+        for col, text, width, stretch in (("when", "When", 130, False),
+                                          ("what", "What", 110, False),
+                                          ("detail", "Detail", 680, True)):
+            activity_tree.heading(col, text=text)
+            activity_tree.column(col, width=width, anchor=tk.W, stretch=stretch)
+        activity_tree.grid(row=0, column=0, sticky="nsew")
+        activity_scroll = ttk.Scrollbar(activity_frame, orient=tk.VERTICAL,
+                                        command=activity_tree.yview)
+        activity_scroll.grid(row=0, column=1, sticky="ns")
+        activity_tree.configure(yscrollcommand=activity_scroll.set)
+        self._activity_tree = activity_tree
+
+        text_frame = ttk.LabelFrame(status_panes, text="Diagnostics output", padding=4)
+        status_panes.add(text_frame, weight=2)
+        text_frame.columnconfigure(0, weight=1)
+        text_frame.rowconfigure(0, weight=1)
         self.status_text = scrolledtext.ScrolledText(
-            status_tab, wrap=tk.WORD, height=14, font=("Consolas", 10), state=tk.DISABLED,
+            text_frame, wrap=tk.WORD, height=8, font=("Consolas", 10), state=tk.DISABLED,
         )
-        self.status_text.grid(row=1, column=0, sticky="nsew")
+        self.status_text.grid(row=0, column=0, sticky="nsew")
 
         requests_toolbar = ttk.Frame(requests_tab)
         requests_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
@@ -1029,7 +1068,13 @@ class DesktopApp:
         threading.Thread(target=worker, name="ui-plex-indicator", daemon=True).start()
 
     def _set_plex_indicator(self, running: bool) -> None:
-        self._plex_dot.configure(foreground=_DOT_GREEN if running else _DOT_RED)
+        color = _DOT_GREEN if running else _DOT_RED
+        self._plex_dot.configure(foreground=color)
+        if hasattr(self, "_status_plex_dot"):
+            self._status_plex_dot.configure(foreground=color)
+        if hasattr(self, "_status_bot_dot"):
+            self._status_bot_dot.configure(
+                foreground=_DOT_GREEN if self.bot_service.running else _DOT_RED)
         self.plex_status_var.set("Plex: running" if running else "Plex: not running")
 
     def confirm_hard_reset(self, from_tray: bool = False) -> None:
@@ -1739,6 +1784,37 @@ class DesktopApp:
     def _on_download_update(self, download_id: int) -> None:
         # Called from download worker threads — marshal to the UI thread.
         self._post_to_ui(self.refresh_downloads)
+        self._post_to_ui(self.refresh_activity_feed)
+
+    def refresh_activity_feed(self) -> None:
+        """The Status tab's live feed: active downloads with progress on
+        top, then the recent download/rename/move history, condensed."""
+        tree = getattr(self, "_activity_tree", None)
+        if tree is None:
+            return
+        for iid in tree.get_children():
+            tree.delete(iid)
+
+        rows = downloads_store.list_downloads(limit=100)
+        active = [r for r in rows if r.status in ("downloading", "queued")]
+        for r in active:
+            marker = f"⬇ {r.progress * 100:.0f}%" if r.status == "downloading" else "⏳ queued"
+            tree.insert("", "end", values=("now", marker, r.title))
+        for h in downloads_store.list_history(limit=80):
+            icons = {"downloaded": "✔ done", "renamed": "✎ renamed",
+                     "moved": "→ moved", "error": "✖ error",
+                     "grabbed": "+ grabbed", "cancelled": "✖ cancelled",
+                     "stopped": "⏸ stopped", "rotated": "↻ rotated",
+                     "replaced": "♻ replaced"}
+            what = icons.get(h.action, h.action)
+            detail = h.after_value or h.before_value or ""
+            if h.action in ("renamed", "moved") and h.before_value and h.after_value:
+                detail = f"{Path(h.before_value).name} → {h.after_value}"
+            tree.insert("", "end", values=(h.at, what, detail[:200]))
+        downloading = sum(1 for r in active if r.status == "downloading")
+        queued = len(active) - downloading
+        self._activity_summary_var.set(
+            f"{downloading} downloading, {queued} queued" if active else "no active downloads")
 
     def _persist_dl_toggle(self, key: str, var: tk.BooleanVar) -> None:
         value = bool(var.get())
@@ -2241,6 +2317,7 @@ class DesktopApp:
         self.refresh_library_summary()
         self.refresh_library_metrics()
         self.refresh_users_tab()  # keep the pending-request badge current
+        self.refresh_activity_feed()
         self._schedule_status_refresh()
 
     def _refresh_file_ledger_views(self) -> None:

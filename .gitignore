@@ -58,3 +58,4 @@ library_lowqual.pkl
 anime_meta.sqlite
 anime_meta.sqlite-*
 unidentified_folders.json
+watchlist_recs.pkl
