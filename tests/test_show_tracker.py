@@ -39,6 +39,45 @@ def test_parse_episode_no_number():
     assert _parse_episode_from_file("Some Movie.mkv") is None
 
 
+def test_parse_episode_version_suffix_and_bare_e():
+    # Version suffixes sit flush against the number ("v2") — real Kaiju No. 8 naming.
+    assert _parse_episode_from_file("[Judas] Kaijuu 8 Gou - S01E05v2.mkv") == (1, 5)
+    # Bare "E01" marker with no season token — real Medaka Box naming.
+    assert _parse_episode_from_file("[Ranger] Medaka Box - E07 [BD][1080p].mkv") == (None, 7)
+    # "Wall-E 2" style names must NOT hit the bare-E pattern.
+    assert _parse_episode_from_file("WALL-E (2008).mkv") is None
+
+
+def test_scan_skips_extras_folders(tmp_path):
+    show = tmp_path / "Some Show"
+    (show / "Season 01").mkdir(parents=True)
+    (show / "Trailers").mkdir()
+    (show / "Other").mkdir()
+    (show / "Season 01" / "Some Show - S01E01.mkv").write_bytes(b"x")
+    (show / "Trailers" / "Season 1 Trailer 1.mkv").write_bytes(b"x")
+    (show / "Other" / "Some Show - NCOP 1.mkv").write_bytes(b"x")
+    found = show_tracker._scan_folders_for_episodes((str(show),))
+    assert set(found) == {(1, 1)}
+
+
+def test_remap_disk_seasons_to_continuous_tracker():
+    # Tracker (TMDB) merged two cours into one 24-episode "Season 1";
+    # disk uses Season 01 (1-12) + Season 02 (1-12). Real Mashle layout.
+    from media_lookup import EpisodeInfo
+    episodes = [EpisodeInfo(1, n, f"ep{n}", "2023-01-01") for n in range(1, 25)]
+    found = {(1, n): f"/s1/e{n}.mkv" for n in range(1, 13)}
+    found |= {(2, n): f"/s2/e{n}.mkv" for n in range(1, 13)}
+    remapped, moved = show_tracker._remap_disk_seasons_to_tracker(found, episodes)
+    assert moved
+    assert set(remapped) == {(1, n) for n in range(1, 25)}
+    assert remapped[(1, 13)] == "/s2/e1.mkv"
+    # A show whose tracker HAS season 2 is left completely alone.
+    episodes2 = ([EpisodeInfo(1, n, "", None) for n in range(1, 13)]
+                 + [EpisodeInfo(2, n, "", None) for n in range(1, 13)])
+    same, moved2 = show_tracker._remap_disk_seasons_to_tracker(dict(found), episodes2)
+    assert not moved2 and same == found
+
+
 @pytest.fixture()
 def tracked_show(tmp_path):
     show_dir = tmp_path / "Test Show"
@@ -72,7 +111,8 @@ def test_sync_marks_missing_and_upcoming(tracked_show, monkeypatch):
     )
 
     summary = show_tracker.sync_show(tracked_show)
-    assert "5 episodes known" in summary and "2 on disk" in summary
+    # Message quotes the same numbers as the table: have/known, missing.
+    assert "2/5 on disk" in summary and "1 missing" in summary
 
     missing = shows_store.missing_episodes(tracked_show)
     assert [(e.season, e.episode) for e in missing] == [(1, 3)]  # aired, no file

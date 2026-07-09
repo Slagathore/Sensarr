@@ -63,6 +63,9 @@ class ShowsTab:
              "Ctrl-click rows that are actually the same show, then merge them into the top-most one."),
             ("Silenced…", self.open_silenced_dialog,
              "List shows whose releases you've silenced, and restore them."),
+            ("Unidentified…", self.open_unidentified_dialog,
+             "Folders the last scan couldn't match to any tracker — identify "
+             "them by hand here instead of digging through the log."),
             ("Fix Titles (English)", self.fix_titles,
              "Rename AniDB-identified shows to their official English titles (offline, safe to re-run)."),
             ("⬇ Grab Missing Now", self.grab_missing_now,
@@ -450,6 +453,152 @@ class ShowsTab:
         ttk.Button(bar, text="Search", command=do_search).grid(row=0, column=1, padx=(0, 6))
         ttk.Button(bar, text="Use Selected", style="Accent.TButton",
                    command=use_selected).grid(row=0, column=2)
+        entry.bind("<Return>", lambda _e: do_search())
+        ttk.Label(win, textvariable=status_var,
+                  font=("Segoe UI", 9, "italic")).grid(row=3, column=0, sticky="w",
+                                                       padx=10, pady=(4, 10))
+        if hasattr(self.app, "_apply_dark_widget_styles"):
+            self.app._apply_dark_widget_styles(win)
+        do_search()
+
+    def open_unidentified_dialog(self) -> None:
+        """Folders the scanner gave up on → manual identification."""
+        folders = show_tracker.load_unidentified()
+        win = tk.Toplevel(self._shows_tree)
+        win.title("Unidentified folders")
+        win.geometry("720x420")
+        win.transient(self._shows_tree.winfo_toplevel())
+        win.columnconfigure(0, weight=1)
+        win.rowconfigure(1, weight=1)
+
+        ttk.Label(win, wraplength=680, justify=tk.LEFT, text=(
+            f"{len(folders)} folder(s) from the last scan couldn't be matched "
+            "automatically (junk-heavy names, obscure titles, or non-show "
+            "folders). Select one and click Identify to search the trackers "
+            "yourself — or leave it; non-show folders are fine to ignore."
+        )).grid(row=0, column=0, sticky="w", padx=10, pady=(10, 6))
+
+        listbox = tk.Listbox(win, activestyle="none")
+        listbox.grid(row=1, column=0, sticky="nsew", padx=10)
+        for f in folders:
+            listbox.insert(tk.END, f)
+        if not folders:
+            listbox.insert(tk.END, "Nothing unidentified — run Scan Folders to refresh.")
+
+        def identify() -> None:
+            sel = listbox.curselection()
+            if not sel or not folders:
+                return
+            folder = folders[sel[0]]
+            win.destroy()
+            self.open_identify_dialog(folder)
+
+        bar = ttk.Frame(win)
+        bar.grid(row=2, column=0, sticky="e", padx=10, pady=(6, 10))
+        ttk.Button(bar, text="Identify…", style="Accent.TButton",
+                   command=identify).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(bar, text="Close", command=win.destroy).pack(side=tk.RIGHT)
+        if hasattr(self.app, "_apply_dark_widget_styles"):
+            self.app._apply_dark_widget_styles(win)
+
+    def open_identify_dialog(self, folder: str) -> None:
+        """Search the trackers for one unidentified folder and track it."""
+        folder_path = Path(folder)
+        media_type = "anime"
+        for entry in config.MEDIA_LIBRARY_PATHS:
+            try:
+                folder_path.relative_to(entry.path)
+                if entry.media_type in ("tv", "anime", "xanime"):
+                    media_type = entry.media_type
+                break
+            except ValueError:
+                continue
+
+        win = tk.Toplevel(self._shows_tree)
+        win.title(f"Identify — {folder_path.name}")
+        win.geometry("640x420")
+        win.transient(self._shows_tree.winfo_toplevel())
+        win.columnconfigure(0, weight=1)
+        win.rowconfigure(2, weight=1)
+
+        ttk.Label(win, text=f"Folder: {folder}\nSearching as: {media_type}",
+                  justify=tk.LEFT).grid(row=0, column=0, sticky="w", padx=10, pady=(10, 4))
+
+        bar = ttk.Frame(win)
+        bar.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 6))
+        bar.columnconfigure(0, weight=1)
+        query_var = tk.StringVar(
+            value=show_tracker.clean_show_folder_name(folder_path.name)[0]
+            or folder_path.name)
+        entry = ttk.Entry(bar, textvariable=query_var)
+        entry.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        status_var = tk.StringVar(value="Adjust the query and Search.")
+
+        results_tree = ttk.Treeview(
+            win, columns=("title", "year", "source", "id"),
+            show="headings", selectmode="browse",
+        )
+        for col, text, width in (("title", "Title", 330), ("year", "Year", 60),
+                                 ("source", "Source", 80), ("id", "ID", 90)):
+            results_tree.heading(col, text=text)
+            results_tree.column(col, width=width, anchor=tk.W)
+        results_tree.grid(row=2, column=0, sticky="nsew", padx=10)
+        candidates: list = []
+
+        def do_search() -> None:
+            query = query_var.get().strip()
+            if not query:
+                return
+            status_var.set("Searching trackers…")
+
+            def worker() -> None:
+                from media_lookup import (search_anidb, search_anilist,
+                                          search_tmdb_shows, search_tvdb_shows)
+                try:
+                    if media_type == "tv":
+                        found = search_tvdb_shows(query, None) + search_tmdb_shows(query, None)
+                    else:
+                        found = search_anidb(
+                            query, media_type=media_type,
+                        ) + search_anilist(query, explicit=(media_type == "xanime"))
+                except Exception as exc:
+                    self.app._post_to_ui(lambda: status_var.set(f"Search failed: {exc}"))
+                    return
+
+                def render() -> None:
+                    candidates.clear()
+                    candidates.extend(found)
+                    for item in results_tree.get_children():
+                        results_tree.delete(item)
+                    for idx, r in enumerate(found):
+                        results_tree.insert("", "end", iid=str(idx),
+                                            values=(r.title, r.year or "", r.source,
+                                                    r.external_id))
+                    status_var.set(f"{len(found)} candidate(s).")
+                self.app._post_to_ui(render)
+
+            threading.Thread(target=worker, name="identify-search", daemon=True).start()
+
+        def track_selected() -> None:
+            sel = results_tree.selection()
+            if not sel:
+                return
+            r = candidates[int(sel[0])]
+            show_id = shows_store.upsert_show(
+                title=r.title, media_type=media_type, source=r.source,
+                external_id=r.external_id, external_url=r.external_url or None,
+                year=r.year,
+            )
+            shows_store.add_show_folder(show_id, folder)
+            win.destroy()
+            self._status_var.set(f"Tracked '{r.title}' ← {folder_path.name} — syncing…")
+            self.refresh()
+            self._run_guarded("Sync show", "identify-sync", "Syncing new show…",
+                              lambda: show_tracker.sync_show(show_id), lambda msg: msg)
+
+        ttk.Button(bar, text="Search", command=do_search).grid(row=0, column=1, padx=(0, 6))
+        ttk.Button(bar, text="Track Selected Match", style="Accent.TButton",
+                   command=track_selected).grid(row=0, column=2)
         entry.bind("<Return>", lambda _e: do_search())
         ttk.Label(win, textvariable=status_var,
                   font=("Segoe UI", 9, "italic")).grid(row=3, column=0, sticky="w",

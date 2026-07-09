@@ -75,9 +75,11 @@ def pick_root_by_free_space(candidates: list[str]) -> str | None:
 
 # --- Episode / title parsing -------------------------------------------------
 
+# "(?:v\d+)?" — release version suffixes ("S01E05v2") sit flush against the
+# episode number, which otherwise breaks the \b word boundary entirely.
 _EPISODE_PATTERNS = [
-    re.compile(r"\bS(?P<season>\d{1,2})[\s._-]*E(?P<episode>\d{1,3})\b", re.IGNORECASE),
-    re.compile(r"\b(?P<season>\d{1,2})x(?P<episode>\d{2,3})\b", re.IGNORECASE),
+    re.compile(r"\bS(?P<season>\d{1,2})[\s._-]*E(?P<episode>\d{1,3})(?:v\d+)?\b", re.IGNORECASE),
+    re.compile(r"\b(?P<season>\d{1,2})x(?P<episode>\d{2,3})(?:v\d+)?\b", re.IGNORECASE),
 ]
 _SEASON_ONLY_PATTERNS = [
     re.compile(r"\bS(?P<season>\d{1,2})\b(?![\s._-]*E\d)", re.IGNORECASE),

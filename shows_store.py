@@ -246,8 +246,26 @@ def clear_episodes(show_id: int) -> None:
 
 
 def replace_episodes(show_id: int, episodes: list) -> None:
-    """Upsert the authoritative episode list from the tracker (keeps has_file)."""
+    """Make the tracker's episode list authoritative (keeps has_file).
+
+    Rows NOT in the new list are DELETED — when a show flips from absolute
+    ordering (one 36-episode "season 1") to real seasons, the stale absolute
+    rows used to survive forever and read as phantom missing episodes.
+    The on-disk scan (update_file_state) runs right after every sync, so
+    legitimately-on-disk extras are re-inserted immediately.
+    """
     with _SHOWS_LOCK, db.connect() as conn:
+        keep = {(ep.season, ep.episode) for ep in episodes}
+        for season, episode in [
+            (r[0], r[1]) for r in conn.execute(
+                "SELECT season, episode FROM episodes WHERE show_id = ?", (show_id,)
+            ).fetchall()
+        ]:
+            if (season, episode) not in keep:
+                conn.execute(
+                    "DELETE FROM episodes WHERE show_id = ? AND season = ? AND episode = ?",
+                    (show_id, season, episode),
+                )
         for ep in episodes:
             conn.execute(
                 """

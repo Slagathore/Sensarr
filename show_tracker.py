@@ -97,13 +97,32 @@ _LEADING_BRACKET_RE = re.compile(r"^\s*(?:\[[^\]]*\]\s*)+")
 _ABS_EP_RE = re.compile(r"(?:^|[\s._-])(\d{1,4})(?=[\s._-]|$)")
 _NOT_EPISODE = re.compile(r"^(?:19|20)\d{2}$|^(?:480|720|1080|2160)$")
 
-# "Episode 01 - Title.mp4" / "Ep 5.mkv" — common DVD-rip naming with no
-# season token in the filename (the season lives in the parent folder name).
-_EP_WORD_RE = re.compile(r"\b(?:Episode|Ep)[\s._-]*(\d{1,4})\b", re.IGNORECASE)
+# "Episode 01 - Title.mp4" / "Ep 5.mkv" / "_Ep01_" / "Show - E01 [BD].mkv" —
+# episode markers with no season token (the season lives in the parent folder
+# name). \b can't be used before Ep: underscores are word chars, so
+# "_Ep01_" (Exiled-Destiny style) would never match.
+_EP_WORD_RE = re.compile(
+    r"(?:^|[\s._\-(\[])(?:Episode|Ep)\.?[\s._-]*(\d{1,4})(?:v\d+)?(?=[\s._\-)\]]|$)",
+    re.IGNORECASE)
+_BARE_E_RE = re.compile(r"(?:^|[\s._-])E(\d{1,3})(?:v\d+)?(?=[\s._-]|$)", re.IGNORECASE)
+# "01) Great Sword.mkv" — leading track-style numbering.
+_LEADING_NUM_RE = re.compile(r"^\s*(\d{1,3})[)\].\s_-]")
+# OVA/OAD/creditless markers → season 0, so "Show OVA - 01" can't collide
+# with the real S01E01.
+_SPECIAL_MARKER_RE = re.compile(r"\b(?:OVA|OAD|NC(?:OP|ED))\b", re.IGNORECASE)
 
-# Parent folder names that carry the season: "Season 02", "Season 2", "S02".
-_SEASON_DIR_RE = re.compile(r"^(?:Season|S)[\s._-]*(\d{1,3})$", re.IGNORECASE)
+# Parent folder names that carry the season: "Season 02", "Season 2", "S02",
+# and suffixed forms like "Noragami Season_1 L@mBerT" (matched anywhere).
+_SEASON_DIR_RE = re.compile(r"(?:^|[\s._-])(?:Season|S)[\s._-]*(\d{1,3})(?=[\s._-]|$)",
+                            re.IGNORECASE)
 _SPECIALS_DIR_RE = re.compile(r"^specials?$", re.IGNORECASE)
+# Bonus-content folders that must NEVER be scanned as episodes: trailers,
+# creditless openings/endings, extras — a "Trailer 1" would otherwise be
+# counted as episode 1 of something.
+_EXTRAS_DIR_RE = re.compile(
+    r"^(?:extras?|featurettes?|behind the scenes|deleted scenes|interviews|"
+    r"scenes|shorts|trailers?|other|nc(?:op|ed)s?|creditless|menus?|"
+    r"bonus(?:es)?|pv|cm)$", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -261,8 +280,36 @@ def _scan_library_folders_impl(media_types: tuple[str, ...]) -> ScanResult:
                     match.title, match.source, match.external_id, folder,
                 )
 
+    _save_unidentified(unidentified)
     return ScanResult(identified=identified, already_tracked=already,
                       unidentified=unidentified)
+
+
+# Folders the scanner couldn't identify — persisted so the Shows tab can
+# offer them for manual identification (they used to hide in the log).
+_UNIDENTIFIED_FILE = "unidentified_folders.json"
+
+
+def _save_unidentified(folders: list[str]) -> None:
+    import json
+    try:
+        (Path(config.APP_DIR) / _UNIDENTIFIED_FILE).write_text(
+            json.dumps(folders, indent=1), encoding="utf-8")
+    except OSError:
+        logger.debug("Could not persist unidentified-folder list.", exc_info=True)
+
+
+def load_unidentified() -> list[str]:
+    """Unidentified folders from the most recent scan (folders that have
+    since been mapped — e.g. identified by hand — are filtered out)."""
+    import json
+    try:
+        raw = json.loads((Path(config.APP_DIR) / _UNIDENTIFIED_FILE)
+                         .read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return [f for f in raw if isinstance(f, str)
+            and Path(f).is_dir() and not shows_store.folder_mapped(f)]
 
 
 # ---------------------------------------------------------------------------
@@ -285,14 +332,28 @@ def _parse_episode_from_file(name: str) -> tuple[int | None, int] | None:
     "Episode 05 - Title.mp4" live inside per-season folders; assuming season
     1 for them was the bug that marked whole shows as missing when their
     seasons were organised in folders)."""
+    stem = Path(name).stem
+    # OVA/OAD/creditless files are specials — pin them to season 0 so
+    # "Show OVA - 01" can never shadow the real S01E01.
+    special = _SPECIAL_MARKER_RE.search(stem) is not None
+    default_season = 0 if special else None
+
     parsed = parse_torrent_name(name)
     if parsed.episode is not None:
-        return (parsed.season, parsed.episode)
+        return (parsed.season if parsed.season is not None else default_season,
+                parsed.episode)
 
-    stem = Path(name).stem
     m = _EP_WORD_RE.search(stem)
     if m:
-        return (None, int(m.group(1)))
+        return (default_season, int(m.group(1)))
+    # Bare "E01" marker ("[Ranger] Medaka Box - E01 [BD].mkv").
+    m = _BARE_E_RE.search(re.sub(r"\[[^\]]*\]", " ", stem))
+    if m:
+        return (default_season, int(m.group(1)))
+    # Leading track-style numbering ("01) Great Sword.mkv").
+    m = _LEADING_NUM_RE.match(stem)
+    if m and not _NOT_EPISODE.match(m.group(1)):
+        return (default_season, int(m.group(1)))
 
     # Fallback: strip bracket groups, then take the LAST plausible number.
     cleaned = re.sub(r"\[[^\]]*\]|\([^)]*\)", " ", stem)
@@ -301,7 +362,9 @@ def _parse_episode_from_file(name: str) -> tuple[int | None, int] | None:
         if not _NOT_EPISODE.match(tok)
     ]
     if candidates:
-        return (None, int(candidates[-1]))
+        return (default_season, int(candidates[-1]))
+    if special:
+        return (0, 1)  # lone unnumbered OVA
     return None
 
 
@@ -312,12 +375,41 @@ def _season_from_parents(file_path: Path, root: Path) -> int | None:
         if parent == root:
             break
         name = parent.name.strip()
-        m = _SEASON_DIR_RE.match(name)
+        m = _SEASON_DIR_RE.search(name)
         if m:
             return int(m.group(1))
         if _SPECIALS_DIR_RE.match(name):
             return 0
     return None
+
+
+def _first_video_file(folders: tuple[str, ...]) -> str | None:
+    """First non-extras video under the mapped folders (largest first, so a
+    sample never wins over the actual episode)."""
+    candidates: list[tuple[int, str]] = []
+    for folder in folders:
+        root = Path(folder)
+        if not root.is_dir():
+            continue
+        for f in root.rglob("*"):
+            if (f.is_file() and f.suffix.lower() in VIDEO_EXTENSIONS
+                    and not _in_extras_dir(f, root)):
+                try:
+                    candidates.append((f.stat().st_size, str(f)))
+                except OSError:
+                    continue
+    return max(candidates)[1] if candidates else None
+
+
+def _in_extras_dir(file_path: Path, root: Path) -> bool:
+    """True when any ancestor between the file and the show root is a bonus
+    folder (Trailers, NCOP/NCED, Other, …) — those aren't episodes."""
+    for parent in file_path.parents:
+        if parent == root:
+            return False
+        if _EXTRAS_DIR_RE.match(parent.name.strip()):
+            return True
+    return False
 
 
 def _scan_folders_for_episodes(folders: tuple[str, ...]) -> dict[tuple[int, int], str]:
@@ -329,6 +421,8 @@ def _scan_folders_for_episodes(folders: tuple[str, ...]) -> dict[tuple[int, int]
         for f in root.rglob("*"):
             if not f.is_file() or f.suffix.lower() not in VIDEO_EXTENSIONS:
                 continue
+            if _in_extras_dir(f, root):
+                continue
             key = _parse_episode_from_file(f.name)
             if key is None:
                 continue
@@ -339,6 +433,41 @@ def _scan_folders_for_episodes(folders: tuple[str, ...]) -> dict[tuple[int, int]
                 season = 1  # flat folder, absolute numbering
             found.setdefault((season, episode), str(f))
     return found
+
+
+def _remap_disk_seasons_to_tracker(
+    found: dict[tuple[int, int], str], episodes: list,
+) -> tuple[dict[tuple[int, int], str], bool]:
+    """Bridge the OTHER ordering mismatch: the tracker numbers everything as
+    one continuous season ("S1E13-24") while the disk splits it into Season
+    folders ("Season 02\\...E01-12") — common when TMDB merges anime cours.
+
+    Only fires for disk seasons the tracker doesn't know AT ALL, and only
+    maps onto tracker rows that actually exist and aren't already matched —
+    so shows with genuine tracker seasons are untouched. Returns the
+    (possibly) remapped dict and whether anything moved.
+    """
+    tracker_keys = {(e.season, e.episode) for e in episodes}
+    tracker_seasons = {s for s, _e in tracker_keys}
+    disk_seasons = sorted({s for s, _e in found if s > 0})
+    orphan_seasons = [s for s in disk_seasons if s >= 2 and s not in tracker_seasons]
+    if not orphan_seasons:
+        return found, False
+
+    disk_max = {s: max(e for (ss, e) in found if ss == s) for s in disk_seasons}
+    remapped = dict(found)
+    moved = False
+    for season in orphan_seasons:
+        offset = sum(disk_max[s] for s in disk_seasons if s < season)
+        for (ss, ep), path in found.items():
+            if ss != season or ep < 1:
+                continue
+            target = (1, offset + ep)
+            if target in tracker_keys and target not in remapped:
+                remapped[target] = path
+                remapped.pop((ss, ep), None)
+                moved = True
+    return remapped, moved
 
 
 def _ensure_tmdb_id(show: shows_store.TrackedShow) -> str | None:
@@ -434,12 +563,35 @@ def _sync_show_impl(show_id: int) -> str:
         next_episode=nxt.episode if nxt else None,
     )
 
+    # Reverse mismatch: tracker numbers continuously, disk uses Season
+    # folders — map "Season 02/E05" onto the tracker's S1E17 etc.
+    if episodes:
+        found, remapped = _remap_disk_seasons_to_tracker(found, episodes)
+        if remapped:
+            ordering_note += " (Season folders matched to the tracker's continuous numbering)"
+
+    # One-episode shows (most hentai, many OVAs) often ship a single file
+    # with no number at all — a lone video IS episode 1.
+    if not found and sum(1 for e in episodes if e.season > 0) == 1:
+        lone = _first_video_file(show.folders)
+        if lone is not None:
+            found[(1, 1)] = lone
+
     shows_store.update_file_state(show_id, found)
-    missing = len(shows_store.missing_episodes(show_id))
+
+    # Report the SAME numbers the tracked-shows table shows (regular seasons
+    # only) — quoting the raw fetch/scan counts here used to disagree with
+    # the row whenever specials (season 0) were involved.
+    final = shows_store.get_show(show_id)
+    have = final.have_count if final else 0
+    known = final.episode_count if final else len(episodes)
+    missing = final.missing_count if final else 0
+    specials_on_disk = sum(1 for season, _ep in found if season == 0)
+    specials_note = f" (+{specials_on_disk} specials on disk)" if specials_on_disk else ""
 
     air_note = f", next airs {nxt.air_date} (S{nxt.season:02d}E{nxt.episode:02d})" if nxt else ""
-    return (f"{show.title}: {len(episodes)} episodes known, {len(found)} on disk, "
-            f"{missing} missing{air_note}{ordering_note}")
+    return (f"{show.title}: {have}/{known} on disk, {missing} missing"
+            f"{specials_note}{air_note}{ordering_note}")
 
 
 def sync_all(progress=None) -> list[str]:
