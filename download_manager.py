@@ -67,14 +67,15 @@ _RUNNER_PATH = _resolve_runner_path()
 
 
 def _size_prefs(media_type: str) -> tuple[float, float, int]:
-    """(preferred MB/min, max MB/min, assumed runtime minutes) per type."""
+    """(preferred MB/min, max MB/min, fallback runtime minutes) per type.
+    The fallback minutes only apply when no real runtime is known."""
     prefs = {
         "movie": (config.SIZE_PREF_MB_PER_MIN_MOVIE, config.SIZE_MAX_MB_PER_MIN_MOVIE, 120),
-        "tv": (config.SIZE_PREF_MB_PER_MIN_TV, config.SIZE_MAX_MB_PER_MIN_TV, 30),
-        "anime": (config.SIZE_PREF_MB_PER_MIN_ANIME, config.SIZE_MAX_MB_PER_MIN_ANIME, 30),
-        "xanime": (config.SIZE_PREF_MB_PER_MIN_XANIME, config.SIZE_MAX_MB_PER_MIN_XANIME, 30),
+        "tv": (config.SIZE_PREF_MB_PER_MIN_TV, config.SIZE_MAX_MB_PER_MIN_TV, 24),
+        "anime": (config.SIZE_PREF_MB_PER_MIN_ANIME, config.SIZE_MAX_MB_PER_MIN_ANIME, 24),
+        "xanime": (config.SIZE_PREF_MB_PER_MIN_XANIME, config.SIZE_MAX_MB_PER_MIN_XANIME, 24),
     }
-    return prefs.get(media_type, (0.0, 0.0, 30))
+    return prefs.get(media_type, (0.0, 0.0, 24))
 
 
 def _runtime_minutes(show) -> float | None:
@@ -157,7 +158,7 @@ def pick_best_result(results: list[TorrentResult], media_type: str,
     prefer the result whose size lands closest to the target on a log
     scale, seeders as tie-breaker. `minutes` is the real runtime when
     known (tracked-show runtime, TMDB movie runtime, ffprobe of a file
-    being replaced); the fallback is 2 h for movies, 30 min for episodes.
+    being replaced); the fallback is 2 h for movies, 24 min for episodes.
     """
     if not results:
         return None

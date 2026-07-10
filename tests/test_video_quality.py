@@ -55,7 +55,7 @@ def test_runtime_anchor_changes_target_and_cap(monkeypatch):
         _result("Show S01E01 450MB", 450 * mb, 40),
         _result("Show S01E01 700MB", 700 * mb, 30),
     ]
-    # Flat 30-min assumption: target 300 MB → the 300 MB result wins.
+    # Flat 24-min fallback: target 240 MB → the 300 MB result is closest.
     flat = pick_best_result(results, "tv")
     assert flat is not None and flat.size_bytes == 300 * mb
     # A known 45-min runtime: target 450 MB → the 450 MB result wins.

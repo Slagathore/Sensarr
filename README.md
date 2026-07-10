@@ -1,214 +1,211 @@
 # Plexxarr
 
+**Your whole media-server stack in one Windows app.** Plexxarr is a free, open-source Plex companion that replaces the Sonarr + Radarr + request-portal + indexer + download-client pile with a single EXE: your household requests shows over Telegram, Plexxarr finds them, downloads them, names them properly, files them into the right library, and keeps every tracked show complete — with best-in-class anime handling powered by a local 41,000-title database.
+
+[![Latest release](https://img.shields.io/github/v/release/Slagathore/Plexxarr)](../../releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)
+![Python](https://img.shields.io/badge/python-3.11+-3776ab)
+[![Ko-fi](https://img.shields.io/badge/Ko--fi-catnip%20fund%20%F0%9F%90%88-ff5f5f)](https://ko-fi.com/sparklemuffin)
+
+![Demo](docs/demo.gif)
+
 *(formerly PlexResetButton — the old repo URL redirects)*
 
-[![Ko-fi](https://img.shields.io/badge/Ko--fi-half%20a%20coffee%20%E2%98%95-ff5f5f)](https://ko-fi.com/sparklemuffin)
+## Quick start
 
-A Windows system-tray application and Telegram bot that lets you remotely **launch, hard-reset, monitor, and manage Plex Media Server** from your phone — plus a Sonarr/Radarr-style request queue, show tracker, and torrent download pipeline, all in one app.
+1. Download the [latest release](../../releases/latest), unzip anywhere, run `Plexxarr.exe` (accept the UAC prompt — it needs it to manage Plex).
+2. The **Setup Wizard** opens on first run and does the annoying parts *with* you: it opens [@BotFather](https://t.me/BotFather) so you can create your Telegram bot (paste the token back and it validates it live), offers one-click `winget` installs of Node.js and Ollama, and won't save a config that doesn't work. Telegram is skippable — the desktop app is fully usable on its own.
+3. In **Settings**: add your library folders (tagged movie / tv / anime / …) and click **Get Plex Token** (a browser PIN page opens; approve it, done).
 
-```
-Phone (Telegram) ──► Telegram Bot API ──► PlexResetButton.exe ──► Plex Media Server
-```
+That's it. No Docker, no YAML, no reverse proxy, no sacrificial offering to the compose gods. Message your bot from the couch.
 
----
+## What it does
 
-## Features
+### 📱 Requests, from anyone you allow
+- **Telegram request flow** that guides users to an exact match — resolved against TMDB, TVDB, AniDB, and AniList, checked against what's already in your library, and queued with a link the admin can act on
+- **Season-aware grabbing** — an episodic request finishes the latest season you own, then moves to the next aired one; a brand-new show starts at season 1; a movie request will *never* take a `S01E03` release
+- **Allowlist with zero friction** — unknown users automatically file an access request that pops up live on the Users tab; approve or deny with a click
+- **Server control from your phone** — launch Plex, check status, see play metrics; hard reset is there too but **off by default** (it force-kills Plex mid-stream, so it's opt-in in Settings)
+- **Watchlists & recommendations** — pulls each user's Plex watchlist and builds genre-aware suggestions, filtered by what's already on disk
 
-| Category             | Details                                                                                                      |
-| -------------------- | ------------------------------------------------------------------------------------------------------------ |
-| **Telegram control** | Inline keyboard + slash commands: Launch, Status, Metrics, Requests. Hard Reset is opt-in (Settings tab).    |
-| **Hard reset**       | Force-kills every Plex process tree via `taskkill /F` (runs elevated; never fails silently)                  |
-| **Request queue**    | Telegram users are guided through a library-aware, DB-linked request flow (TMDB/TVDB/AniDB/AniList)          |
-| **Shows tracker**    | Sonarr-style: scan library folders, identify shows, track episodes/air dates, auto-grab missing episodes     |
-| **Downloads**        | In-app torrent search (YTS/TPB/nyaa/sukebei), webtorrent downloads, automatic rename + routing to libraries  |
-| **Users**            | Telegram allowlist with in-app approval of access requests (updates live when a request arrives)             |
-| **Health**           | One-click server health check, Plex + app update check, dependency and disk-space issues surfaced            |
-| **Library index**    | Indexes your media folders to SQLite for fast search; fallback to Plex API search                            |
-| **Play metrics**     | Per-user play counts, watch time, active sessions, and library section inventory                             |
-| **Plex PIN auth**    | Built-in browser-based PIN flow to obtain and persist your Plex token                                        |
-| **Auto-start**       | One-click Task Scheduler registration at highest privilege level                                             |
-| **EXE build**        | Single-folder PyInstaller bundle via `build_exe.bat`                                                         |
+### 📺 A Sonarr-style show tracker
+- Scans your folders, identifies every show, tracks episodes, air dates, and **% missing** — sortable, filterable, resizable, with an **Upcoming** strip showing exactly what airs when (silence any show; one click to restore)
+- **Two kinds of follow**, because they're different things: 🆕 *grab new releases as they air* vs ✅ *keep the show at 100%* — flag either from a right-click
+- **Right-click everything** — fix a wrong match, jump to its database entry, merge duplicates, sanitize-and-push names, grab all missing
+- **Parses real-world naming** — `S01E05v2`, bare `E01`, `_Ep01_`, `01) Title`, `Season_1 L@mBerT`, OVAs into Specials, `[Raze] Dandadan S2 - 11`, release-group junk, trailing years… the parser meets your files where they are instead of demanding you rename them
 
----
+### ⬇️ A download pipeline that thinks
+- **Built-in torrent search** (YTS, TPB, nyaa, sukebei) with its own webtorrent engine — or point it at your **qBittorrent** Web UI and it drives that instead
+- **A real queue**: a few active at a time, the rest waiting, stalled downloads rotated out automatically; right-click any row for stop / restart / recheck / remove (± files) / search again
+- **Size preferences that mean something** — you set MB-per-minute targets and caps with sliders; grabs are anchored to each show's **real runtime** (from the local anime DB, TMDB, or ffprobe), so a 24-min anime and a 45-min drama get honest targets, not the same guess. Defaults to ~530 MB per 24-min episode
+- **Grab discipline** — cam/telesync releases blocked by default; when everything on offer is oversized it waits a day before settling; when nothing has seeders it races five candidates for an hour and keeps the winner
+- **Renames and files everything** into your library structure, fetches subtitles in *your* language (multi-sub packs won't flood you with 30 `.srt`s), and recovers cleanly from crashes and interrupted moves
+- **A file-change ledger** — every rename, replacement, move, and deletion in your libraries is logged with who/what did it, plus a missing-files view for things that vanished outside the app
 
-## Architecture
+### 🗃️ Library housekeeping
+- Full inventory of every media file across all your drives, searchable and filterable
+- **Low-quality scan** — finds cams and low-bitrate files (worst first), flags copies that are redundant because a better file already exists, and can **replace a cam with a proper release in one click** — the old file is recycled only after the new one lands
+- Subtitle fetching for anything missing them, in the language you pick
 
-```
-main.py              Entry point — UAC elevation gate → starts desktop_app
-desktop_app.py       Tkinter GUI + pystray tray icon; owns the app lifecycle
-bot.py               All Telegram command/callback handlers (async)
-telegram_service.py  Runs the python-telegram-bot Application on a background thread
-plex_control.py      Hard reset (taskkill), launch, status
-plex_api.py          Plex HTTP API client — metrics, sessions, library inventory
-plex_auth.py         Plex PIN/token authentication flow (urllib, no extra deps)
-health.py            Health checks + Plex/app update checks (Status tab)
-library_index.py     SQLite-backed filesystem media indexer and searcher
-metrics_report.py    Formats combined metrics message for bot and desktop
-queue_store.py       SQLite request queue — add, complete, list, count
-auth_store.py        Telegram allowlist + access requests (admin approval)
-db.py                Shared SQLite connection helper (WAL, busy timeout)
-torrent_search.py    In-app torrent search (YTS / TPB / nyaa / sukebei)
-torrent_routing.py   Destination planner — show/season folders, safe renames
-download_manager.py  Torrent downloads via Node webtorrent runner + history
-downloads_store.py   Downloads + before/after history tables
-torrent_runner/      Headless Node webtorrent downloader (npm install once)
-shows_store.py       Tracked-show inventory: shows, folders, episode air dates
-show_tracker.py      Folder scan → tracker identify → episode sync → missing
-shows_tab.py         Shows tab UI (Sonarr-style; first split-out tab module)
-ui_helpers.py        Shared Tk helpers: sortable tree columns, busy spinner
-config.py            Centralised config: reads .env, validates required keys
-app_logging.py       Dual log handler: stderr stream + in-memory ring buffer
-```
+### 🧠 A local-first anime brain
+- Ships with a **41,537-title anime database** (built from the excellent [manami-project](https://github.com/manami-project/anime-offline-database), [Fribb/anime-lists](https://github.com/Fribb/anime-lists), and [Anime-Lists](https://github.com/Anime-Lists/anime-lists) datasets): titles, synonyms, episode counts, runtimes, and AniDB ↔ TVDB ↔ TMDB ↔ MAL ↔ AniList id mappings — SQLite + full-text search, ~1 ms lookups, refreshed weekly, **zero API keys, works offline**
+- Fixes the two classic anime-library nightmares in *both* directions: absolute numbering vs Season folders, and TMDB's "one long season 1" merged-cour lists — using curated per-show mappings, not guesswork
+- Hentai handled as a first-class type with its own library routing, size prefs, and metadata (it's your server; we don't judge)
 
----
+### 🔩 The boring-but-important parts
+- **Everything is persistent.** Scans, indexes, maintenance results, recommendations — cached to disk, diffed on refresh, pre-warmed by an overnight idle pass. You will never watch it re-parse 30,000 files because you restarted the app
+- One-click **health check** (Plex reachable, token valid, dependencies present, disk space), Plex + app update checks, Task Scheduler autostart, single-instance lock, orphan-process cleanup on startup
+- **Won't wreck your library**: grabs are matched against the show they're for before anything is renamed — an unrelated torrent can't get stamped with your show's name and moved into its folder
 
-## Setting up on a fresh computer
+## Why not just run the *arr stack?
 
-What a new user needs, assuming they got a built EXE folder (`PlexResetButton/` from `dist\`):
+If Sonarr + Radarr + Prowlarr + Overseerr + qBittorrent behind Docker fits your life, run it — it's the power-user gold standard and nothing here is a knock on it. Plexxarr is for the other 90%: **one Windows machine, Plex already on it, and no appetite for maintaining five services to automate it.** One EXE, one wizard, and the pieces already know about each other. (Already attached to qBittorrent? Plexxarr will happily use it as the download engine.)
 
-1. **Windows 10/11 (64-bit)** with **Plex Media Server** installed locally.
-2. **First run**: put the app folder anywhere, run `PlexResetButton.exe` (accept the UAC prompt). With no bot token configured, the **Setup Wizard opens automatically** and walks you through everything below — including one-click winget installs of Node.js and Ollama, and validating your bot token against Telegram before saving it.
-3. **Telegram bot**: the wizard opens [@BotFather](https://t.me/BotFather) for you — send `/newbot`, paste the token back into the wizard. (Telegram requires a human to create the bot; there's no API for it.)
-4. **In the app**: Settings tab → add your library folders (tagged movie/tv/anime/…) → Save. Click **Get Plex Token** to run the browser PIN flow (persists automatically).
-5. **Optional — for request lookups**: free API keys for [TMDB](https://www.themoviedb.org/settings/api) and [TVDB](https://thetvdb.com/api-information) in Settings. Anime identification works offline out of the box (AniDB title dump downloads automatically).
-6. **Optional — downloads**: the wizard can install Node.js and run `npm install` for the torrent runner. Prefer qBittorrent? Enable it in Settings (Web UI URL + login) and downloads delegate to it instead.
-7. **Optional**: `setup_autostart.bat` to launch at login without UAC prompts.
-8. Message your bot on Telegram. Unknown users automatically file an access request that appears instantly on the **Users** tab.
+<details>
+<summary><b>📸 Screenshots</b></summary>
 
-Use the **Status tab → 🩺 Health Check** button to verify every dependency at once.
+**Shows tracker**
+![Shows tab](docs/shows.png)
 
-### Running from source instead
+**Downloads queue**
+![Downloads tab](docs/downloads.png)
+
+**Status — server vitals + live activity**
+![Status tab](docs/status.png)
+
+**Telegram request flow**
+![Telegram](docs/telegram.png)
+
+**Setup wizard**
+![Wizard](docs/wizard.png)
+
+**Size preferences**
+![Settings](docs/settings.png)
+
+</details>
+
+## Privacy
+
+**Everything runs and stays on your machine.** No server of ours, no accounts, no telemetry, no analytics. Your config lives in a local `.env` (git-ignored), your request/show/download history in local SQLite files next to the app. The only network connections Plexxarr makes, and only when the feature is used: the Telegram Bot API (your bot), your own Plex server + plex.tv (auth/watchlists), the metadata sources you enable (TMDB/TVDB keys are optional; AniList/Jikan/AniDB for anime), torrent indexers when a search runs, a public tracker list refresh, and the weekly anime-database rebuild from GitHub. The optional LLM categorization runs on **your** Ollama with a ~1 GB local model by default (`gemma3:1b`) — request text never leaves your machine unless you deliberately configure a `:cloud` model tag.
+
+## Disclaimer
+
+Plexxarr is an **unofficial** tool and is not affiliated with, endorsed by, or connected to Plex, Inc. (or Telegram, TMDB, TVDB, AniDB, AniList, or any indexer). It includes a general-purpose BitTorrent client and searches public indexers; BitTorrent is a neutral protocol, and **you are solely responsible for what you search for, download, and share**. Use it for content you have the rights to — your own media, public-domain and freely-licensed works, and content licensed for you to obtain this way, in accordance with the laws where you live. The software is provided **as is**, with no warranty of any kind.
+
+## Running from source
+
+Packaged builds need nothing installed. From source: Python 3.11+, plus Node.js only if you use the built-in download engine (`npm install` inside `torrent_runner/`; the wizard can do all of this for you).
 
 ```powershell
 git clone https://github.com/Slagathore/Plexxarr.git
 cd Plexxarr
-python -m pip install -r requirements.txt   # Python 3.11+
-Copy-Item .env.example .env ; notepad .env  # paste your bot token
-python main.py
+python -m pip install -r requirements.txt
+Copy-Item .env.example .env
+python main.py     # first run opens the Setup Wizard
 ```
 
----
+Build your own EXE with `build_exe.bat` (needs `pip install -r requirements-build.txt`, just PyInstaller) — output lands in `dist\<timestamp>\Plexxarr\Plexxarr.exe`. Register autostart-at-login (highest privilege, no UAC prompt) with `setup_autostart.bat`; remove with `remove_autostart.bat`.
 
-## Configuration — `.env`
+<details>
+<summary><b>⚙️ Configuration (.env)</b></summary>
 
-Copy `.env.example` to `.env` and edit the values. The `.env` file is git-ignored; it never leaves your machine. Everything except the bot token can also be edited from the **Settings tab**, which writes back to `.env`.
+Copy `.env.example` to `.env`. Everything below is also editable from the **Settings tab**, which writes back to `.env`. The file is git-ignored and never leaves your machine.
 
-| Variable                       | Required | Default                                                         | Description                                                 |
-| ------------------------------ | -------- | --------------------------------------------------------------- | ----------------------------------------------------------- |
-| `TELEGRAM_BOT_TOKEN`           | **Yes**  | —                                                               | Bot token from @BotFather                                   |
-| `TELEGRAM_ALLOWED_USER_IDS`    | No       | —                                                               | Comma-separated Telegram user IDs always allowed            |
-| `TELEGRAM_HARD_RESET_ENABLED`  | No       | `false`                                                         | Show the Hard Reset button/command in the Telegram bot      |
-| `PLEX_MEDIA_SERVER_PATH`       | No       | `C:\Program Files\Plex\Plex Media Server\Plex Media Server.exe` | Full path to the Plex executable                            |
-| `PLEX_SERVER_URL`              | No       | `http://127.0.0.1:32400`                                        | Local Plex server URL                                       |
-| `PLEX_TOKEN`                   | No       | —                                                               | Plex authentication token (obtain via the in-app auth flow) |
-| `MEDIA_LIBRARY_PATHS`          | No       | —                                                               | Typed library folders (edit via Settings tab)               |
-| `TMDB_API_KEY` / `TVDB_API_KEY`| No       | —                                                               | Free keys for movie/TV request lookups                      |
-| `OLLAMA_HOST` / `OLLAMA_MODEL` | No       | `localhost:11434`                                               | Optional LLM for request categorization                     |
-| `TORRENT_DOWNLOAD_DIR`         | No       | `downloads/`                                                    | Torrent staging folder                                      |
-| `SIZE_PREF_MB_PER_MIN_*`       | No       | `0`                                                             | Preferred download size per type (MB per minute; 0 = off)   |
-| `SHOWS_AUTO_GRAB`              | No       | `false`                                                         | Auto-download missing episodes of tracked shows             |
+| Variable | Required | Default | Description |
+| --- | --- | --- | --- |
+| `TELEGRAM_BOT_TOKEN` | No* | — | Bot token from @BotFather (*required for the bot; the desktop app runs without it) |
+| `TELEGRAM_ALLOWED_USER_IDS` | No | — | Comma-separated Telegram user IDs always allowed |
+| `TELEGRAM_HARD_RESET_ENABLED` | No | `false` | Expose Hard Reset in the bot (off by default on purpose) |
+| `PLEX_MEDIA_SERVER_PATH` | No | standard install path | Full path to `Plex Media Server.exe` |
+| `PLEX_SERVER_URL` | No | `http://127.0.0.1:32400` | Local Plex URL |
+| `PLEX_TOKEN` | No | — | Filled automatically by the in-app PIN flow |
+| `MEDIA_LIBRARY_PATHS` | No | — | Typed library folders (edit via Settings) |
+| `TMDB_API_KEY` / `TVDB_API_KEY` | No | — | Free keys; enable movie/TV lookups and richer matching |
+| `OLLAMA_HOST` / `OLLAMA_MODEL` | No | `localhost:11434` / `gemma3:1b` | Optional local LLM for request categorization |
+| `QBITTORRENT_ENABLED` / `_URL` / `_USERNAME` / `_PASSWORD` | No | `false` | Use your qBittorrent as the download engine |
+| `TORRENT_DOWNLOAD_DIR` | No | `downloads/` | Staging folder before files are moved into libraries |
+| `SIZE_PREF_MB_PER_MIN_*` | No | movies `10`, episodic `22.1` | Preferred size per type (≈530 MB per 24-min episode) |
+| `SIZE_MAX_MB_PER_MIN_*` | No | movies `0`, episodic `22.1` | Hard ceiling per type (0 = no cap) |
+| `BLOCK_CAMS` | No | `true` | Never auto-grab cam/telesync releases |
+| `SUBTITLE_LANGUAGE` | No | `en` | The only subtitle language kept from multi-sub packs |
+| `SHOWS_AUTO_GRAB` | No | `false` | Global auto-download of missing episodes (per-show flags work regardless) |
+| `MAX_ACTIVE_DOWNLOADS` | No | `4` | Concurrent downloads; the rest queue |
 
-(Plus timing/limit knobs — see `.env.example` for the full annotated list.)
+(Plus timing/limit knobs — `.env.example` is fully annotated.)
 
----
+</details>
 
-## Building the EXE
+<details>
+<summary><b>💬 Telegram commands</b></summary>
 
-```bat
-build_exe.bat
+| Command | Description |
+| --- | --- |
+| `/start` | Welcome message + inline keyboard |
+| `/help` | Command overview |
+| `/launch` | Start Plex Media Server |
+| `/status` | Is Plex running? |
+| `/request <text>` | Start a guided watch request |
+| `/requests` | Show the open request queue |
+| `/search <title>` | Search the media library |
+| `/libraries` | Library summary |
+| `/metrics` | Play counts, watch time, sessions |
+| `/reindex` | Rebuild the filesystem library index |
+| `/hardreset` | Force-kill + relaunch Plex — only if enabled in Settings; asks for confirmation |
+
+</details>
+
+<details>
+<summary><b>🏗️ Architecture</b></summary>
+
+```
+main.py              Entry point — UAC elevation gate → single-instance lock → app
+desktop_app.py       Tkinter GUI + tray icon; owns the app lifecycle
+bot.py               Telegram command/callback handlers (async)
+telegram_service.py  Runs python-telegram-bot on a background thread
+plex_control.py      Launch / status / hard reset (taskkill)
+plex_api.py          Plex HTTP API — metrics, sessions, accounts, watchlists
+plex_auth.py         Plex PIN/token flow (no extra deps)
+health.py            Health checks + Plex/app update checks
+library_index.py     SQLite filesystem indexer + file-change ledger
+queue_store.py       Request queue store
+auth_store.py        Telegram allowlist + access requests
+torrent_search.py    Indexer search (YTS / TPB / nyaa / sukebei)
+torrent_routing.py   Release-name parsing + destination planning
+download_manager.py  Queue pump, grab logic, size math, post-processing
+downloads_store.py   Download rows + grab-deferral state
+torrent_runner/      Headless Node webtorrent downloader
+shows_store.py       Tracked shows / episodes / flags / runtimes
+show_tracker.py      Folder scan → identify → episode sync → missing detection
+anime_db.py          Local 41k-title anime metadata DB (manami + Fribb + Anime-Lists)
+media_lookup.py      TMDB / TVDB / AniDB / AniList / Jikan lookups
+video_quality.py     Cam detection, ffprobe bitrate/runtime probing
+subtitles.py         Subtitle download (subliminal) + language filtering
+watchlist_tab.py     Watchlist + recommendations UI
+shows_tab.py         Shows tab UI
+ui_helpers.py        Sortable trees, tooltips, smooth scrolling
+config.py            .env-backed config
+db.py                Shared SQLite helper (WAL)
 ```
 
-Output lands in `dist\<timestamp>\PlexResetButton\PlexResetButton.exe`.
+</details>
 
-Requirements: `python -m pip install -r requirements-build.txt` (just PyInstaller).
+## Data attribution
 
----
+Anime identification runs on a **local database** rebuilt weekly from these community datasets — thank you to their maintainers:
 
-## Auto-start on Login
-
-```bat
-setup_autostart.bat
-```
-
-Registers a Windows Task Scheduler entry that triggers on login, runs at highest privilege (no UAC prompt), prefers the compiled EXE, and falls back to `pythonw.exe main.py`. Remove with `remove_autostart.bat`.
-
----
-
-## Telegram Commands
-
-| Command           | Description                                                                   |
-| ----------------- | ----------------------------------------------------------------------------- |
-| `/start`          | Show welcome message and inline keyboard                                      |
-| `/launch`         | Start Plex Media Server                                                       |
-| `/hardreset`      | Hard reset (force-kill + relaunch) — only if enabled in Settings; confirms first |
-| `/status`         | Show whether Plex is running                                                  |
-| `/request <text>` | Add a watch request to the queue                                              |
-| `/requests`       | List all open requests                                                        |
-| `/search <title>` | Search the media library                                                      |
-| `/reindex`        | Rebuild the local filesystem library index                                    |
-| `/libraries`      | Show library summary                                                          |
-| `/metrics`        | Show play counts, watch time, sessions, library counts                        |
-
----
-
-## Plex Authentication
-
-To enable API-based features (metrics, library search, session data) you need a Plex token. The desktop app includes a built-in authentication flow:
-
-1. Open the desktop app (or tray icon → **Open**)
-2. Go to the **Settings** tab
-3. Click **Authenticate with Plex** — a browser window opens with the Plex PIN page
-4. Approve the request in the browser
-5. The token and client identifier are written to your `.env` automatically
-
----
-
-## Security Notes
-
-- **The bot only answers allowlisted Telegram users.** Unknown users file an
-  access request that appears instantly on the desktop app's Users tab for
-  approval or denial. The allowlist lives in the app database.
-- **Hard reset via Telegram is off by default** — enable it in Settings only
-  if you're comfortable with remote users force-killing Plex mid-stream.
-- Your `.env` file is git-ignored and never committed.
-- The Telegram bot token grants full control of the bot — treat it like a password.
-- The Plex token is stored locally in `.env` only.
-- The app only responds to Telegram updates delivered to your bot; no ports are opened.
-- Note: the default `OLLAMA_MODEL` ends in `:cloud`, which relays request text
-  through Ollama's hosted service. Use a local model tag to keep inference on-box.
-
----
-
-## Support
-
-If this app keeps your movie nights running, consider [buying me half a coffee](https://ko-fi.com/sparklemuffin). ☕
-
-## Data Attribution
-
-Anime identification and cross-site id mapping run on a **local database**
-(rebuilt weekly, zero API calls) built from these excellent community datasets:
-
-- [manami-project/anime-offline-database](https://github.com/manami-project/anime-offline-database)
-  — ~41k anime with titles, synonyms, episode counts, seasons, and tags.
-  Licensed under [ODbL v1.0](https://opendatacommons.org/licenses/odbl/1-0/) +
-  DbCL v1.0.
-- [Fribb/anime-lists](https://github.com/Fribb/anime-lists) and
-  [Anime-Lists/anime-lists](https://github.com/Anime-Lists/anime-lists)
-  — the community-curated AniDB ↔ TVDB ↔ TMDB ↔ IMDb ↔ MAL ↔ AniList mapping
-  (the same data the Plex HAMA agent and Sonarr ecosystems use).
-- [AniDB](https://anidb.net)'s public title dump for romaji/English title
-  coverage.
+- [manami-project/anime-offline-database](https://github.com/manami-project/anime-offline-database) — ~41k anime: titles, synonyms, episode counts, runtimes, seasons, tags. Licensed [ODbL v1.0](https://opendatacommons.org/licenses/odbl/1-0/) + DbCL v1.0.
+- [Fribb/anime-lists](https://github.com/Fribb/anime-lists) and [Anime-Lists/anime-lists](https://github.com/Anime-Lists/anime-lists) — the community-curated AniDB ↔ TVDB ↔ TMDB ↔ IMDb ↔ MAL ↔ AniList mapping (the same data the Plex HAMA agent and the Sonarr ecosystem rely on).
+- [AniDB](https://anidb.net)'s public title dump for romaji/English coverage.
 
 ## Acknowledgements
 
-The torrent download pipeline (Downloads tab) is modeled on
-[**torlink**](https://github.com/baairon/torlink) by **bairon**
-([bairon.dev](https://bairon.dev), MIT) — the per-category source registry,
-the webtorrent engine choice, and the stop-seeding-on-complete behavior all
-follow torlink's design. torlink ships as an interactive terminal app, so this
-project reimplements that pipeline headlessly rather than embedding his code —
-but the architecture is his. Thanks, bairon. 🙏
+The download pipeline is modeled on [**torlink**](https://github.com/baairon/torlink) by **bairon** ([bairon.dev](https://bairon.dev), MIT) — the per-category source registry, the webtorrent engine choice, and stop-seeding-on-complete all follow torlink's design. torlink is an interactive terminal app, so Plexxarr reimplements the pipeline headlessly rather than embedding his code — but the architecture is his. Thanks, bairon. 🙏
+
+## Support
+
+😺 If Plexxarr keeps your movie nights running, you could help me get more catnip for my many, many cats — they NEED their zoomies: [buy me Half a cup of coffee](https://ko-fi.com/sparklemuffin). Tarriffs amirite. 🥲
 
 ## License
 
-MIT — see [LICENSE](LICENSE) if present, otherwise free to use and modify.
+MIT — see [LICENSE](LICENSE).

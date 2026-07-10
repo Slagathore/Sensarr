@@ -3895,20 +3895,22 @@ class DesktopApp:
         self._settings_load_paths_from_config()
 
     # Size preference: (env key, label, minutes of runtime for the total-size
-    # preview). Movies preview against a 2 h runtime; episodic content 30 min.
+    # preview). Movies preview against a 2 h runtime; episodic content 24 min.
+    # Actual grabs anchor on each show/movie's real runtime when known.
     _SIZE_PREF_FIELDS: tuple[tuple[str, str, int], ...] = (
         ("SIZE_PREF_MB_PER_MIN_MOVIE", "Movies", 120),
-        ("SIZE_PREF_MB_PER_MIN_TV", "TV shows", 30),
-        ("SIZE_PREF_MB_PER_MIN_ANIME", "Anime", 30),
-        ("SIZE_PREF_MB_PER_MIN_XANIME", "Hentai / xAnime", 30),
+        ("SIZE_PREF_MB_PER_MIN_TV", "TV shows", 24),
+        ("SIZE_PREF_MB_PER_MIN_ANIME", "Anime", 24),
+        ("SIZE_PREF_MB_PER_MIN_XANIME", "Hentai / xAnime", 24),
     )
 
     def _build_size_pref_section(self, inner: ttk.Frame) -> None:
         """Per-type preferred download size sliders.
 
         MB/min is the real metric the downloader follows; the total shown
-        next to it (2 h for movies, 30 min for episodes) is just a guideline
-        so the number is easy to feel out. 0 = no preference.
+        next to it (2 h for movies, 24 min for episodes) is just a guideline
+        so the number is easy to feel out — grabs use each show's real
+        runtime when known. 0 = no preference.
         """
         frame = ttk.LabelFrame(inner, text="Preferred download size (0 = no preference)", padding=10)
         frame.grid(row=2, column=0, sticky="ew", pady=(0, 10))
@@ -3918,7 +3920,8 @@ class DesktopApp:
             frame,
             text=("Drag to set a target bitrate per media type. MB/min is what the "
                   "downloader matches against; the ≈ total is what that works out "
-                  "to for a typical runtime (movies 2 h, episodes 30 min)."),
+                  "to for a typical runtime (movies 2 h, episodes 24 min). Grabs "
+                  "use each show's real runtime when it's known."),
             wraplength=720, foreground=_MUTED_TEXT,
         ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
 
@@ -3936,7 +3939,7 @@ class DesktopApp:
 
                 def update_readout(_v: str = "", *, var=var, readout=readout,
                                    minutes=minutes, empty_text=empty_text) -> None:
-                    mb_min = round(float(var.get()) * 2) / 2  # snap to 0.5 steps
+                    mb_min = round(float(var.get()) * 10) / 10  # snap to 0.1 steps
                     var.set(mb_min)
                     if mb_min <= 0:
                         readout.set(empty_text)
@@ -3944,7 +3947,7 @@ class DesktopApp:
                     total_mb = mb_min * minutes
                     total = (f"{total_mb / 1024:.1f} GB" if total_mb >= 1024
                              else f"{total_mb:.0f} MB")
-                    runtime = "2 h movie" if minutes == 120 else "30 min episode"
+                    runtime = "2 h movie" if minutes == 120 else "24 min episode"
                     readout.set(f"{mb_min:.1f} MB/min  ≈  {total} per {runtime}")
 
                 scale = ttk.Scale(frame, from_=0.0, to=60.0, variable=var,

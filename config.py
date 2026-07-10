@@ -254,20 +254,23 @@ DOWNLOAD_ROOT_OVERRIDE: str = os.getenv("DOWNLOAD_ROOT_OVERRIDE", "").strip()
 # Preferred download size, in MB per minute of runtime, per media type.
 # 0 = no preference (pick by seeders alone). Used by the torrent pickers to
 # prefer results whose size best matches the target, and shown in Settings as
-# both MB/min and an approximate total (movies ≈ 2 h, episodes ≈ 30 min).
-# Default 10 MB/min ≈ 1.2 GB per 2h movie / 300 MB per 30-min episode.
+# both MB/min and an approximate total (movies ≈ 2 h, episodes ≈ 24 min).
+# Grab math anchors on each show/movie's REAL runtime when known.
+# Defaults: movies 10 MB/min ≈ 1.2 GB per 2 h; episodic types 22.1 MB/min
+# ≈ 530 MB per 24-min episode.
 # ---------------------------------------------------------------------------
 SIZE_PREF_MB_PER_MIN_MOVIE: float = float(os.getenv("SIZE_PREF_MB_PER_MIN_MOVIE", "10"))
-SIZE_PREF_MB_PER_MIN_TV: float = float(os.getenv("SIZE_PREF_MB_PER_MIN_TV", "10"))
-SIZE_PREF_MB_PER_MIN_ANIME: float = float(os.getenv("SIZE_PREF_MB_PER_MIN_ANIME", "10"))
-SIZE_PREF_MB_PER_MIN_XANIME: float = float(os.getenv("SIZE_PREF_MB_PER_MIN_XANIME", "10"))
+SIZE_PREF_MB_PER_MIN_TV: float = float(os.getenv("SIZE_PREF_MB_PER_MIN_TV", "22.1"))
+SIZE_PREF_MB_PER_MIN_ANIME: float = float(os.getenv("SIZE_PREF_MB_PER_MIN_ANIME", "22.1"))
+SIZE_PREF_MB_PER_MIN_XANIME: float = float(os.getenv("SIZE_PREF_MB_PER_MIN_XANIME", "22.1"))
 
 # Hard ceiling, same units (0 = no cap). Auto-grab NEVER takes a result whose
 # implied MB/min exceeds this — the answer to "only one result at 2× target".
+# Episodic default matches the preference: 530 MB per 24-min episode.
 SIZE_MAX_MB_PER_MIN_MOVIE: float = float(os.getenv("SIZE_MAX_MB_PER_MIN_MOVIE", "0"))
-SIZE_MAX_MB_PER_MIN_TV: float = float(os.getenv("SIZE_MAX_MB_PER_MIN_TV", "0"))
-SIZE_MAX_MB_PER_MIN_ANIME: float = float(os.getenv("SIZE_MAX_MB_PER_MIN_ANIME", "0"))
-SIZE_MAX_MB_PER_MIN_XANIME: float = float(os.getenv("SIZE_MAX_MB_PER_MIN_XANIME", "0"))
+SIZE_MAX_MB_PER_MIN_TV: float = float(os.getenv("SIZE_MAX_MB_PER_MIN_TV", "22.1"))
+SIZE_MAX_MB_PER_MIN_ANIME: float = float(os.getenv("SIZE_MAX_MB_PER_MIN_ANIME", "22.1"))
+SIZE_MAX_MB_PER_MIN_XANIME: float = float(os.getenv("SIZE_MAX_MB_PER_MIN_XANIME", "22.1"))
 
 # Never auto-download cam/telesync releases (movies). Manual grabs still obey
 # the user's click.
