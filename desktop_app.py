@@ -321,8 +321,9 @@ class DesktopApp:
             except Exception:
                 logger.exception("Midnight auto-grab pass failed.")
 
-        if config.SHOWS_AUTO_GRAB or any(s.auto_grab for s in
-                                         __import__("shows_store").list_shows()):
+        if config.SHOWS_AUTO_GRAB or any(
+                s.auto_grab or s.follow_new
+                for s in __import__("shows_store").list_shows()):
             threading.Thread(target=worker, name="midnight-grab", daemon=True).start()
         self._schedule_midnight_rollover()
 

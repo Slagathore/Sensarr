@@ -77,10 +77,13 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     ("tracked_shows", "next_season", "INTEGER"),
     ("tracked_shows", "next_episode", "INTEGER"),
     # Per-show release controls: silenced hides the show from Upcoming;
-    # auto_grab downloads its episodes on release even when the global
-    # Shows auto-grab toggle is off.
+    # auto_grab = KEEP AT 100%% (finish all missing + grab new releases);
+    # follow_new = only grab NEW releases from follow_since onward — the
+    # back-catalog is deliberately left alone. They are different asks.
     ("tracked_shows", "silenced", "INTEGER NOT NULL DEFAULT 0"),
     ("tracked_shows", "auto_grab", "INTEGER NOT NULL DEFAULT 0"),
+    ("tracked_shows", "follow_new", "INTEGER NOT NULL DEFAULT 0"),
+    ("tracked_shows", "follow_since", "TEXT"),
 ]
 
 
@@ -113,6 +116,8 @@ class TrackedShow:
     tmdb_id: str | None = None
     silenced: bool = False
     auto_grab: bool = False
+    follow_new: bool = False
+    follow_since: str | None = None
 
 
 @dataclass(frozen=True)
@@ -216,7 +221,7 @@ def list_shows() -> list[TrackedShow]:
                    COALESCE(s.next_air_date,
                             (SELECT MIN(e.air_date) FROM episodes e WHERE e.show_id = s.id
                                  AND e.air_date IS NOT NULL AND e.air_date > ?)),
-                   s.next_season, s.next_episode, s.tmdb_id, s.silenced, s.auto_grab
+                   s.next_season, s.next_episode, s.tmdb_id, s.silenced, s.auto_grab, s.follow_new, s.follow_since
             FROM tracked_shows s ORDER BY s.title COLLATE NOCASE
             """,
             (today, today),
@@ -236,6 +241,7 @@ def list_shows() -> list[TrackedShow]:
             episode_count=r[10], have_count=r[11], missing_count=r[12],
             next_air_date=r[13], next_season=r[14], next_episode=r[15],
             tmdb_id=r[16], silenced=bool(r[17]), auto_grab=bool(r[18]),
+            follow_new=bool(r[19]), follow_since=r[20],
         )
         for r in rows
     ]
@@ -301,6 +307,18 @@ def set_show_auto_grab(show_id: int, auto_grab: bool) -> None:
     with _SHOWS_LOCK, db.connect() as conn:
         conn.execute("UPDATE tracked_shows SET auto_grab = ? WHERE id = ?",
                      (1 if auto_grab else 0, show_id))
+        conn.commit()
+
+
+def set_show_follow_new(show_id: int, follow: bool) -> None:
+    """Follow NEW releases only: episodes airing from now on are grabbed,
+    the back-catalog is not (that's what keep-at-100%% is for)."""
+    from datetime import date
+    with _SHOWS_LOCK, db.connect() as conn:
+        conn.execute(
+            "UPDATE tracked_shows SET follow_new = ?, follow_since = ? WHERE id = ?",
+            (1 if follow else 0, date.today().isoformat() if follow else None,
+             show_id))
         conn.commit()
 
 

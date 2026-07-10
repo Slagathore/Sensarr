@@ -979,14 +979,17 @@ class DownloadManager:
         for show in shows_store.list_shows():
             if len(started) >= limit:
                 break
+            follow_only = False
             if show_ids is not None:
                 # Explicit selection (Grab Missing Now on selected rows)
                 # overrides the auto-grab flags.
                 if show.show_id not in show_ids:
                     continue
-            elif not (config.SHOWS_AUTO_GRAB or show.auto_grab):
-                # Global toggle grabs for every show; otherwise only shows
-                # the admin marked keep-at-100%.
+            elif config.SHOWS_AUTO_GRAB or show.auto_grab:
+                pass  # keep-at-100%: every missing episode is fair game
+            elif show.follow_new:
+                follow_only = True  # new releases only, from follow_since on
+            else:
                 continue
             # Re-sync stale shows so "missing" reflects reality.
             stale = True
@@ -1009,6 +1012,10 @@ class DownloadManager:
             for ep in shows_store.missing_episodes(show.show_id):
                 if len(started) >= limit:
                     break
+                if follow_only:
+                    since = show.follow_since or ""
+                    if not ep.air_date or (since and ep.air_date < since):
+                        continue  # back-catalog — follow-new leaves it alone
                 started.extend(self._grab_one_episode(show, ep))
         return started
 

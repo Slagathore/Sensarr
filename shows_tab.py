@@ -244,7 +244,9 @@ class ShowsTab:
             if query and query not in s.title.casefold():
                 continue
             folders = "; ".join(s.folders) if s.folders else "—"
-            flags = ("🔕" if s.silenced else "") + ("⬇" if s.auto_grab else "")
+            flags = (("🔕" if s.silenced else "")
+                     + ("✅" if s.auto_grab else "")
+                     + ("🆕" if s.follow_new else ""))
             miss_pct = (f"{s.missing_count / s.episode_count * 100:.0f}%"
                         if s.episode_count else "")
             self._shows_tree.insert(
@@ -284,7 +286,7 @@ class ShowsTab:
                 listbox.configure(yscrollcommand=sb.set)
             meta: list[tuple[int, str]] = []
             for show, ep in entries:
-                marker = "⬇ " if show.auto_grab else ""
+                marker = ("✅ " if show.auto_grab else "") + ("🆕 " if show.follow_new else "")
                 have = " ✓" if ep.has_file else ""
                 listbox.insert(tk.END, f"{marker}{show.title}  S{ep.season:02d}E{ep.episode:02d}{have}")
                 meta.append((show.show_id, f"{show.title} S{ep.season:02d}E{ep.episode:02d}"))
@@ -365,11 +367,16 @@ class ShowsTab:
             label=f"🔕 Silence releases of '{show.title}'",
             command=lambda: (shows_store.set_show_silenced(show_id, True), self.refresh()),
         )
-        auto_label = ("Stop keeping at 100%" if show.auto_grab
-                      else "✅ Keep show at 100% (finish missing + grab new releases)")
         menu.add_command(
-            label=auto_label,
+            label=("Stop keeping at 100%" if show.auto_grab
+                   else "✅ Keep show at 100% (finish ALL missing + grab new releases)"),
             command=lambda: (shows_store.set_show_auto_grab(show_id, not show.auto_grab),
+                             self.refresh()),
+        )
+        menu.add_command(
+            label=("Stop following new releases" if show.follow_new
+                   else "🆕 Follow new releases (ONLY episodes airing from today)"),
+            command=lambda: (shows_store.set_show_follow_new(show_id, not show.follow_new),
                              self.refresh()),
         )
         menu.add_separator()
@@ -407,8 +414,14 @@ class ShowsTab:
                              self.refresh()),
         )
         menu.add_command(
+            label=("Stop following new releases" if show.follow_new
+                   else "🆕 Follow new releases (auto-grab this + future episodes)"),
+            command=lambda: (shows_store.set_show_follow_new(show.show_id, not show.follow_new),
+                             self.refresh()),
+        )
+        menu.add_command(
             label=("Stop keeping at 100%" if show.auto_grab
-                   else "✅ Keep show at 100% (finish missing + grab new releases)"),
+                   else "✅ Keep show at 100% (finish ALL missing + grab new releases)"),
             command=lambda: (shows_store.set_show_auto_grab(show.show_id, not show.auto_grab),
                              self.refresh()),
         )

@@ -435,6 +435,27 @@ def get_recommendations(
                 if isinstance(g, dict) and g.get("tag"):
                     tag = str(g["tag"])
                     genre_count[tag] = genre_count.get(tag, 0) + 1
+    if not genre_count and account_id is not None and mine is not history:
+        # Metadata fetches for this user's items all whiffed (Plex busy /
+        # transient timeouts) — retry the tally across everyone's history
+        # rather than returning an empty genre list.
+        for h in history:
+            rk = str(h.get("grandparentRatingKey") or h.get("ratingKey") or "")
+            if not rk:
+                continue
+            try:
+                payload = _request_json(f"/library/metadata/{rk}")
+            except Exception:
+                continue
+            for meta in _as_list(_media_container(payload).get("Metadata")):
+                if isinstance(meta, dict):
+                    for g in _as_list(meta.get("Genre")):
+                        if isinstance(g, dict) and g.get("tag"):
+                            tag = str(g["tag"])
+                            genre_count[tag] = genre_count.get(tag, 0) + 1
+            if len(genre_count) >= 5:
+                break
+
     top_genres = [g for g, _n in sorted(genre_count.items(), key=lambda kv: -kv[1])][:8]
     wanted = ({genre_filter} if genre_filter else set(top_genres))
 
