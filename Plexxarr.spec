@@ -32,6 +32,21 @@ hiddenimports = (
 )
 
 
+# Heavyweight packages from OTHER projects in the global site-packages that
+# PyInstaller's analysis reaches via entry-point/plugin scanning (subliminal's
+# stevedore loader etc.). None are Plexxarr dependencies — excluding them cuts
+# minutes off the build and a lot of megabytes off the bundle.
+_EXCLUDE_HEAVY = [
+    "torch", "torchvision", "torchaudio", "torchao", "triton",
+    "tensorflow", "tensorflow-plugins", "keras", "transformers", "timm",
+    "sklearn", "scipy", "pandas", "matplotlib", "numpy", "numba", "llvmlite",
+    "moviepy", "imageio", "imageio_ffmpeg", "librosa", "soundfile", "nltk",
+    "onnxruntime", "cv2", "h5py", "boto3", "botocore", "duckdb", "sqlalchemy",
+    "lxml", "openpyxl", "IPython", "jedi", "parso", "black", "blib2to3",
+    "pytest", "_pytest", "py", "uvicorn", "websockets", "keyring", "fsspec",
+    "lz4", "dns", "pythonnet", "clr_loader", "win32com",
+]
+
 a = Analysis(
     ["main.py"],
     pathex=[str(project_dir)],
@@ -41,7 +56,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=_EXCLUDE_HEAVY,
     noarchive=False,
     optimize=0,
 )

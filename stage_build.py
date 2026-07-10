@@ -69,11 +69,17 @@ def main() -> int:
         print("  WARNING: python-dotenv missing — could not pin APP_DB_PATH; "
               "the bundle will use its own fresh database!")
 
-    for cache in ("anidb_titles.dat.gz", "trackers_cache.txt"):
+    for cache in ("anidb_titles.dat.gz", "trackers_cache.txt",
+                  "anime_meta.sqlite", "maintenance_cache.pkl",
+                  "library_lowqual.pkl", "watchlist_recs.pkl",
+                  "unidentified_folders.json"):
         src = REPO / cache
         if src.is_file():
             shutil.copy2(src, bundle / cache)
             print(f"  copied {cache}")
+    # Clear any partially-built anime DB from a previous bundle launch.
+    partial = bundle / "anime_meta.building"
+    partial.unlink(missing_ok=True)
 
     print("\nStaged. Launch:")
     print(f"  {bundle / (bundle.name + '.exe')}")
