@@ -66,3 +66,6 @@ anime_meta.sqlite-*
 unidentified_folders.json
 watchlist_recs.pkl
 plexxarr.pid
+
+# Private audit notes — never commit
+FABLES_AUDIT*.md
