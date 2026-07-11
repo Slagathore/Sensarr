@@ -102,7 +102,7 @@ class DesktopApp:
     def __init__(self) -> None:
         self.bot_service = TelegramBotService()
         self.root = tk.Tk()
-        self.root.title("Plexxarr")
+        self.root.title(f"Plexxarr v{config.APP_VERSION}")
         try:
             # Taskbar/alt-tab icon — same mark as the tray and the EXE.
             from PIL import ImageTk
@@ -881,7 +881,7 @@ class DesktopApp:
             MenuItem("Get Plex Token", lambda icon, item: self.authenticate_plex_account()),
             MenuItem("Quit", lambda icon, item: self.request_exit()),
         )
-        return Icon("Plexxarr", image, "Plexxarr", menu)
+        return Icon("Plexxarr", image, f"Plexxarr v{config.APP_VERSION}", menu)
 
     def _create_tray_image(self) -> PillowImage:
         from app_icon import icon_image
