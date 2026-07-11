@@ -1,7 +1,7 @@
 # Release signing
 
 Release executables (`Plexxarr.exe` in the zip, `Plexxarr-portable.exe`) are
-Authenticode-signed — publisher `CN=Charles Chambers` — using Azure Artifact
+Authenticode-signed (publisher `CN=Charles Chambers`) using Azure Artifact
 Signing, timestamped so signatures outlive the short-lived certificates.
 
 Signing happens locally after the PyInstaller build, before assets are

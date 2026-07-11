@@ -1,5 +1,5 @@
 # -----------------------------------------------------------------------
-# Secrets & credentials — never commit these
+# Secrets & credentials, never commit these
 # -----------------------------------------------------------------------
 .env
 
@@ -17,11 +17,11 @@ debug_*.png
 pyinstaller_check.log
 
 # -----------------------------------------------------------------------
-# AI assistant context (may contain personal info / conversation history)
+# Local tooling / editor context (may hold personal info)
 # -----------------------------------------------------------------------
 .claude/
 
-# Local outreach/press kit — not part of the public repo
+# Local outreach/press kit, not part of the public repo
 OUTREACH.md
 
 # Raw screenshot-tour output (curated copies live in docs/)
@@ -67,5 +67,5 @@ unidentified_folders.json
 watchlist_recs.pkl
 plexxarr.pid
 
-# Private audit notes — never commit
-FABLES_AUDIT*.md
+# Private audit notes, never commit
+*AUDIT*.md

@@ -13,7 +13,7 @@ labels: bug
 **Steps to reproduce:**
 1.
 
-**Log excerpt** — Logs tab → App Log, copy the lines around the problem
+**Log excerpt** (Logs tab → App Log): copy the lines around the problem
 (check for tokens/paths you don't want public before pasting):
 
 ```
