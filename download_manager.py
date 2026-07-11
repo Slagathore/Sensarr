@@ -78,6 +78,36 @@ def _size_prefs(media_type: str) -> tuple[float, float, int]:
     return prefs.get(media_type, (0.0, 0.0, 24))
 
 
+# A release that already failed for a given episode/request is retried only
+# after this long — unless it's the only option, in which case the least-
+# recently-failed one goes first (rotating through copies across passes).
+FAILED_GRAB_RETRY_AFTER_S = 7 * 24 * 3600
+
+
+def _magnet_hash(magnet: str) -> str:
+    m = re.search(r"btih:([A-Za-z0-9]{32,40})", magnet or "")
+    return m.group(1).lower() if m else ""
+
+
+def _prefer_unfailed(results: list[TorrentResult], context_key: str) -> list[TorrentResult]:
+    """Drop releases that recently failed for this context; if EVERY option
+    has failed, fall back to the least-recently-failed one."""
+    fails = downloads_store.failed_grab_times(context_key)
+    if not fails:
+        return results
+    now = time.time()
+    fresh = [
+        r for r in results
+        if fails.get(_magnet_hash(r.magnet), 0.0) < now - FAILED_GRAB_RETRY_AFTER_S
+    ]
+    if fresh:
+        return fresh
+    logger.info("Every candidate for %s failed before — retrying the "
+                "least-recently-failed copy.", context_key)
+    return sorted(results,
+                  key=lambda r: fails.get(_magnet_hash(r.magnet), 0.0))[:1]
+
+
 def _runtime_minutes(show) -> float | None:
     """A tracked show's real per-episode runtime (minutes), when known."""
     runtime = getattr(show, "runtime_min", None) if show is not None else None
@@ -921,6 +951,7 @@ class DownloadManager:
                 viable, show.media_type, minutes=minutes,
                 episode_context=(show.show_id, ep.season, ep.episode))
         key = f"ep:{show.show_id}:{ep.season}:{ep.episode}"
+        seeded = _prefer_unfailed(seeded, key)
         if not self._oversize_gate(seeded, show.media_type, key, minutes=minutes):
             return []
         best = pick_best_result(seeded, show.media_type, minutes=minutes)
@@ -976,6 +1007,7 @@ class DownloadManager:
                     request_id=req.request_id, request_title=query,
                 ))
                 continue
+            seeded = _prefer_unfailed(seeded, f"req:{req.request_id}")
             if not self._oversize_gate(seeded, media_type, f"req:{req.request_id}",
                                        minutes=minutes):
                 continue

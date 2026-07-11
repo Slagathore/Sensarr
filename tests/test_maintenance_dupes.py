@@ -72,3 +72,39 @@ def test_combo_clean_rules(tmp_path, monkeypatch):
         == "Other Show - 05.mkv"
     # untouched files produce no pair
     assert "Already Clean Name S01E02.mkv" not in renames
+
+
+def test_prefer_unfailed_rotates_copies(tmp_path, monkeypatch):
+    """Failed releases are skipped for a week; when everything failed,
+    the least-recently-failed copy is retried (rotation, not starvation)."""
+    import time
+
+    import db as appdb
+    monkeypatch.setattr(config, "APP_DB_PATH", str(tmp_path / "t.db"))
+    monkeypatch.setattr(appdb, "DB_PATH", str(tmp_path / "t.db"), raising=False)
+
+    import downloads_store as ds
+    from download_manager import _prefer_unfailed
+    from torrent_search import TorrentResult
+
+    def result(h):
+        return TorrentResult(title=h, magnet=f"magnet:?xt=urn:btih:{h}",
+                             size_bytes=1, seeders=1, source="tpb",
+                             media_type="tv")
+
+    a, b, c = (result("a" * 40), result("b" * 40), result("c" * 40))
+    key = "ep:1:1:1"
+
+    # nothing recorded — untouched
+    assert _prefer_unfailed([a, b, c], key) == [a, b, c]
+
+    # a failed recently — dropped while b/c remain
+    ds.record_failed_grab(key, "a" * 40)
+    assert _prefer_unfailed([a, b, c], key) == [b, c]
+
+    # all failed — least-recently-failed comes back alone
+    ds.record_failed_grab(key, "b" * 40)
+    time.sleep(0.01)
+    ds.record_failed_grab(key, "c" * 40)
+    survivors = _prefer_unfailed([a, b, c], key)
+    assert [r.title for r in survivors] == ["a" * 40]

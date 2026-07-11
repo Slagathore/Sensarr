@@ -123,6 +123,45 @@ CREATE TABLE IF NOT EXISTS grab_deferrals (
 """
 
 
+def _init_failed_grabs(conn) -> None:
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS failed_grabs (
+            context_key TEXT NOT NULL,
+            magnet_hash TEXT NOT NULL,
+            failed_at   REAL NOT NULL,
+            PRIMARY KEY (context_key, magnet_hash)
+        )
+    """)
+
+
+def record_failed_grab(context_key: str, magnet_hash: str) -> None:
+    """Remember that this release failed for this episode/request, so the
+    next retry prefers a different copy."""
+    import time as _time
+    if not context_key or not magnet_hash:
+        return
+    with _DL_LOCK, db.connect() as conn:
+        _init_failed_grabs(conn)
+        conn.execute(
+            "INSERT INTO failed_grabs (context_key, magnet_hash, failed_at)"
+            " VALUES (?, ?, ?)"
+            " ON CONFLICT(context_key, magnet_hash)"
+            " DO UPDATE SET failed_at = excluded.failed_at",
+            (context_key, magnet_hash.lower(), _time.time()),
+        )
+        conn.commit()
+
+
+def failed_grab_times(context_key: str) -> dict[str, float]:
+    """magnet_hash -> last failure timestamp for one episode/request key."""
+    with _DL_LOCK, db.connect() as conn:
+        _init_failed_grabs(conn)
+        rows = conn.execute(
+            "SELECT magnet_hash, failed_at FROM failed_grabs WHERE context_key = ?",
+            (context_key,)).fetchall()
+    return {str(r[0]): float(r[1]) for r in rows}
+
+
 def check_grab_deferral(key: str, *, wait_hours: float = 24.0) -> bool:
     """Oversize-only-result cooldown for ROUTINE grabs: first sighting
     records the key and returns False (wait); once wait_hours have passed
@@ -224,6 +263,8 @@ def set_files(download_id: int, relative_paths: list[str]) -> None:
 
 def set_status(download_id: int, status: str, *, error: str | None = None,
                completed: bool = False) -> None:
+    if status == "error":
+        _remember_failure(download_id)
     with _DL_LOCK, db.connect() as conn:
         if completed:
             conn.execute(
@@ -236,6 +277,25 @@ def set_status(download_id: int, status: str, *, error: str | None = None,
                 (status, error, download_id),
             )
         conn.commit()
+
+
+def _remember_failure(download_id: int) -> None:
+    """On error: log the release's info-hash against its episode/request
+    context so retries prefer a different copy."""
+    import re as _re
+    row = get_download(download_id)
+    if row is None:
+        return
+    m = _re.search(r"btih:([A-Za-z0-9]{32,40})", row.magnet or "")
+    if not m:
+        return
+    key = None
+    if row.show_id is not None and row.season is not None and row.episode is not None:
+        key = f"ep:{row.show_id}:{row.season}:{row.episode}"
+    elif row.request_id is not None:
+        key = f"req:{row.request_id}"
+    if key:
+        record_failed_grab(key, m.group(1))
 
 
 def set_progress(download_id: int, progress: float) -> None:
@@ -280,8 +340,12 @@ def request_ids_with_downloads() -> set[int]:
     """Request IDs that already have a grab — used by auto-grab to skip them."""
     initialize_downloads_db()
     with _DL_LOCK, db.connect() as conn:
+        # error/cancelled rows don't count — a failed grab must not strand
+        # its request forever; the next auto-grab pass retries it.
         rows = conn.execute(
-            "SELECT DISTINCT request_id FROM downloads WHERE request_id IS NOT NULL"
+            "SELECT DISTINCT request_id FROM downloads"
+            " WHERE request_id IS NOT NULL"
+            " AND status NOT IN ('error', 'cancelled')"
         ).fetchall()
     return {int(r[0]) for r in rows}
 
