@@ -103,6 +103,14 @@ class DesktopApp:
         self.bot_service = TelegramBotService()
         self.root = tk.Tk()
         self.root.title("Plexxarr")
+        try:
+            # Taskbar/alt-tab icon — same mark as the tray and the EXE.
+            from PIL import ImageTk
+            from app_icon import icon_image
+            self._window_icon = ImageTk.PhotoImage(icon_image(64))
+            self.root.iconphoto(True, self._window_icon)
+        except Exception:
+            logger.debug("Window icon unavailable; Tk default kept.", exc_info=True)
         self.root.geometry("860x620")
         self.root.minsize(760, 520)
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
@@ -876,11 +884,8 @@ class DesktopApp:
         return Icon("Plexxarr", image, "Plexxarr", menu)
 
     def _create_tray_image(self) -> PillowImage:
-        icon = Image.new("RGBA", (64, 64), (24, 28, 36, 255))
-        draw = ImageDraw.Draw(icon)
-        draw.rounded_rectangle((8, 8, 56, 56), radius=12, fill=(227, 88, 51, 255))
-        draw.text((22, 18), "PR", fill=(255, 255, 255, 255))
-        return icon
+        from app_icon import icon_image
+        return icon_image(64)
 
     # =====================================================================
     # Window management

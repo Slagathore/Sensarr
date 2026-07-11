@@ -79,6 +79,7 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     uac_admin=True,
+    icon="assets/plexxarr.ico",
 )
 
 coll = COLLECT(
