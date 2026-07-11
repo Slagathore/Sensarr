@@ -864,7 +864,9 @@ class DesktopApp:
     def _build_tray_icon(self) -> Icon:
         image = self._create_tray_image()
         menu = Menu(
-            MenuItem("Show Admin", lambda icon, item: self.show_window()),
+            # default=True: double-clicking the tray icon reopens the window.
+            MenuItem("Show Admin", lambda icon, item: self.show_window(),
+                     default=True),
             MenuItem("Launch Plex", lambda icon, item: self.run_action("Launch Plex", launch_plex)),
             MenuItem("Hard Reset", lambda icon, item: self.confirm_hard_reset(from_tray=True)),
             MenuItem("Refresh Status", lambda icon, item: self.refresh_status()),
