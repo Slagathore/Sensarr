@@ -46,6 +46,7 @@ __pycache__/
 build/
 dist/
 torrent_runner/node_modules/
+packaging/Output/
 
 # Torrent staging area (in-progress and unrouted downloads)
 downloads/

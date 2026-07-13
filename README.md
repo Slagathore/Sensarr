@@ -14,7 +14,7 @@
 
 ## Quick start
 
-1. Download the [latest release](../../releases/latest). The zip has everything (unzip anywhere, run `Plexxarr.exe`); the portable exe is a single file that fetches its anime database on first run. Both are code-signed (publisher: Charles Chambers; see [SIGNING.md](SIGNING.md)). Accept the UAC prompt; it needs that to manage Plex.
+1. Download the [latest release](../../releases/latest). The installer (`Plexxarr-<ver>-Setup.exe`) is the easiest path: it installs to your user folder and adds Start Menu shortcuts. The zip has everything (unzip anywhere, run `Plexxarr.exe`); the portable exe is a single file that fetches its anime database on first run. All three are code-signed (publisher: Charles Chambers; see [SIGNING.md](SIGNING.md)). Accept the UAC prompt; it needs that to manage Plex.
 2. The Setup Wizard opens on first run and walks you through the annoying parts: it opens [@BotFather](https://t.me/BotFather) so you can create your Telegram bot (paste the token back and it validates it live), offers one-click winget installs of Node.js and Ollama, and won't save a config that doesn't work. Telegram is skippable; the desktop app works fine on its own.
 3. In Settings: add your library folders (tagged movie / tv / anime) and click **Get Plex Token**. A browser PIN page opens, you approve it, done.
 

@@ -73,6 +73,39 @@ if %errorlevel% neq 0 (
 :: and it wastes a few hundred MB per build. Only dist\ matters.
 rmdir /s /q "%WORK_ROOT%" >nul 2>nul
 
+:: --------------------------------------------------------------------------
+:: Wrap the fresh onedir bundle in a Windows installer (packaging\installer.iss)
+:: if Inno Setup is on this machine. Skipped silently otherwise -- the folder
+:: bundle and portable exe still work without it.
+:: --------------------------------------------------------------------------
+set "ISCC=C:\Users\Cole\AppData\Local\Programs\Inno Setup 6\ISCC.exe"
+if not exist "%ISCC%" (
+    echo.
+    echo NOTE: Inno Setup ^(ISCC.exe^) not found -- skipping installer build.
+    echo       Folder bundle and portable exe are unaffected.
+) else (
+    setlocal EnableDelayedExpansion
+    set "APP_VERSION="
+    for /f "usebackq delims=" %%v in (`powershell -NoProfile -Command "(Select-String -Path '%SCRIPT_DIR%\config.py' -Pattern '^APP_VERSION').Line -replace '.*=\s*\u0022([^\u0022]+)\u0022.*', '$1'"`) do set "APP_VERSION=%%v"
+    if "!APP_VERSION!"=="" (
+        echo.
+        echo NOTE: Could not read APP_VERSION from config.py -- skipping installer build.
+    ) else (
+        echo.
+        echo Building installer for version !APP_VERSION!...
+        "%ISCC%" "/DAppVersion=!APP_VERSION!" "/DSourceDir=%DIST_ROOT%\Plexxarr" "%SCRIPT_DIR%\packaging\installer.iss"
+        if errorlevel 1 (
+            echo.
+            echo WARNING: Installer build failed. Folder bundle and portable exe are unaffected.
+        ) else (
+            echo.
+            echo Installer: %SCRIPT_DIR%\packaging\Output\Plexxarr-!APP_VERSION!-Setup.exe
+            echo Sign it per SIGNING.md before shipping.
+        )
+    )
+    endlocal
+)
+
 echo.
 echo Build complete.
 echo Executable bundle: %DIST_ROOT%\Plexxarr
