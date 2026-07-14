@@ -69,6 +69,48 @@ def rtn_version() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Quality labels (Task F) — cam/telesync/webrip/bluray/... plus resolution,
+# derived from the SAME RTN parse the gates already ran. The label written to
+# downloads.quality_label / media_quality is this string, so CAM knowledge
+# lives in the database, not in filenames (Design stance 10).
+# ---------------------------------------------------------------------------
+
+def _scalar(value):
+    """RTN fields can be LISTS (spike item) — take the first scalar."""
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else None
+    if value is None:
+        return ""
+    text = str(value).strip()
+    return "" if text.lower() == "unknown" else text
+
+
+def quality_label_from_parsed(parsed) -> Optional[str]:
+    """'webrip-720p' / 'bluray-1080p' / 'cam' / '2160p' / None, from an RTN
+    ParsedData (or any object exposing quality/resolution)."""
+    if parsed is None:
+        return None
+    quality = _scalar(getattr(parsed, "quality", None)).lower()
+    resolution = _scalar(getattr(parsed, "resolution", None)).lower()
+    if quality and resolution:
+        return f"{quality}-{resolution}"
+    return quality or resolution or None
+
+
+def parse_quality_label(title: str) -> Optional[str]:
+    """Quality label for a release title (one RTN parse). The automatic grab
+    paths reuse the label the selection engine already derived on the chosen
+    candidate (ScoreBreakdown.quality_label); this exists for manual/legacy
+    entry points that never went through a scored decision."""
+    if not (title or "").strip():
+        return None
+    try:
+        return quality_label_from_parsed(parse(title))
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Selection modes (section 4 item 5) — declared on every decision.
 # ---------------------------------------------------------------------------
 MODE_AUTOMATIC_SINGLE = "automatic-single"
@@ -257,6 +299,9 @@ class ScoreBreakdown:
     seeders: int
     size_bytes: int
     size_distance: float      # abs(log2(size/target)); tie-break key 3
+    # Task F: the quality label from the SAME parse the gates ran, so grab
+    # time reuses it instead of re-parsing the chosen candidate.
+    quality_label: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -575,6 +620,7 @@ def _score(candidate: Candidate, want: SelectWant, parsed,
         seeders=candidate.seeders,
         size_bytes=candidate.size_bytes,
         size_distance=round(size_distance, 6),
+        quality_label=quality_label_from_parsed(parsed),
     )
 
 

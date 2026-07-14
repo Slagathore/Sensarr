@@ -618,6 +618,18 @@ def library_inventory() -> LibraryInventory:
 # Filename sanitisation
 # ---------------------------------------------------------------------------
 
+def _after_library_rename(old_path: str, new_path: str) -> None:
+    """Every library-file rename path funnels here so quality labels keep
+    following the file (Task F item 2 — media_quality.update_file_path is the
+    ONE central helper; the label itself rides the identity, this only moves
+    the file_path pointer). Never fails the rename that already happened."""
+    try:
+        import media_quality
+        media_quality.update_file_path(old_path, new_path)
+    except Exception:
+        logger.exception("media_quality file_path update failed: %s", old_path)
+
+
 def _plex_safe_name(stem: str, year: int | None, ext: str) -> str:
     """Build a Plex-friendly filename: 'Title (Year).ext'."""
     clean = _QUALITY_TAGS.sub(" ", stem)
@@ -667,6 +679,7 @@ def sanitize_filename(path: str, *, dry_run: bool = True) -> SanitizePair:
 
     if not dry_run and new_path != p:
         p.rename(new_path)
+        _after_library_rename(str(p), str(new_path))
         logger.info("Sanitized: %s → %s", p.name, new_name)
 
     return pair
@@ -791,6 +804,7 @@ def apply_sanitization(pairs: list[SanitizePair]) -> list[str]:
             continue
         try:
             src.rename(dst)
+            _after_library_rename(str(src), str(dst))
             logger.info("Renamed: %s → %s", src.name, dst.name)
         except OSError as exc:
             errors.append(f"Rename failed for {src.name}: {exc}")

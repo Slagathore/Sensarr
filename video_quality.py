@@ -50,6 +50,30 @@ def is_cam_release(name: str) -> bool:
     return CAM_RE.search(Path(name).stem) is not None
 
 
+# Task F: stored quality labels (media_quality / downloads.quality_label, the
+# lowercased RTN parse like 'cam', 'telesync', 'bluray-1080p') carry the CAM
+# verdict from the database FIRST; the name regex is the fallback for files
+# with no recorded label. Resolution-only labels ('1080p') decide nothing.
+_CAM_LABEL_PREFIXES = ("cam", "telesync", "telecine", "scr", "workprint",
+                       "pdvd")
+_CLEAN_LABEL_PREFIXES = ("bluray", "bdrip", "brrip", "remux", "web", "hdtv",
+                         "dvdrip", "hdrip")
+
+
+def label_says_cam(label: str | None) -> bool | None:
+    """The stored label's CAM verdict: True (cam-class), False (known clean
+    source), or None when the label carries no quality component (fall back
+    to the name regex)."""
+    low = (label or "").strip().lower()
+    if not low:
+        return None
+    if low.startswith(_CAM_LABEL_PREFIXES):
+        return True
+    if low.startswith(_CLEAN_LABEL_PREFIXES):
+        return False
+    return None
+
+
 def cam_markers(name: str) -> list[str]:
     """The matched cam markers in a name, cleaned up ("CAM", "TS", …)."""
     return [m.strip(" ._-[]()").upper() for m in CAM_RE.findall(Path(name).stem)]
@@ -199,6 +223,17 @@ def find_low_quality_movies(
     threshold = (config.LOW_QUALITY_MB_PER_MIN
                  if threshold_mb_min is None else threshold_mb_min)
 
+    # Task F: recorded quality labels are consulted FIRST — a file whose
+    # identity is KNOWN to be a cam is flagged even after a sanitize rename
+    # scrubbed the marker from its name, and a file with a known clean source
+    # is never false-positived by a name that happens to regex-hit.
+    try:
+        import media_quality
+        known_labels = media_quality.labels_by_path()
+    except Exception:
+        logger.exception("media_quality read failed — falling back to names.")
+        known_labels = {}
+
     # Load the entire probe cache in ONE query — the first scan pays the
     # ffprobe cost per file (persisted to SQLite), reruns and restarts only
     # probe files that are new or changed size.
@@ -222,7 +257,9 @@ def find_low_quality_movies(
             else:
                 minutes = _ASSUMED_MOVIE_MINUTES
         rate = (size / (1024 * 1024)) / (minutes or _ASSUMED_MOVIE_MINUTES)
-        scanned.append((path, name, size, rate, exact, is_cam_release(name)))
+        label_verdict = label_says_cam(known_labels.get(path))
+        cam = label_verdict if label_verdict is not None else is_cam_release(name)
+        scanned.append((path, name, size, rate, exact, cam))
 
     if new_probes:
         with db.connect() as conn:
@@ -243,6 +280,10 @@ def find_low_quality_movies(
                 continue  # fine as-is
             better = next((g[0] for g in good_versions if g[0] != path), None)
             markers = ", ".join(dict.fromkeys(cam_markers(name))) if cam else ""
+            if cam and not markers:
+                # Flagged by the recorded label, not the name (e.g. renamed
+                # since download) — surface the label as the marker.
+                markers = (known_labels.get(path) or "CAM").upper()
             results.append(LowQualityMovie(
                 path=path, name=name, size_bytes=size,
                 rate_mb_min=rate, rate_exact=exact, cam_hit=markers,

@@ -79,6 +79,15 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     # The selection_run this download came from (Task C item 6 shares one across
     # a zero-seeder race so every racer links back to the single decision).
     ("downloads", "selection_run_id", "INTEGER"),
+    # Task F: persistent quality label ('bluray-1080p', 'cam', ...) written at
+    # grab time from the RTN parse of the chosen release — CAM knowledge lives
+    # in the database, not filenames. Rides into media_quality on verified move.
+    ("downloads", "quality_label", "TEXT"),
+    # Task E retention (RESOLVED DECISION 5): keep_details exempts a run from
+    # the 90-day loser-detail prune; verdict_histogram_json is the forever
+    # rejection aggregate ({"cam_or_trash": 3, ...}) that survives pruning.
+    ("selection_runs", "keep_details", "INTEGER NOT NULL DEFAULT 0"),
+    ("selection_runs", "verdict_histogram_json", "TEXT"),
 ]
 
 _SCHEMA_HISTORY = """
@@ -125,6 +134,7 @@ class DownloadRow:
     verification_state: str | None = None
     verification_reason: str | None = None
     selection_run_id: int | None = None
+    quality_label: str | None = None
 
 
 @dataclass(frozen=True)
@@ -142,7 +152,8 @@ _DOWNLOAD_COLUMNS = (
     "staging_dir, planned_dest, planned_name, route_reason, auto_rename, "
     "auto_move, error, created_at, completed_at, show_id, season, episode, "
     "replace_path, files_json, failure_key, want_json, removed_at, "
-    "removed_reason, verification_state, verification_reason, selection_run_id"
+    "removed_reason, verification_state, verification_reason, "
+    "selection_run_id, quality_label"
 )
 
 
@@ -155,11 +166,14 @@ CREATE TABLE IF NOT EXISTS grab_deferrals (
 )
 """
 # Deferrals gained reason + next_attempt_at (Task C item 9 / Task E) so the grab
-# queue can render WHY a request is held and WHEN it will next be tried. Applied
-# via ALTER on upgrade for tables that predate the columns.
+# queue can render WHY a request is held and WHEN it will next be tried, plus
+# the candidate stats + last selection_run_id of the pass that deferred (Task E
+# item 1). Applied via ALTER on upgrade for tables that predate the columns.
 _DEFERRAL_MIGRATIONS: list[tuple[str, str, str]] = [
     ("grab_deferrals", "reason", "TEXT"),
     ("grab_deferrals", "next_attempt_at", "TEXT"),
+    ("grab_deferrals", "candidate_stats_json", "TEXT"),
+    ("grab_deferrals", "selection_run_id", "INTEGER"),
 ]
 
 # ---------------------------------------------------------------------------
@@ -347,13 +361,17 @@ def _ensure_deferral_columns(conn) -> None:
 
 
 def check_grab_deferral(key: str, *, wait_hours: float = 24.0,
-                        reason: str | None = None) -> bool:
+                        reason: str | None = None,
+                        candidate_stats: dict | None = None,
+                        selection_run_id: int | None = None) -> bool:
     """Oversize-only-result cooldown for ROUTINE grabs: first sighting
-    records the key (with an optional reason + a computed next_attempt_at) and
-    returns False (wait); once wait_hours have passed it returns True (go
-    ahead). Cleared on a successful grab. reason + next_attempt_at feed the
-    grab-queue view (Task E)."""
+    records the key (with an optional reason + a computed next_attempt_at,
+    plus the deferring pass's candidate stats and selection run when the
+    caller has them) and returns False (wait); once wait_hours have passed it
+    returns True (go ahead). Cleared on a successful grab. All the extra
+    columns feed the grab-queue view (Task E)."""
     import datetime as _dt
+    import json as _json
     now = _dt.datetime.now(_dt.timezone.utc)
     with _DL_LOCK, db.connect() as conn:
         _ensure_deferral_columns(conn)
@@ -362,10 +380,23 @@ def check_grab_deferral(key: str, *, wait_hours: float = 24.0,
         if row is None:
             next_at = (now + _dt.timedelta(hours=wait_hours)).isoformat()
             conn.execute(
-                "INSERT INTO grab_deferrals (key, reason, next_attempt_at)"
-                " VALUES (?, ?, ?)", (key, reason, next_at))
+                "INSERT INTO grab_deferrals (key, reason, next_attempt_at,"
+                " candidate_stats_json, selection_run_id) VALUES (?, ?, ?, ?, ?)",
+                (key, reason, next_at,
+                 _json.dumps(candidate_stats) if candidate_stats else None,
+                 selection_run_id))
             conn.commit()
             return False
+        # Refresh the freshest evidence on an existing deferral without
+        # resetting its clock.
+        if candidate_stats or selection_run_id is not None:
+            conn.execute(
+                "UPDATE grab_deferrals SET candidate_stats_json ="
+                " COALESCE(?, candidate_stats_json), selection_run_id ="
+                " COALESCE(?, selection_run_id) WHERE key = ?",
+                (_json.dumps(candidate_stats) if candidate_stats else None,
+                 selection_run_id, key))
+            conn.commit()
     try:
         # SQLite CURRENT_TIMESTAMP is naive UTC.
         first = _dt.datetime.fromisoformat(row[0]).replace(tzinfo=_dt.timezone.utc)
@@ -374,17 +405,91 @@ def check_grab_deferral(key: str, *, wait_hours: float = 24.0,
     return (now - first).total_seconds() >= wait_hours * 3600
 
 
+def set_grab_deferral(key: str, *, wait_hours: float = 24.0,
+                      reason: str | None = None,
+                      candidate_stats: dict | None = None,
+                      selection_run_id: int | None = None) -> None:
+    """Explicit deferral upsert (the grab-queue 'Defer' action): unlike
+    check_grab_deferral this always (re)sets the clock to now + wait_hours."""
+    import datetime as _dt
+    import json as _json
+    now = _dt.datetime.now(_dt.timezone.utc)
+    next_at = (now + _dt.timedelta(hours=wait_hours)).isoformat()
+    with _DL_LOCK, db.connect() as conn:
+        _ensure_deferral_columns(conn)
+        conn.execute(
+            "INSERT INTO grab_deferrals (key, first_seen, reason,"
+            " next_attempt_at, candidate_stats_json, selection_run_id)"
+            " VALUES (?, ?, ?, ?, ?, ?)"
+            " ON CONFLICT(key) DO UPDATE SET first_seen = excluded.first_seen,"
+            " reason = excluded.reason, next_attempt_at = excluded.next_attempt_at,"
+            " candidate_stats_json = COALESCE(excluded.candidate_stats_json,"
+            "                                 candidate_stats_json),"
+            " selection_run_id = COALESCE(excluded.selection_run_id,"
+            "                             selection_run_id)",
+            (key, now.isoformat(), reason, next_at,
+             _json.dumps(candidate_stats) if candidate_stats else None,
+             selection_run_id))
+        conn.commit()
+
+
+def _deferral_row_to_dict(row) -> dict:
+    import json as _json
+    stats = None
+    if row[4]:
+        try:
+            stats = _json.loads(row[4])
+        except (ValueError, TypeError):
+            stats = None
+    return {"key": row[0], "first_seen": row[1], "reason": row[2],
+            "next_attempt_at": row[3], "candidate_stats": stats,
+            "selection_run_id": row[5]}
+
+
 def get_grab_deferral(key: str) -> dict | None:
-    """Deferral detail (reason + next_attempt_at) for the grab-queue view."""
+    """Deferral detail (reason + next_attempt_at + candidate stats + last
+    selection run) for the grab-queue view."""
     with _DL_LOCK, db.connect() as conn:
         _ensure_deferral_columns(conn)
         row = conn.execute(
-            "SELECT key, first_seen, reason, next_attempt_at"
+            "SELECT key, first_seen, reason, next_attempt_at,"
+            " candidate_stats_json, selection_run_id"
             " FROM grab_deferrals WHERE key = ?", (key,)).fetchone()
-    if row is None:
-        return None
-    return {"key": row[0], "first_seen": row[1],
-            "reason": row[2], "next_attempt_at": row[3]}
+    return _deferral_row_to_dict(row) if row is not None else None
+
+
+def list_grab_deferrals() -> list[dict]:
+    """Every live deferral row (the grab queue joins these onto requests)."""
+    with _DL_LOCK, db.connect() as conn:
+        _ensure_deferral_columns(conn)
+        rows = conn.execute(
+            "SELECT key, first_seen, reason, next_attempt_at,"
+            " candidate_stats_json, selection_run_id"
+            " FROM grab_deferrals ORDER BY key").fetchall()
+    return [_deferral_row_to_dict(r) for r in rows]
+
+
+def deferral_expired(detail: dict | None,
+                     now_iso: str | None = None) -> bool:
+    """True when a deferral's next_attempt_at has passed (or is unreadable —
+    a broken clock must never hold a request forever)."""
+    import datetime as _dt
+    if detail is None:
+        return True
+    next_at = detail.get("next_attempt_at")
+    if not next_at:
+        return True
+    now = (_dt.datetime.fromisoformat(now_iso) if now_iso
+           else _dt.datetime.now(_dt.timezone.utc))
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=_dt.timezone.utc)
+    try:
+        when = _dt.datetime.fromisoformat(next_at)
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=_dt.timezone.utc)
+    except ValueError:
+        return True
+    return now >= when
 
 
 def clear_grab_deferral(key: str) -> None:
@@ -423,7 +528,7 @@ def _row_to_download(row) -> DownloadRow:
         replace_path=row[20], files_json=row[21], failure_key=row[22],
         want_json=row[23], removed_at=row[24], removed_reason=row[25],
         verification_state=row[26], verification_reason=row[27],
-        selection_run_id=row[28],
+        selection_run_id=row[28], quality_label=row[29],
     )
 
 
@@ -435,7 +540,7 @@ def create_download(
     show_id: int | None = None, season: int | None = None,
     episode: int | None = None, replace_path: str | None = None,
     failure_key: str | None = None, want_json: str | None = None,
-    selection_run_id: int | None = None,
+    selection_run_id: int | None = None, quality_label: str | None = None,
 ) -> int:
     initialize_downloads_db()
     with _DL_LOCK, db.connect() as conn:
@@ -445,13 +550,14 @@ def create_download(
                 (request_id, title, magnet, source, media_type, staging_dir,
                  planned_dest, planned_name, route_reason, auto_rename, auto_move,
                  show_id, season, episode, replace_path, failure_key, want_json,
-                 selection_run_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 selection_run_id, quality_label)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (request_id, title, magnet, source, media_type, staging_dir,
              planned_dest, planned_name, route_reason,
              int(auto_rename), int(auto_move), show_id, season, episode,
-             replace_path, failure_key, want_json, selection_run_id),
+             replace_path, failure_key, want_json, selection_run_id,
+             quality_label),
         )
         conn.commit()
         download_id = int(cursor.lastrowid or 0)
@@ -711,6 +817,9 @@ class SelectionRunRow:
     chosen_title: str | None
     reason: str | None
     pool_stats_json: str | None
+    # Task E retention (RESOLVED DECISION 5)
+    keep_details: bool = False
+    verdict_histogram_json: str | None = None
 
 
 @dataclass(frozen=True)
@@ -752,14 +861,22 @@ def record_selection_run(decision, *, request_id: int | None = None,
                  for i, s in enumerate(scores)}
     score_by_hash = {getattr(s, "infohash", None): s for s in scores}
 
+    # The forever rejection aggregate (Task E retention): stored at write time
+    # so pruning the per-loser detail rows can never lose the histogram.
+    histogram: dict = {}
+    for v in verdicts:
+        code = getattr(v, "reason_code", "") or ""
+        histogram[code] = histogram.get(code, 0) + 1
+
     initialize_downloads_db()
     with _DL_LOCK, db.connect() as conn:
         cursor = conn.execute(
             """
             INSERT INTO selection_runs
                 (created_at, mode, profile, rtn_version, request_id, download_id,
-                 chosen_infohash, chosen_title, reason, pool_stats_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 chosen_infohash, chosen_title, reason, pool_stats_json,
+                 verdict_histogram_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 getattr(decision, "created_at", ""),
@@ -771,6 +888,7 @@ def record_selection_run(decision, *, request_id: int | None = None,
                 getattr(decision, "chosen_title", None),
                 getattr(decision, "reason", "") or "",
                 _json.dumps(getattr(decision, "pool_stats", {}) or {}),
+                _json.dumps(histogram),
             ),
         )
         run_id = int(cursor.lastrowid or 0)
@@ -808,19 +926,28 @@ def record_selection_run(decision, *, request_id: int | None = None,
     return run_id
 
 
+_RUN_COLS = ("id, created_at, mode, profile, rtn_version, request_id, "
+             "download_id, chosen_infohash, chosen_title, reason, "
+             "pool_stats_json, keep_details, verdict_histogram_json")
+
+
+def _row_to_run(row) -> SelectionRunRow:
+    return SelectionRunRow(
+        selection_run_id=row[0], created_at=row[1], mode=row[2],
+        profile=row[3], rtn_version=row[4], request_id=row[5],
+        download_id=row[6], chosen_infohash=row[7], chosen_title=row[8],
+        reason=row[9], pool_stats_json=row[10], keep_details=bool(row[11]),
+        verdict_histogram_json=row[12])
+
+
 def get_selection_run(selection_run_id: int) -> SelectionRunRow | None:
     initialize_downloads_db()
     with _DL_LOCK, db.connect() as conn:
         row = conn.execute(
-            """
-            SELECT id, created_at, mode, profile, rtn_version, request_id,
-                   download_id, chosen_infohash, chosen_title, reason,
-                   pool_stats_json
-            FROM selection_runs WHERE id = ?
-            """,
+            f"SELECT {_RUN_COLS} FROM selection_runs WHERE id = ?",
             (selection_run_id,),
         ).fetchone()
-    return SelectionRunRow(*row) if row else None
+    return _row_to_run(row) if row else None
 
 
 def list_candidate_decisions(selection_run_id: int) -> list[CandidateDecisionRow]:
@@ -855,16 +982,134 @@ def get_selection_run_for_download(download_id: int) -> SelectionRunRow | None:
     initialize_downloads_db()
     with _DL_LOCK, db.connect() as conn:
         row = conn.execute(
-            """
-            SELECT id, created_at, mode, profile, rtn_version, request_id,
-                   download_id, chosen_infohash, chosen_title, reason,
-                   pool_stats_json
-            FROM selection_runs WHERE download_id = ?
-            ORDER BY id DESC LIMIT 1
-            """,
+            f"SELECT {_RUN_COLS} FROM selection_runs WHERE download_id = ?"
+            " ORDER BY id DESC LIMIT 1",
             (download_id,),
         ).fetchone()
-    return SelectionRunRow(*row) if row else None
+    return _row_to_run(row) if row else None
+
+
+def set_keep_details(selection_run_id: int, keep: bool = True) -> None:
+    """Per-run keep-details control (RESOLVED DECISION 5): a flagged run's
+    per-loser candidate_decisions rows are exempt from the retention prune."""
+    with _DL_LOCK, db.connect() as conn:
+        conn.execute(
+            "UPDATE selection_runs SET keep_details = ? WHERE id = ?",
+            (1 if keep else 0, selection_run_id))
+        conn.commit()
+
+
+def export_selection_run_json(selection_run_id: int) -> str | None:
+    """Full JSON export of one run — the escape hatch to save every loser's
+    forensic detail BEFORE the 90-day prune deletes it. Returns None when the
+    run does not exist."""
+    import json as _json
+    run = get_selection_run(selection_run_id)
+    if run is None:
+        return None
+    decisions = list_candidate_decisions(selection_run_id)
+
+    def _maybe_json(text):
+        if not text:
+            return None
+        try:
+            return _json.loads(text)
+        except (ValueError, TypeError):
+            return text
+
+    payload = {
+        "selection_run_id": run.selection_run_id,
+        "created_at": run.created_at,
+        "mode": run.mode,
+        "profile": run.profile,
+        "rtn_version": run.rtn_version,
+        "request_id": run.request_id,
+        "download_id": run.download_id,
+        "chosen_infohash": run.chosen_infohash,
+        "chosen_title": run.chosen_title,
+        "reason": run.reason,
+        "pool_stats": _maybe_json(run.pool_stats_json),
+        "verdict_histogram": _maybe_json(run.verdict_histogram_json),
+        "keep_details": run.keep_details,
+        "candidates": [
+            {
+                "rank_position": d.rank_position,
+                "infohash": d.infohash,
+                "title": d.title,
+                "passed": d.passed,
+                "reason_code": d.reason_code,
+                "detail": d.detail,
+                "score_total": d.score_total,
+                "score_components": _maybe_json(d.score_components_json),
+                "seeders": d.seeders,
+                "size_bytes": d.size_bytes,
+            }
+            for d in decisions
+        ],
+    }
+    return _json.dumps(payload, indent=2)
+
+
+def prune_selection_run_details(*, days: float = 90.0,
+                                now: str | None = None) -> dict:
+    """The ONE retention prune entrypoint (RESOLVED DECISION 5), run from the
+    app's daily pass.
+
+    Deletes per-LOSER candidate_decisions rows for runs older than `days`,
+    EXCEPT: runs flagged keep_details, the chosen candidate's own row, and
+    NEVER a selection_runs row (the forever receipt: wanted identity, chosen
+    release, winning breakdown, verification, timestamps) or its
+    verdict_histogram_json (the forever rejection aggregate). Runs written
+    before histograms existed get theirs computed from the detail rows and
+    stored BEFORE those rows are deleted.
+    """
+    import datetime as _dt
+    import json as _json
+    if now is None:
+        now_dt = _dt.datetime.now(_dt.timezone.utc)
+    else:
+        now_dt = _dt.datetime.fromisoformat(now)
+        if now_dt.tzinfo is None:
+            now_dt = now_dt.replace(tzinfo=_dt.timezone.utc)
+    cutoff = (now_dt - _dt.timedelta(days=days)).isoformat()
+
+    initialize_downloads_db()
+    runs_pruned = 0
+    rows_deleted = 0
+    with _DL_LOCK, db.connect() as conn:
+        runs = conn.execute(
+            "SELECT id, chosen_infohash, verdict_histogram_json"
+            " FROM selection_runs"
+            " WHERE keep_details = 0 AND created_at != ''"
+            "   AND created_at < ?", (cutoff,)).fetchall()
+        for run_id, chosen_infohash, histogram_json in runs:
+            if not histogram_json:
+                # Pre-histogram run: preserve the aggregate before deleting
+                # the only place it can still be derived from.
+                hist: dict = {}
+                for (code,) in conn.execute(
+                        "SELECT reason_code FROM candidate_decisions"
+                        " WHERE selection_run_id = ?", (run_id,)).fetchall():
+                    hist[code or ""] = hist.get(code or "", 0) + 1
+                conn.execute(
+                    "UPDATE selection_runs SET verdict_histogram_json = ?"
+                    " WHERE id = ?", (_json.dumps(hist), run_id))
+            if chosen_infohash:
+                cursor = conn.execute(
+                    "DELETE FROM candidate_decisions"
+                    " WHERE selection_run_id = ?"
+                    "   AND (infohash IS NULL OR infohash != ?)",
+                    (run_id, chosen_infohash))
+            else:
+                cursor = conn.execute(
+                    "DELETE FROM candidate_decisions"
+                    " WHERE selection_run_id = ?", (run_id,))
+            if cursor.rowcount > 0:
+                runs_pruned += 1
+                rows_deleted += cursor.rowcount
+        conn.commit()
+    return {"runs_pruned": runs_pruned, "rows_deleted": rows_deleted,
+            "cutoff": cutoff}
 
 
 # ---------------------------------------------------------------------------

@@ -249,7 +249,8 @@ class ShowsTab:
             folders = "; ".join(s.folders) if s.folders else "—"
             flags = (("🔕" if s.silenced else "")
                      + ("✅" if s.auto_grab else "")
-                     + ("🆕" if s.follow_new else ""))
+                     + ("🆕" if s.follow_new else "")
+                     + ("📏" if s.size_mode == "match_library" else ""))
             miss_pct = (f"{s.missing_count / s.episode_count * 100:.0f}%"
                         if s.episode_count else "")
             self._shows_tree.insert(
@@ -382,6 +383,14 @@ class ShowsTab:
             command=lambda: (shows_store.set_show_follow_new(show_id, not show.follow_new),
                              self.refresh()),
         )
+        menu.add_command(
+            label=("Size: use global preferences" if show.size_mode == "match_library"
+                   else "📏 Size: match existing episodes"),
+            command=lambda: (shows_store.set_show_size_mode(
+                show_id,
+                "global" if show.size_mode == "match_library" else "match_library"),
+                self.refresh()),
+        )
         menu.add_separator()
         menu.add_command(
             label="Find torrent now…",
@@ -427,6 +436,14 @@ class ShowsTab:
                    else "✅ Keep show at 100% (finish ALL missing + grab new releases)"),
             command=lambda: (shows_store.set_show_auto_grab(show.show_id, not show.auto_grab),
                              self.refresh()),
+        )
+        menu.add_command(
+            label=("Size: use global preferences" if show.size_mode == "match_library"
+                   else "📏 Size: match existing episodes"),
+            command=lambda: (shows_store.set_show_size_mode(
+                show.show_id,
+                "global" if show.size_mode == "match_library" else "match_library"),
+                self.refresh()),
         )
         menu.add_separator()
         menu.add_command(label="🧹 Send files to Sanitize (Maintenance tab)",

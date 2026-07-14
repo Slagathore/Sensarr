@@ -47,6 +47,7 @@ import shows_store
 import telegram_service
 import torrent_routing
 from download_manager import DownloadManager
+from grab_queue_tab import GrabQueueTab
 from health import format_health_report
 from shows_tab import ShowsTab
 from torrent_search import TorrentResult, format_size, search_torrents
@@ -101,18 +102,9 @@ PillowImage = Any
 
 
 def _local_ts(ts: str) -> str:
-    """Render a stored timestamp in the machine's local timezone.
-
-    Stored timestamps (SQLite CURRENT_TIMESTAMP and the explicit
-    datetime.now(timezone.utc) writes) are UTC; naive values are assumed UTC.
-    """
-    try:
-        dt = datetime.datetime.fromisoformat(ts.replace("T", " ").strip())
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=datetime.timezone.utc)
-        return dt.astimezone().strftime("%Y-%m-%d %H:%M")
-    except ValueError:
-        return ts
+    """Stored-UTC timestamp rendered local — canonical impl in ui_helpers."""
+    from ui_helpers import local_ts
+    return local_ts(ts)
 
 
 class DesktopApp:
@@ -537,9 +529,25 @@ class DesktopApp:
 
         status_tab.columnconfigure(0, weight=1)
         status_tab.rowconfigure(3, weight=1)
+        # Requests hosts two SUBTABS (Task E): the classic request list and
+        # the grab queue. The sub-notebook fills the whole tab; the classic
+        # widgets below are parented into requests_list_tab.
         requests_tab.columnconfigure(0, weight=1)
-        requests_tab.rowconfigure(1, weight=1)
-        requests_tab.rowconfigure(2, weight=0)
+        requests_tab.rowconfigure(0, weight=1)
+        requests_nb = ttk.Notebook(requests_tab)
+        requests_nb.grid(row=0, column=0, sticky="nsew")
+        requests_list_tab = ttk.Frame(requests_nb, padding=6)
+        grab_queue_frame = ttk.Frame(requests_nb, padding=6)
+        requests_nb.add(requests_list_tab, text="Requests")
+        requests_nb.add(grab_queue_frame, text="Grab queue")
+        requests_list_tab.columnconfigure(0, weight=1)
+        requests_list_tab.rowconfigure(1, weight=1)
+        requests_list_tab.rowconfigure(2, weight=0)
+        self.grab_queue_tab = GrabQueueTab(grab_queue_frame, self)
+        requests_nb.bind(
+            "<<NotebookTabChanged>>",
+            lambda _e: (self.grab_queue_tab.refresh()
+                        if requests_nb.index("current") == 1 else None))
         library_tab.columnconfigure(0, weight=1)
         library_tab.rowconfigure(2, weight=1)
         metrics_tab.columnconfigure(0, weight=1)
@@ -639,7 +647,7 @@ class DesktopApp:
         )
         self.status_text.grid(row=0, column=0, sticky="nsew")
 
-        requests_toolbar = ttk.Frame(requests_tab)
+        requests_toolbar = ttk.Frame(requests_list_tab)
         requests_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         requests_toolbar.columnconfigure(3, weight=1)
 
@@ -656,7 +664,7 @@ class DesktopApp:
         ttk.Button(requests_toolbar, text="Complete Selected", command=self.complete_selected_request).grid(row=0, column=7, padx=(0, 6))
         ttk.Button(requests_toolbar, text="Refresh", command=self.refresh_requests).grid(row=0, column=8)
 
-        requests_frame = ttk.Frame(requests_tab)
+        requests_frame = ttk.Frame(requests_list_tab)
         requests_frame.grid(row=1, column=0, sticky="nsew")
         requests_frame.columnconfigure(0, weight=1)
         requests_frame.rowconfigure(0, weight=1)
@@ -685,7 +693,7 @@ class DesktopApp:
         requests_scroll.grid(row=0, column=1, sticky="ns")
         self.requests_tree.configure(yscrollcommand=requests_scroll.set)
 
-        detail_frame = ttk.LabelFrame(requests_tab, text="Request Detail", padding=6)
+        detail_frame = ttk.LabelFrame(requests_list_tab, text="Request Detail", padding=6)
         detail_frame.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         detail_frame.columnconfigure(0, weight=1)
 
@@ -973,8 +981,8 @@ class DesktopApp:
             return
 
         # Show every request with outstanding work, including needs_identity
-        # rows so they are visible for resolution (the resolve action UI is
-        # Task A/E; note: deferred - resolve button lands with the grab queue).
+        # rows so they are visible for resolution (Resolve button here; the
+        # Grab-queue subtab offers the same action from its right-click menu).
         requests = list_requests(status="active", limit=200)
         selected = self.requests_tree.selection()
         selected_id = None
@@ -1173,6 +1181,11 @@ class DesktopApp:
         if request_id is None:
             self._show_warning("No request selected", "Select a request to resolve.")
             return
+        self.resolve_request_by_id(request_id)
+
+    def resolve_request_by_id(self, request_id: int) -> None:
+        """Resolve one request by id — shared by the Requests toolbar button
+        and the Grab-queue subtab's right-click action."""
         req = get_request(request_id)
         if req is None:
             self._show_warning("Request not found", f"Request #{request_id} is gone.")
@@ -3055,6 +3068,17 @@ class DesktopApp:
             except Exception as exc:
                 logger.exception("Daily library check failed.")
                 summary = {"checked": 0, "newly_found": 0, "errors": [str(exc)]}
+            # Task E retention: the ONE prune entrypoint rides the daily pass.
+            # Loser detail rows older than 90 days go; receipts + histograms
+            # stay forever (RESOLVED DECISION 5).
+            try:
+                pruned = downloads_store.prune_selection_run_details()
+                if pruned.get("rows_deleted"):
+                    logger.info("Selection retention: pruned %s loser row(s) "
+                                "across %s run(s).", pruned["rows_deleted"],
+                                pruned["runs_pruned"])
+            except Exception:
+                logger.exception("Selection retention prune failed.")
             self._post_to_ui(lambda: self._handle_daily_check_result(summary, silent=silent))
             # Piggyback the app-update check on the nightly pass.
             try:

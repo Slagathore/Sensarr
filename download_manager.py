@@ -35,9 +35,11 @@ from typing import Any, Callable
 import config
 import downloads_store
 import media_identity
+import media_quality
 import queue_store
 import show_tracker
 import shows_store
+import size_match
 import torrent_routing
 import torrent_select
 import verification
@@ -251,12 +253,16 @@ class _AdoptResult:
 def _build_want_snapshot(
     result: TorrentResult, req, *, request_title: str | None,
     show_id: int | None, season: int | None, episode: int | None,
-    minutes: float | None,
+    minutes: float | None, identity: MediaIdentity | None = None,
 ) -> dict:
     """Freeze what this grab is meant to satisfy: the MediaIdentity + the
     season/episode target + the size prefs, at grab time. Stored immutably in
     downloads.want_json; verification/reconciliation/restart READ this instead
     of re-deriving intent from the mutable request row (or the torrent title).
+
+    `identity` supplies the MediaIdentity for grabs with NO request row (the
+    identity-aware replacement path, Task F item 4) — the request row wins
+    when both exist, because it is what the user actually asked for.
     """
     pref, max_rate, _default_minutes = _size_prefs(result.media_type)
     identity_source = getattr(req, "identity_source", None) if req else None
@@ -265,6 +271,13 @@ def _build_want_snapshot(
     canonical_year = getattr(req, "canonical_year", None) if req else None
     origin_countries = list(getattr(req, "origin_countries", []) or []) if req else []
     aliases = list(getattr(req, "aliases", []) or []) if req else []
+    if req is None and identity is not None:
+        identity_source = identity.identity_source
+        external_id = identity.external_id
+        canonical_title = identity.canonical_title
+        canonical_year = identity.canonical_year
+        origin_countries = list(identity.origin_countries or ())
+        aliases = list(identity.aliases or ())
     # The season target: an explicit episode_context wins, else the request's
     # season, else none.
     want_season = season if season is not None else (
@@ -288,6 +301,33 @@ def _build_want_snapshot(
         "size_max_rate": max_rate,
         "runtime_minutes": minutes,
     }
+
+
+# Verified per-movie folder tag (Task D2) — the offline identity evidence the
+# replacement path reads back (Task F item 4).
+_TMDB_TAG_RE = re.compile(r"\{tmdb-(\d+)\}")
+_FOLDER_YEAR_RE = re.compile(r"\((\d{4})\)")
+
+
+def identity_from_movie_path(path: str) -> MediaIdentity | None:
+    """Resolve a movie's MediaIdentity from its managed per-movie folder name
+    (`Title (Year) {tmdb-12345}` — RESOLVED DECISION 4 guarantees the tag was
+    verified when written). Checks the parent folder first, then the file stem.
+    Returns None when no tag is present — never a guessed identity."""
+    p = Path(path)
+    for candidate in (p.parent.name, p.stem):
+        m = _TMDB_TAG_RE.search(candidate or "")
+        if not m:
+            continue
+        base = _TMDB_TAG_RE.sub("", candidate).strip()
+        ym = _FOLDER_YEAR_RE.search(base)
+        year = int(ym.group(1)) if ym else None
+        title = _FOLDER_YEAR_RE.sub("", base).strip(" .-_") or None
+        return MediaIdentity(
+            media_type="movie", identity_source="tmdb",
+            external_id=m.group(1), canonical_title=title,
+            canonical_year=year)
+    return None
 
 
 def _movie_route_identity(req) -> tuple[str | None, int | None, str | None]:
@@ -546,6 +586,9 @@ class DownloadManager:
         # and when a slow download was last rotated (sorts it to the back).
         self._progress_seen: dict[int, tuple[float, float]] = {}
         self._rotate_cooldown: dict[int, float] = {}
+        # Task G: one derived SizePick per show PER PASS (the library sample is
+        # re-read at the start of each auto-grab pass, not on every candidate).
+        self._size_pick_cache: dict[int, size_match.SizePick] = {}
         downloads_store.initialize_downloads_db()
         self._recover_previous_session()
         threading.Thread(target=self._queue_monitor, name="dl-queue-monitor",
@@ -567,10 +610,17 @@ class DownloadManager:
         season_context: tuple[int, int] | None = None,  # (show_id, season) for a pack
         replace_path: str | None = None,  # old low-quality file to delete after move
         failure_key: str | None = None,   # failure-memory context for pack grabs
+        quality_label: str | None = None,  # Task F: from the decision's parse
+        identity_override: MediaIdentity | None = None,  # want identity w/o a request
     ) -> int:
         """Start downloading a search result. Returns the download row id."""
         auto_rename = config.TORRENT_AUTO_RENAME if auto_rename is None else auto_rename
         auto_move = config.TORRENT_AUTO_MOVE if auto_move is None else auto_move
+        # Task F: the automatic paths hand in the label the selection engine
+        # already parsed on the chosen candidate; manual/legacy entry points
+        # fall back to one RTN parse of the release title here.
+        if quality_label is None:
+            quality_label = torrent_select.parse_quality_label(result.title)
 
         show_id = season = episode = None
         req = get_request(request_id) if request_id is not None else None
@@ -595,6 +645,14 @@ class DownloadManager:
             )
         elif result.media_type == "movie":
             mt, my, mtmdb = _movie_route_identity(req)
+            if req is None and identity_override is not None:
+                # Identity-aware replacement (Task F item 4): the resolved
+                # identity drives the per-movie folder exactly like a request.
+                mt = identity_override.canonical_title
+                my = identity_override.canonical_year
+                mtmdb = (str(identity_override.external_id)
+                         if (identity_override.identity_source == "tmdb"
+                             and identity_override.external_id) else None)
             plan = torrent_routing.plan_route(
                 result.title, result.media_type, request_title=request_title,
                 movie_title=mt, movie_year=my, movie_tmdb_id=mtmdb)
@@ -611,7 +669,8 @@ class DownloadManager:
             req is not None and result.media_type == "movie") else None
         want = _build_want_snapshot(
             result, req, request_title=request_title,
-            show_id=show_id, season=season, episode=episode, minutes=minutes)
+            show_id=show_id, season=season, episode=episode, minutes=minutes,
+            identity=identity_override)
 
         download_id = downloads_store.create_download(
             title=result.title, magnet=result.magnet, source=result.source,
@@ -623,7 +682,7 @@ class DownloadManager:
             auto_rename=auto_rename, auto_move=auto_move,
             show_id=show_id, season=season, episode=episode,
             replace_path=replace_path, failure_key=failure_key,
-            want_json=json.dumps(want),
+            want_json=json.dumps(want), quality_label=quality_label,
         )
         if episode_context is not None:
             shows_store.set_episode_grab(
@@ -1028,11 +1087,18 @@ class DownloadManager:
 
     @staticmethod
     def _oversize_gate(seeded: list[TorrentResult], media_type: str, key: str,
-                       *, minutes: float | None = None) -> bool:
+                       *, minutes: float | None = None,
+                       pref_override: float | None = None) -> bool:
         """Routine-grab size discipline: when EVERY viable option is >20%
         over the preferred size, wait a day (keyed cooldown) and only then
-        allow it. Returns True when grabbing may proceed now."""
+        allow it. Returns True when grabbing may proceed now.
+
+        `pref_override` is the Task G match-library preference (MB/min) — the
+        1.2x OVERSIZE DEFERRAL then anchors on the show's own derived target,
+        distinct from the 1.8x hard max the selection gate enforces."""
         pref, _mx, default_minutes = _size_prefs(media_type)
+        if pref_override and pref_override > 0:
+            pref = pref_override
         if pref <= 0 or not seeded:
             downloads_store.clear_grab_deferral(key)
             return True
@@ -1040,7 +1106,11 @@ class DownloadManager:
         if any(r.size_bytes <= target * 1.2 for r in seeded):
             downloads_store.clear_grab_deferral(key)
             return True
-        if downloads_store.check_grab_deferral(key):
+        # note: deferred - the oversize deferral records its reason but not
+        # candidate_stats/selection_run_id (the run row does not exist yet at
+        # gate time); the blocked-candidate deferral path carries both.
+        if downloads_store.check_grab_deferral(
+                key, reason="oversize: every result is >120% of the preferred size"):
             logger.info("Oversize deferral expired for %s — proceeding.", key)
             return True
         logger.info("Only oversized results for %s (>120%% of preference) — "
@@ -1494,6 +1564,18 @@ class DownloadManager:
         )
         return decision, by_hash
 
+    @staticmethod
+    def _quality_label_for(decision, result) -> str | None:
+        """The quality label the engine already parsed on this candidate
+        (Task F: reuse the decision's parse instead of re-parsing at grab)."""
+        if result is None or decision is None:
+            return None
+        ih = torrent_select.infohash_from_magnet(getattr(result, "magnet", ""))
+        for s in getattr(decision, "scores", ()) or ():
+            if ih and s.infohash == ih:
+                return s.quality_label
+        return None
+
     def _want_from_request(self, req, media_type: str, *, mode: str,
                            season: int | None = None,
                            episode: int | None = None,
@@ -1534,7 +1616,9 @@ class DownloadManager:
                                season: int | None, episode: int | None,
                                minutes: float | None, mode: str) -> SelectWant:
         """SelectWant for a tracked-show episode/season grab, keyed on the
-        show's identity from tracked_shows (source + external_id)."""
+        show's identity from tracked_shows (source + external_id). A show with
+        size_mode='match_library' gets its derived preference applied here
+        (Task G) so EVERY automatic path through this want honours it."""
         pref, max_rate, default_minutes = _size_prefs(show.media_type)
         identity = MediaIdentity(
             media_type=show.media_type,
@@ -1545,10 +1629,60 @@ class DownloadManager:
             season=season,
             episode=episode,
         )
-        return SelectWant(
+        want = SelectWant(
             identity=identity, size_pref_mb_min=pref, size_max_rate=max_rate,
             runtime_minutes=minutes, fallback_minutes=default_minutes,
             allow_cam=not config.BLOCK_CAMS, mode=mode)
+        want, _meta = self._apply_size_override(want, show)
+        return want
+
+    # ------------------------------------------------------------------
+    # Task G — per-show "match my existing sizes" override
+    # ------------------------------------------------------------------
+
+    def _size_pick_for_show(self, show) -> size_match.SizePick | None:
+        """The derived SizePick for a match_library show (cached per pass);
+        None when the show is absent or on the global mode."""
+        if show is None or getattr(show, "size_mode",
+                                   size_match.SIZE_MODE_GLOBAL) \
+                != size_match.SIZE_MODE_MATCH_LIBRARY:
+            return None
+        cached = self._size_pick_cache.get(show.show_id)
+        if cached is not None:
+            return cached
+
+        def _junk(name: str) -> bool:
+            return bool(verification._SAMPLE_RE.search(name)
+                        or verification._EXTRA_NAME_RE.search(name))
+
+        sizes = size_match.eligible_episode_sizes(
+            shows_store.list_episodes(show.show_id),
+            video_exts=torrent_routing.VIDEO_EXTENSIONS, is_junk_name=_junk)
+        _pref, _mx, default_minutes = _size_prefs(show.media_type)
+        # The SAME minutes value the want uses for target conversion — the
+        # derived MB/min round-trips back to the sampled median exactly.
+        minutes = _runtime_minutes(show) or default_minutes
+        pick = size_match.pick_from_sizes(sizes, minutes)
+        self._size_pick_cache[show.show_id] = pick
+        return pick
+
+    def _apply_size_override(self, want: SelectWant,
+                             show) -> tuple[SelectWant, dict | None]:
+        """Apply a show's match-library size derivation to a want.
+
+        Pref := the library mode; hard max := 1.8 x mode (House of the Dragon
+        at 2.5 GB keeps grabbing 2.5 GB regardless of the global TV cap). On a
+        fallback (too few files / no runtime) the global knobs stay and only
+        the flagged meta is returned. Returns (want, pick_meta_or_None)."""
+        pick = self._size_pick_for_show(show)
+        if pick is None:
+            return want, None
+        if not pick.ok:
+            return want, pick.meta()  # global fallback, flagged in pick_meta
+        from dataclasses import replace as _dc_replace
+        want = _dc_replace(want, size_pref_mb_min=pick.mb_per_min,
+                           size_max_rate=pick.mb_per_min * 1.8)
+        return want, pick.meta()
 
     def _grab_season_pack(self, title: str, media_type: str, season: int,
                           ep_count: int, *, request_id: int | None,
@@ -1602,6 +1736,14 @@ class DownloadManager:
         want = self._want_from_request(
             req, media_type, mode=torrent_select.MODE_AUTOMATIC_SEASON_PACK,
             season=season, runtime_override=season_minutes)
+        # Task G: a match-library show's derived MB/min replaces the global
+        # pref/max; the season target multiplies through season_minutes
+        # (ep_count x per-episode runtime), so packs scale automatically.
+        want, size_meta = self._apply_size_override(want, show)
+        if size_meta is not None:
+            pool_stats["size_match"] = size_meta
+        size_pick = self._size_pick_for_show(show)
+        pref_override = size_pick.mb_per_min if (size_pick and size_pick.ok) else None
         decision, by_hash = self._run_selection(
             viable, want, failure_key=key, pool_stats=pool_stats)
         chosen = by_hash.get(decision.chosen_infohash) if decision.chosen else None
@@ -1610,7 +1752,9 @@ class DownloadManager:
             return []
         survivors = [by_hash[s.infohash] for s in decision.scores
                      if s.infohash in by_hash]
-        if not self._oversize_gate(survivors, media_type, key, minutes=season_minutes):
+        if not self._oversize_gate(survivors, media_type, key,
+                                   minutes=season_minutes,
+                                   pref_override=pref_override):
             downloads_store.record_selection_run(decision, request_id=request_id)
             return []
         # Route the pack by show_id when we have an identity-backed show (Task D
@@ -1619,7 +1763,8 @@ class DownloadManager:
         season_context = (show.show_id, season) if show is not None else None
         download_id = self.grab(chosen, request_id=request_id, request_title=title,
                                 auto_rename=True, auto_move=True,
-                                failure_key=key, season_context=season_context)
+                                failure_key=key, season_context=season_context,
+                                quality_label=self._quality_label_for(decision, chosen))
         downloads_store.record_selection_run(
             decision, request_id=request_id, download_id=download_id)
         logger.info("Season-pack grab: '%s' S%02d → download #%s (%s)",
@@ -1735,6 +1880,12 @@ class DownloadManager:
         want = self._want_for_show_episode(
             show, ep.season, ep.episode, minutes,
             torrent_select.MODE_AUTOMATIC_EPISODE)
+        # Task G: record the match-library derivation (or its flagged
+        # fallback) on the decision so pick_meta explains the size rules.
+        size_pick = self._size_pick_for_show(show)
+        if size_pick is not None:
+            pool_stats["size_match"] = size_pick.meta()
+        pref_override = size_pick.mb_per_min if (size_pick and size_pick.ok) else None
         key = f"ep:{show.show_id}:{ep.season}:{ep.episode}"
         decision, by_hash = self._run_selection(
             viable, want, failure_key=key, pool_stats=pool_stats)
@@ -1757,13 +1908,15 @@ class DownloadManager:
                     survivors, show.media_type, minutes=minutes,
                     request_id=request_id,
                     episode_context=(show.show_id, ep.season, ep.episode))
-        if not self._oversize_gate(survivors, show.media_type, key, minutes=minutes):
+        if not self._oversize_gate(survivors, show.media_type, key,
+                                   minutes=minutes, pref_override=pref_override):
             downloads_store.record_selection_run(decision, request_id=request_id)
             return []
         download_id = self.grab(
             chosen, request_id=request_id,
             episode_context=(show.show_id, ep.season, ep.episode),
-            auto_rename=True, auto_move=True)
+            auto_rename=True, auto_move=True,
+            quality_label=self._quality_label_for(decision, chosen))
         downloads_store.record_selection_run(
             decision, request_id=request_id, download_id=download_id)
         logger.info("Auto-grabbed %s → download #%s (%s, %s seeders)",
@@ -1780,6 +1933,14 @@ class DownloadManager:
         double-protects against any 'open' row that lacks a qualified identity.
         """
         started: list[int] = []
+        self._size_pick_cache.clear()  # Task G: fresh library sample per pass
+        # Task E: user-deferred requests whose next_attempt_at has passed come
+        # back to 'open' before this pass scans the open set.
+        try:
+            import grab_queue
+            grab_queue.reopen_expired_deferrals()
+        except Exception:
+            logger.exception("Deferral reopen sweep failed.")
         # Visible, logged reason for skipping identity-less rows.
         pending_identity = list_requests(
             status=queue_store.STATUS_NEEDS_IDENTITY, limit=200)
@@ -1834,13 +1995,17 @@ class DownloadManager:
                 pool_stats=dict(pool.pool_stats))
             chosen = by_hash.get(decision.chosen_infohash) if decision.chosen else None
             if chosen is None:
-                downloads_store.record_selection_run(decision, request_id=req.request_id)
+                run_id = downloads_store.record_selection_run(
+                    decision, request_id=req.request_id)
                 # Task C item 9: if a viable release existed but was BLOCKED
-                # (subject-scoped), defer a day with a reason + next-attempt
-                # (persisted for Task E) rather than hammering every 5 minutes.
+                # (subject-scoped), defer a day with a reason + next-attempt +
+                # the pass's candidate stats and run id (persisted for the
+                # Task E grab queue) rather than hammering every 5 minutes.
                 if any(v.reason_code == "blocklisted" for v in decision.verdicts):
                     downloads_store.check_grab_deferral(
-                        key, reason="last viable candidate blocked")
+                        key, reason="last viable candidate blocked",
+                        candidate_stats=decision.verdict_histogram(),
+                        selection_run_id=run_id)
                 logger.info("Request #%s (%s): no acceptable result this pass — "
                             "will retry on the next auto-grab cycle.",
                             req.request_id, query)
@@ -1864,6 +2029,7 @@ class DownloadManager:
                 continue
             download_id = self.grab(
                 chosen, request_id=req.request_id, request_title=query,
+                quality_label=self._quality_label_for(decision, chosen),
             )
             downloads_store.record_selection_run(
                 decision, request_id=req.request_id, download_id=download_id)
@@ -1902,6 +2068,7 @@ class DownloadManager:
                                 show_ids: list[int] | None = None) -> list[int]:
         limit = config.SHOWS_GRAB_LIMIT_PER_PASS if limit is None else limit
         started: list[int] = []
+        self._size_pick_cache.clear()  # Task G: fresh library sample per pass
 
         for show in shows_store.list_shows():
             if len(started) >= limit:
@@ -2007,7 +2174,8 @@ class DownloadManager:
             # the single winner that is allowed to move.
             did = self.grab(r, request_id=request_id, request_title=request_title,
                             episode_context=episode_context,
-                            auto_rename=False, auto_move=False)
+                            auto_rename=False, auto_move=False,
+                            quality_label=self._quality_label_for(decision, r))
             downloads_store.link_download_to_run(did, run_id)
             ids.append(did)
         logger.info("Zero-seeder race started (run #%s): %d candidate(s) %s",
@@ -2101,7 +2269,8 @@ class DownloadManager:
     # Quality replacement — swap a cam/low-bitrate movie for a proper one
     # ------------------------------------------------------------------
 
-    def replace_low_quality_movie(self, title_query: str, old_path: str) -> int | None:
+    def replace_low_quality_movie(self, title_query: str, old_path: str,
+                                  identity: MediaIdentity | None = None) -> int | None:
         """Search for a NON-cam release of a movie and download it; the old
         file is deleted automatically once the new one lands in the library.
 
@@ -2109,7 +2278,19 @@ class DownloadManager:
         that's what we're replacing), never size 0, and at least the
         low-quality threshold in MB/min so we don't swap junk for junk.
         Returns the download id, or None when nothing acceptable was found.
+
+        Identity (Task F item 4): an explicit MediaIdentity wins; otherwise it
+        is resolved offline from the per-movie folder's verified {tmdb-ID} tag
+        when present. A resolved identity flows into the want snapshot (so
+        verification + the per-movie folder route by it) and the verified move
+        writes an identity-keyed media_quality update. When it stays
+        unresolved, the grab proceeds on the title alone and the quality
+        write is marked source='manual-unresolved' — no identity-keyed update
+        is claimed. (The library index stores no provider ids, so the folder
+        tag is the only offline evidence.)
         """
+        if identity is None:
+            identity = identity_from_movie_path(old_path)
         try:
             pool = search_collect(title_query, "movie")
         except Exception:
@@ -2135,11 +2316,12 @@ class DownloadManager:
         viable = [r for r in pool.results
                   if r.size_bytes >= floor_bytes and r.seeders > 0]
         pref, max_rate, default_minutes = _size_prefs("movie")
-        # note: deferred - Task F/Phase 6 gives replacement a real MediaIdentity
-        # (media_identity + old_path -> replacement); today it only has the
-        # title query, so the want carries canonical_title but no external id.
+        # Resolved identity (folder tag or caller) drives the gates; the
+        # unresolved fallback keeps the title-only guard of the old shape.
+        want_identity = identity if identity is not None else MediaIdentity(
+            media_type="movie", canonical_title=title_query)
         want = SelectWant(
-            identity=MediaIdentity(media_type="movie", canonical_title=title_query),
+            identity=want_identity,
             size_pref_mb_min=pref, size_max_rate=max_rate,
             runtime_minutes=minutes, fallback_minutes=default_minutes,
             allow_cam=False,  # always block cams — that's what we're replacing
@@ -2154,6 +2336,8 @@ class DownloadManager:
         download_id = self.grab(
             chosen, request_title=title_query,
             auto_rename=True, auto_move=True, replace_path=old_path,
+            quality_label=self._quality_label_for(decision, chosen),
+            identity_override=identity,
         )
         downloads_store.record_selection_run(decision, download_id=download_id)
         logger.info("Replacement grab for %s → download #%s (%s)",
@@ -2670,6 +2854,23 @@ class DownloadManager:
                         after=f"name already taken by another file of this "
                               f"download — kept as {cand.name}")
                     target = cand
+                if (target.exists() and row.replace_path
+                        and str(target) == str(row.replace_path)):
+                    # The planned destination IS the low-quality file this
+                    # download was grabbed to REPLACE (same canonical name in
+                    # the same per-movie folder). Retire it now — recycle bin
+                    # first — so the verified replacement can land; checked
+                    # BEFORE the same-size/duplicate branches so the old copy
+                    # can never win by colliding with its own replacement.
+                    try:
+                        from send2trash import send2trash
+                        send2trash(str(target))
+                    except Exception:
+                        target.unlink(missing_ok=True)
+                    downloads_store.add_history(
+                        download_id, "replaced", before=str(target),
+                        after="old low-quality copy recycled to make room "
+                              "for its replacement")
                 if target.exists():
                     try:
                         same_size = target.stat().st_size == src.stat().st_size
@@ -2809,6 +3010,13 @@ class DownloadManager:
                         shows_store.set_episode_file(
                             row.show_id, row.season, int(f.parsed_episode),
                             f.final_path)
+            # Task F: persist this release's quality label onto the QUALIFIED
+            # identity for every verified placed file — the label now rides
+            # the identity, not the filename, and survives later renames.
+            try:
+                self._record_quality_labels(row, want_dict)
+            except Exception:
+                logger.exception("media_quality write failed for #%s", download_id)
             # A per-movie folder created without a verified TMDB tag stays
             # visible for later metadata repair (Task D2 item 1).
             if getattr(plan, "missing_folder_id", False):
@@ -2831,6 +3039,63 @@ class DownloadManager:
                 queue_store.set_status(row.request_id,
                                        queue_store.STATUS_NEEDS_ATTENTION)
         return f"processed (no move) — planned: {plan.describe()}"
+
+    def _record_quality_labels(self, row: downloads_store.DownloadRow,
+                               want_dict: dict | None) -> None:
+        """Task F verified-move hook: write media_quality for every VERIFIED
+        placed gating file. Movies key on the qualified provider identity from
+        the frozen want; a movie with NO qualified identity (the unresolved
+        manual replacement shape) is path-keyed and marked manual-unresolved —
+        an identity-keyed update is never claimed for it. Episodes key on the
+        internal (show_id, season, episode) coordinates. The label is the one
+        parsed at grab time (downloads.quality_label), so cause and provenance
+        stay tied to the release that supplied the file."""
+        label = row.quality_label or torrent_select.parse_quality_label(row.title)
+        if label is None:
+            return
+        cause = "replacement" if row.replace_path else "verified_move"
+        placed = [f for f in downloads_store.list_download_files(row.download_id)
+                  if f.verification_state == "verified" and f.final_path
+                  and f.media_role in (verification.ROLE_PRIMARY_VIDEO,
+                                       verification.ROLE_EPISODE)]
+        if not placed:
+            return
+
+        media_type = (want_dict or {}).get("media_type") or row.media_type
+        if media_type == "movie":
+            primary = max(placed, key=lambda f: f.size_bytes or 0)
+            source = (want_dict or {}).get("identity_source")
+            ext = (want_dict or {}).get("external_id")
+            if source and ext:
+                media_quality.record_quality(
+                    media_quality.movie_identity_key(source, str(ext)),
+                    quality_label=label, file_path=primary.final_path,
+                    media_type="movie", identity_source=source,
+                    external_id=str(ext),
+                    source=media_quality.SOURCE_PARSED, cause=cause)
+            else:
+                media_quality.record_quality(
+                    media_quality.path_identity_key(primary.final_path),
+                    quality_label=label, file_path=primary.final_path,
+                    media_type="movie",
+                    source=media_quality.SOURCE_MANUAL_UNRESOLVED, cause=cause)
+            return
+
+        if row.show_id is None:
+            return  # unlinked episodic payload — no durable identity to key
+        for f in placed:
+            season = f.parsed_season if f.parsed_season is not None else row.season
+            episode = (f.parsed_episode if f.parsed_episode is not None
+                       else row.episode)
+            if season is None or episode is None:
+                continue
+            media_quality.record_quality(
+                media_quality.episode_identity_key(
+                    row.show_id, int(season), int(episode)),
+                quality_label=label, file_path=f.final_path,
+                media_type=media_type, show_id=row.show_id,
+                season=int(season), episode=int(episode),
+                source=media_quality.SOURCE_PARSED, cause=cause)
 
     @staticmethod
     def _episode_stem_for_file(

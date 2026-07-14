@@ -9,11 +9,29 @@
 #                          frames, no image asset needed).
 # =============================================================================
 
+import datetime as _datetime
 import re
 import tkinter as tk
 from tkinter import ttk
 
 import config
+
+
+def local_ts(ts: str) -> str:
+    """Render a stored timestamp in the machine's local timezone.
+
+    Stored timestamps (SQLite CURRENT_TIMESTAMP and the explicit
+    datetime.now(timezone.utc) writes) are UTC; naive values are assumed UTC.
+    Shared by every tab that displays a stored time (desktop_app._local_ts
+    delegates here).
+    """
+    try:
+        dt = _datetime.datetime.fromisoformat(ts.replace("T", " ").strip())
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_datetime.timezone.utc)
+        return dt.astimezone().strftime("%Y-%m-%d %H:%M")
+    except ValueError:
+        return ts
 
 _NUMERIC_RE = re.compile(r"^\s*-?\d+(?:\.\d+)?\s*%?\s*$")   # "42", "3.5", "17%"
 _FRACTION_RE = re.compile(r"^\s*(\d+)\s*/\s*(\d+)\s*$")  # "123/321" have-counts

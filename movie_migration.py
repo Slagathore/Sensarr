@@ -240,6 +240,12 @@ def _perform_move(old: Path, new: Path) -> None:
         raise FileExistsError(f"destination already exists: {new}")
     new.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(old), str(new))
+    # Task F: quality labels follow the file through the ONE central helper.
+    try:
+        import media_quality
+        media_quality.update_file_path(str(old), str(new))
+    except Exception:
+        logger.exception("media_quality file_path update failed: %s", old)
 
 
 def execute_run(run_id: str, *, on_progress=None) -> dict:

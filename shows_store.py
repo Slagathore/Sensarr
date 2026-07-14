@@ -87,6 +87,13 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     # Real per-show episode runtime (minutes) — anchors MB/min size math
     # instead of the flat 30-minute assumption. anime_db/TMDB fill it at sync.
     ("tracked_shows", "runtime_min", "REAL"),
+    # Task G — per-show size override. 'global' uses the SIZE_* knobs;
+    # 'match_library' derives the preference from the show's own existing
+    # episode files (size_match.pick_from_sizes). NOTE: the ALTER identifiers
+    # here are static literals — never interpolate user input into them.
+    ("tracked_shows", "size_mode", "TEXT NOT NULL DEFAULT 'global'"),
+    # Reserved manual override (MB/min); no UI yet by design.
+    ("tracked_shows", "size_mb_min_override", "REAL"),
 ]
 
 
@@ -122,6 +129,8 @@ class TrackedShow:
     follow_new: bool = False
     follow_since: str | None = None
     runtime_min: float | None = None
+    size_mode: str = "global"          # global | match_library (Task G)
+    size_mb_min_override: float | None = None  # reserved, no UI yet
 
 
 @dataclass(frozen=True)
@@ -244,7 +253,7 @@ def list_shows() -> list[TrackedShow]:
                             (SELECT MIN(e.air_date) FROM episodes e WHERE e.show_id = s.id
                                  AND e.air_date IS NOT NULL AND e.air_date > ?)),
                    s.next_season, s.next_episode, s.tmdb_id, s.silenced, s.auto_grab, s.follow_new, s.follow_since,
-                   s.runtime_min
+                   s.runtime_min, s.size_mode, s.size_mb_min_override
             FROM tracked_shows s ORDER BY s.title COLLATE NOCASE
             """,
             (today, today),
@@ -265,6 +274,7 @@ def list_shows() -> list[TrackedShow]:
             next_air_date=r[13], next_season=r[14], next_episode=r[15],
             tmdb_id=r[16], silenced=bool(r[17]), auto_grab=bool(r[18]),
             follow_new=bool(r[19]), follow_since=r[20], runtime_min=r[21],
+            size_mode=r[22] or "global", size_mb_min_override=r[23],
         )
         for r in rows
     ]
@@ -429,6 +439,17 @@ def merge_shows(primary_id: int, duplicate_ids: list[int]) -> int:
             merged += 1
         conn.commit()
     return merged
+
+
+def set_show_size_mode(show_id: int, size_mode: str) -> None:
+    """Per-show size override (Task G): 'global' uses the SIZE_* knobs,
+    'match_library' derives the preference from the show's existing files."""
+    if size_mode not in ("global", "match_library"):
+        raise ValueError(f"unknown size_mode: {size_mode!r}")
+    with _SHOWS_LOCK, db.connect() as conn:
+        conn.execute("UPDATE tracked_shows SET size_mode = ? WHERE id = ?",
+                     (size_mode, show_id))
+        conn.commit()
 
 
 def set_show_runtime(show_id: int, runtime_min: float | None) -> None:
