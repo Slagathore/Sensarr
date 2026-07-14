@@ -70,8 +70,8 @@ def main() -> int:
               "the bundle will use its own fresh database!")
 
     for cache in ("anidb_titles.dat.gz", "trackers_cache.txt",
-                  "anime_meta.sqlite", "maintenance_cache.pkl",
-                  "library_lowqual.pkl", "watchlist_recs.pkl",
+                  "anime_meta.sqlite", "maintenance_cache.json",
+                  "library_lowqual.json", "watchlist_recs.json",
                   "unidentified_folders.json"):
         src = REPO / cache
         if src.is_file():

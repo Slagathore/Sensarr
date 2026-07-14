@@ -357,6 +357,8 @@ def _ensure_deferral_columns(conn) -> None:
         "PRAGMA table_info(grab_deferrals)").fetchall()}
     for _t, col, col_def in _DEFERRAL_MIGRATIONS:
         if col not in existing:
+            # Interpolated identifiers come from the static _DEFERRAL_MIGRATIONS
+            # literals above — never feed these user-supplied values.
             conn.execute(f"ALTER TABLE grab_deferrals ADD COLUMN {col} {col_def}")
 
 
@@ -513,6 +515,9 @@ def initialize_downloads_db() -> None:
         for table, column, col_def in (_MIGRATIONS + _DEFERRAL_MIGRATIONS):
             existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
             if existing and column not in existing:
+                # Interpolated identifiers come from the static _MIGRATIONS /
+                # _DEFERRAL_MIGRATIONS literals above — never feed these
+                # user-supplied values.
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_def}")
         conn.commit()
 

@@ -101,6 +101,8 @@ def _apply_migrations(conn) -> None:
     for table, column, col_def in _MIGRATIONS:
         existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
         if existing and column not in existing:
+            # Interpolated identifiers come from the static _MIGRATIONS
+            # literals above — never feed these user-supplied values.
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_def}")
 
 

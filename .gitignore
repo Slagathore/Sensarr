@@ -63,11 +63,14 @@ Thumbs.db
 anidb_titles.dat.gz
 trackers_cache.txt
 maintenance_cache.pkl
+maintenance_cache.json
 library_lowqual.pkl
+library_lowqual.json
 anime_meta.sqlite
 anime_meta.sqlite-*
 unidentified_folders.json
 watchlist_recs.pkl
+watchlist_recs.json
 plexxarr.pid
 
 # Private audit notes, never commit

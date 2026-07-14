@@ -140,7 +140,8 @@ def stage_self_update(info: UpdateInfo, on_status=None) -> str:
     install_dir = Path(config.APP_DIR)
     bat = work / "apply_update.bat"
     # Everything the USER owns stays: .env, SQLite databases (requests,
-    # shows, downloads), pickled caches, the anime metadata DB, pid lock.
+    # shows, downloads), JSON scan caches (plus any pickle-era leftovers),
+    # the anime metadata DB, pid lock.
     bat.write_text(
         "@echo off\r\n"
         f"echo Waiting for {config.APP_PRODUCT_NAME} to close...\r\n"
@@ -150,7 +151,8 @@ def stage_self_update(info: UpdateInfo, on_status=None) -> str:
         f"echo Installing v{info.version}...\r\n"
         f"robocopy \"{src_dir}\" \"{install_dir}\" /E /R:3 /W:2 "
         "/XF .env *.db *.db-shm *.db-wal *.pkl *.sqlite *.sqlite-* "
-        "plexxarr.pid unidentified_folders.json trackers_cache.txt\r\n"
+        "plexxarr.pid unidentified_folders.json trackers_cache.txt "
+        "maintenance_cache.json library_lowqual.json watchlist_recs.json\r\n"
         f"start \"\" \"{install_dir / exe_name}\"\r\n"
         f"rmdir /S /Q \"{work}\"\r\n",
         encoding="ascii", errors="replace",

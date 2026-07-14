@@ -165,19 +165,26 @@ class WatchlistTab:
     # Data
     # ------------------------------------------------------------------
 
+    # JSON, not pickle (Task S item 1): the cache dir is user-writable and
+    # the app runs elevated — a cache file must never be able to run code.
+    _RECS_CACHE_VERSION = 1
+
     def _recs_cache_path(self):
         from pathlib import Path
-        return Path(config.APP_DIR) / "watchlist_recs.pkl"
+        return Path(config.APP_DIR) / "watchlist_recs.json"
 
     def _load_persisted_recs(self) -> None:
         """Last fetch survives restarts — the tab is never empty if recs
-        have EVER been generated. Get Recommendations refreshes."""
-        import pickle
+        have EVER been generated. Get Recommendations refreshes. A malformed
+        or pickle-era cache file is a cache miss, never an error."""
+        import json_cache
+        from plex_api import Recommendation
+        payload = json_cache.load_json_cache(
+            self._recs_cache_path(), version=self._RECS_CACHE_VERSION,
+            dataclass_types=(Recommendation,))
+        if not isinstance(payload, dict):
+            return
         try:
-            path = self._recs_cache_path()
-            if not path.is_file():
-                return
-            payload = pickle.loads(path.read_bytes())
             self._recs_all = payload.get("recs", [])
             self._top_genres = payload.get("genres", [])
             if self._top_genres:
@@ -189,18 +196,18 @@ class WatchlistTab:
                 f"Loaded last recommendations (from {payload.get('at', '?')}) — "
                 "Get Recommendations refreshes.")
         except Exception:
-            logger.debug("Persisted recs load failed.", exc_info=True)
+            logger.debug("Persisted recs render failed.", exc_info=True)
 
     def _persist_recs(self) -> None:
         import datetime
-        import pickle
-        try:
-            self._recs_cache_path().write_bytes(pickle.dumps({
-                "recs": self._recs_all, "genres": self._top_genres,
-                "at": datetime.datetime.now().strftime("%b %d %H:%M"),
-            }))
-        except Exception:
-            logger.debug("Persisted recs save failed.", exc_info=True)
+        from pathlib import Path
+        import json_cache
+        json_cache.save_json_cache(
+            self._recs_cache_path(),
+            {"recs": self._recs_all, "genres": self._top_genres,
+             "at": datetime.datetime.now().strftime("%b %d %H:%M")},
+            version=self._RECS_CACHE_VERSION,
+            legacy_paths=[Path(config.APP_DIR) / "watchlist_recs.pkl"])
 
     def _load_accounts(self) -> None:
         def worker() -> None:

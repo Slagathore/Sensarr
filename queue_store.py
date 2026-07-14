@@ -215,6 +215,9 @@ def initialize_queue_db() -> None:
 
         for col_name, col_def in (_V2_COLUMNS + _V3_COLUMNS):
             if col_name not in existing_cols:
+                # Interpolated identifiers come from the static _V2/_V3
+                # column literals above — never feed these user-supplied
+                # values.
                 conn.execute(
                     f"ALTER TABLE requests ADD COLUMN {col_name} {col_def}"
                 )

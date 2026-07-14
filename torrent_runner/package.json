@@ -5,6 +5,6 @@
   "description": "Headless webtorrent downloader used by PlexResetButton's download pipeline",
   "type": "module",
   "dependencies": {
-    "webtorrent": "^2.5.1"
+    "webtorrent": "2.8.5"
   }
 }

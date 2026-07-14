@@ -25,8 +25,9 @@ from plex_auth import (PlexPinSession, PlexTokenResult, launch_auth_browser,
                        wait_for_plex_token)
 from plex_control import get_status, hard_reset, is_plex_running, launch_plex
 from maintenance import (
-    DuplicateGroup, JunkFile, LibraryInventory, SanitizePair, ShowInventory,
-    UnindexedFile, apply_sanitization, daily_library_check,
+    DuplicateGroup, JunkFile, LibraryInventory, MissingEpisode,
+    MissingEpisodesReport, MovieInventory, SanitizePair, SeasonSummary,
+    ShowInventory, UnindexedFile, apply_sanitization, daily_library_check,
     delete_files_with_cleanup, find_duplicates, find_junk_files,
     find_missing_episodes, find_unindexed_files, library_inventory,
     media_type_for_path, sanitize_all, sanitize_filename,
@@ -41,6 +42,8 @@ from telegram_service import TelegramBotService
 import anime_db
 import auth_store
 import downloads_store
+import json_cache
+import maint_jobs
 import movie_migration
 import request_intake
 import shows_store
@@ -136,6 +139,10 @@ class DesktopApp:
         # Run auth migrations even when the Telegram bot isn't configured —
         # the Users tab reads these tables regardless.
         auth_store.initialize_auth_db()
+        # Maintenance run journal (Task I): create the table and mark any
+        # run persisted as running/queued by a previous process interrupted —
+        # never pretend a daemon thread survived a restart.
+        maint_jobs.initialize_maint_jobs_db()
 
         self.status_var = tk.StringVar(value="Starting...")
         self.bot_status_var = tk.StringVar(value="Telegram bot: starting")
@@ -170,6 +177,25 @@ class DesktopApp:
         self._maint_load_cache()
         self._maint_tree: ttk.Treeview | None = None
         self._maint_status_var = tk.StringVar(value="Select a tool to run.")
+        # Task I: every Maintenance tool runs through the process-wide job
+        # registry — one at a time, journalled in SQLite, cancellable, and
+        # the UI rebuilds its progress display from the registry on demand
+        # (so a tab switch never loses a run).
+        self._maint_registry = maint_jobs.get_registry()
+        self._maint_registry.subscribe(self._on_maint_job_event)
+        self._maint_job_indicator_var = tk.StringVar(value="")
+        self._maint_banner_var = tk.StringVar(value="")
+        self._maint_phase_var = tk.StringVar(value="")
+        self._maint_elapsed_var = tk.StringVar(value="")
+        self._maint_queue_var = tk.StringVar(value="")
+        self._maint_progressbar: ttk.Progressbar | None = None
+        self._maint_cancel_btn: ttk.Button | None = None
+        self._maint_banner_label: ttk.Label | None = None
+        self._maint_bar_indeterminate = False
+        self._maint_tick_scheduled = False
+        # Job ids submitted by the overnight idle pass — popups stay
+        # suppressed until the last of them finishes.
+        self._maint_idle_pending: set[int] = set()
         # Typed rows for re-rendering after a filter toggle.
         # Each entry: (media_type_tag, row_values, action_payload).
         # action_payload is opaque per-tool — for find_duplicates it's the
@@ -453,6 +479,11 @@ class DesktopApp:
         ttk.Label(header, textvariable=self.last_action_var).grid(row=3, column=0, sticky="w", pady=(4, 0))
         ttk.Label(header, textvariable=self.queue_var).grid(row=4, column=0, sticky="w", pady=(4, 0))
         ttk.Label(header, textvariable=self.library_var).grid(row=5, column=0, sticky="w", pady=(4, 0))
+        # Task I item 5: a running maintenance job stays visible OUTSIDE the
+        # Maintenance tab — this header line shows label + live counts and
+        # clears itself when the registry goes idle.
+        ttk.Label(header, textvariable=self._maint_job_indicator_var,
+                  foreground=_DOT_AMBER).grid(row=6, column=0, sticky="w", pady=(4, 0))
 
         # Ko-fi support link — sits above the action buttons.
         kofi_row = ttk.Frame(self.root, padding=(16, 0, 16, 4))
@@ -520,6 +551,15 @@ class DesktopApp:
         self._downloads_tab = downloads_tab
         self._maintenance_tab = maintenance_tab
         self._settings_tab = settings_tab
+        # Task I item 5: returning to the Maintenance tab repaints the
+        # progress strip from the job registry — a run started earlier is
+        # still there, mid-run, with live counts.
+        notebook.bind(
+            "<<NotebookTabChanged>>",
+            lambda _e: (self._maint_sync_from_registry()
+                        if notebook.select() == str(maintenance_tab)
+                        else None),
+            add="+")
         self._build_downloads_tab(downloads_tab)
         self._build_users_tab(users_tab)
         # Tabs split out of this class into their own modules — the pattern
@@ -553,7 +593,7 @@ class DesktopApp:
         metrics_tab.columnconfigure(0, weight=1)
         metrics_tab.rowconfigure(1, weight=1)
         maintenance_tab.columnconfigure(0, weight=1)
-        # Row 2 now holds the filter row; the results tree moves to row 3 (set below).
+        # Rows: 0 toolbar, 1 status, 2 progress strip, 3 filters, 4 results.
         logs_tab.columnconfigure(0, weight=1)
         logs_tab.rowconfigure(0, weight=1)
 
@@ -743,6 +783,8 @@ class DesktopApp:
              "moves; every move is journalled and reversible."),
             ("Unindexed Files", self._run_unindexed,
              "Files on disk that aren't in the local search index yet — fix with Reindex."),
+            # note: deferred — Reindex reuses the Library tab's rebuild flow
+            # (its own status reporting), not a registry job yet.
             ("Reindex", self.rebuild_library_index_from_ui,
              "Rebuild the local file index used by /search and the Library tab."),
             ("🔄 Re-run", self._maint_rerun_current,
@@ -760,10 +802,49 @@ class DesktopApp:
         ttk.Label(maintenance_tab, textvariable=self._maint_status_var,
                   font=("Segoe UI", 11, "bold")).grid(row=1, column=0, sticky="w", pady=(0, 6))
 
+        # Task I: run progress strip — an HONEST progressbar (determinate
+        # with counts where the tool can count, indeterminate + phase +
+        # ticking elapsed where it can't; never a fake percentage), a Cancel
+        # button, the visible queue, and a persistent result banner. All of
+        # it repaints from the job registry, so tab switches lose nothing.
+        progress_row = ttk.Frame(maintenance_tab)
+        progress_row.grid(row=2, column=0, sticky="ew", pady=(0, 4))
+        progress_row.columnconfigure(1, weight=1)
+        self._maint_progressbar = ttk.Progressbar(
+            progress_row, orient=tk.HORIZONTAL, mode="determinate",
+            length=220)
+        self._maint_progressbar.grid(row=0, column=0, sticky="w")
+        ttk.Label(progress_row, textvariable=self._maint_phase_var).grid(
+            row=0, column=1, sticky="w", padx=(8, 0))
+        ttk.Label(progress_row, textvariable=self._maint_elapsed_var,
+                  foreground=_MUTED_TEXT).grid(row=0, column=2, sticky="e",
+                                               padx=(8, 0))
+        self._maint_cancel_btn = ttk.Button(
+            progress_row, text="Cancel", command=self._maint_cancel_current,
+            state=tk.DISABLED)
+        self._maint_cancel_btn.grid(row=0, column=3, padx=(8, 0))
+        add_tooltip(self._maint_cancel_btn,
+                    "Cooperative cancel — the run stops at its next "
+                    "checkpoint and the summary says how far it got.")
+        history_btn = ttk.Button(progress_row, text="Run history",
+                                 command=self._maint_open_run_history)
+        history_btn.grid(row=0, column=4, padx=(6, 0))
+        add_tooltip(history_btn,
+                    "Every maintenance run ever journalled — state, timing, "
+                    "progress, and summary survive app restarts.")
+        ttk.Label(progress_row, textvariable=self._maint_queue_var,
+                  foreground=_MUTED_TEXT).grid(row=1, column=0, columnspan=3,
+                                               sticky="w", pady=(2, 0))
+        self._maint_banner_label = ttk.Label(
+            progress_row, textvariable=self._maint_banner_var,
+            font=("Segoe UI", 9, "bold"))
+        self._maint_banner_label.grid(row=2, column=0, columnspan=5,
+                                      sticky="w", pady=(2, 0))
+
         # Media-type filter checkboxes — toggle these to hide/show rows by tag
         # without re-running the tool.
         filter_row = ttk.Frame(maintenance_tab)
-        filter_row.grid(row=2, column=0, sticky="ew", pady=(0, 4))
+        filter_row.grid(row=3, column=0, sticky="ew", pady=(0, 4))
         ttk.Label(filter_row, text="Show:").pack(side=tk.LEFT, padx=(0, 6))
         maint_tags = [("movie", "Movies"), ("tv", "TV"), ("anime", "Anime")]
         if config.XANIME_ENABLED:
@@ -790,11 +871,13 @@ class DesktopApp:
                     "Pick exactly ONE library type above first. Nothing is "
                     "renamed until you Apply Selected.")
 
-        # Adjust the tab's row layout: results frame moves to row 3.
-        maintenance_tab.rowconfigure(3, weight=1)
+        # Adjust the tab's row layout: results frame lives on row 4 (rows 2/3
+        # hold the progress strip + filter row).
+        maintenance_tab.rowconfigure(4, weight=1)
         maintenance_tab.rowconfigure(2, weight=0)
+        maintenance_tab.rowconfigure(3, weight=0)
         maint_results_frame = ttk.Frame(maintenance_tab)
-        maint_results_frame.grid(row=3, column=0, sticky="nsew")
+        maint_results_frame.grid(row=4, column=0, sticky="nsew")
         maint_results_frame.columnconfigure(0, weight=1)
         maint_results_frame.rowconfigure(0, weight=1)
 
@@ -1762,30 +1845,46 @@ class DesktopApp:
                 paths.append(values[-1])
         return paths
 
-    _LIB_LOWQUAL_CACHE_FILE = "library_lowqual.pkl"
+    # JSON, not pickle (Task S item 1) — same reasoning as the maintenance
+    # cache: a plantable cache file must never execute in this process.
+    _LIB_LOWQUAL_CACHE_VERSION = 1
+    _LIB_LOWQUAL_CACHE_FILE = "library_lowqual.json"
+    _LIB_LOWQUAL_CACHE_LEGACY = "library_lowqual.pkl"
 
     def _lib_lowqual_cache_path(self) -> Path:
         return Path(config.APP_DIR) / self._LIB_LOWQUAL_CACHE_FILE
 
+    def _lib_lowqual_save_cache(self, results: list[Any], scanned: int) -> None:
+        json_cache.save_json_cache(
+            self._lib_lowqual_cache_path(),
+            {"results": results, "scanned": scanned,
+             "at": datetime.datetime.now().strftime("%b %d %H:%M")},
+            version=self._LIB_LOWQUAL_CACHE_VERSION,
+            legacy_paths=[Path(config.APP_DIR) / self._LIB_LOWQUAL_CACHE_LEGACY])
+
+    def _lib_lowqual_load_cache(self) -> dict[str, Any] | None:
+        from video_quality import LowQualityMovie
+        payload = json_cache.load_json_cache(
+            self._lib_lowqual_cache_path(),
+            version=self._LIB_LOWQUAL_CACHE_VERSION,
+            dataclass_types=(LowQualityMovie,))
+        return payload if isinstance(payload, dict) else None
+
     def _lib_search_lowqual(self) -> None:
-        import pickle
         # First click shows the persisted result from the last scan (survives
         # restarts); clicking again while that cached view is up re-scans.
         # Re-scans are cheap anyway: ffprobe runtimes live in SQLite, so only
         # new/changed files get probed.
         if not getattr(self, "_lib_lowqual_showing_cache", False):
-            try:
-                path = self._lib_lowqual_cache_path()
-                if path.is_file():
-                    payload = pickle.loads(path.read_bytes())
-                    self._lib_lowqual_showing_cache = True
-                    self._lib_render_lowqual(payload["results"], payload["scanned"])
-                    self._lib_status_var.set(
-                        self._lib_status_var.get()
-                        + f"  (cached {payload['at']} — click again to re-scan)")
-                    return
-            except Exception:
-                logger.debug("Low-quality cache load failed.", exc_info=True)
+            payload = self._lib_lowqual_load_cache()
+            if payload is not None:
+                self._lib_lowqual_showing_cache = True
+                self._lib_render_lowqual(payload.get("results", []),
+                                         payload.get("scanned", 0))
+                self._lib_status_var.set(
+                    self._lib_status_var.get()
+                    + f"  (cached {payload.get('at', '?')} — click again to re-scan)")
+                return
         self._lib_lowqual_showing_cache = False
         self._lib_status_var.set("Scanning movies for cams and low-bitrate files…")
 
@@ -1807,14 +1906,7 @@ class DesktopApp:
                 logger.exception("Low-quality scan failed.")
                 self._post_to_ui(lambda: self._lib_status_var.set(f"Scan failed: {exc}"))
                 return
-            import pickle
-            try:
-                self._lib_lowqual_cache_path().write_bytes(pickle.dumps({
-                    "results": results, "scanned": len(movies),
-                    "at": datetime.datetime.now().strftime("%b %d %H:%M"),
-                }))
-            except Exception:
-                logger.debug("Low-quality cache save failed.", exc_info=True)
+            self._lib_lowqual_save_cache(results, len(movies))
             self._post_to_ui(lambda: self._lib_render_lowqual(results, len(movies)))
 
         threading.Thread(target=worker, name="lib-lowqual", daemon=True).start()
@@ -2719,11 +2811,9 @@ class DesktopApp:
     # Maintenance tab — UI helpers
     # =====================================================================
 
-    def _maint_set_busy(self, label: str) -> None:
-        self._maint_status_var.set(f"Running {label}...")
-        if self._maint_tree is not None:
-            for item in self._maint_tree.get_children():
-                self._maint_tree.delete(item)
+    # Note: the old _maint_set_busy (which CLEARED the results tree and set a
+    # bare string) is gone — Task I item 5. The registry's "started" event
+    # sets the status, and the tree keeps its last results through a run.
 
     def _maint_require_library_paths(self, tool_label: str) -> bool:
         """
@@ -2850,34 +2940,39 @@ class DesktopApp:
         self._maint_tool_name = ""
         runner()
 
-    _MAINT_CACHE_VERSION = 2
-    _MAINT_CACHE_FILE = "maintenance_cache.pkl"
+    # Version 3 = the JSON format (Task S item 1 killed the pickle cache;
+    # versions 1-2 were pickle-era and load as a miss).
+    _MAINT_CACHE_VERSION = 3
+    _MAINT_CACHE_FILE = "maintenance_cache.json"
+    _MAINT_CACHE_LEGACY = "maintenance_cache.pkl"
+    # Dataclasses that may appear in cached results/typed_rows — the JSON
+    # decoder reconstructs ONLY these; anything else rejects the cache.
+    _MAINT_CACHE_TYPES = (
+        DuplicateGroup, SanitizePair, MissingEpisode, SeasonSummary,
+        MissingEpisodesReport, UnindexedFile, JunkFile, ShowInventory,
+        MovieInventory, LibraryInventory,
+    )
 
     def _maint_cache_path(self) -> Path:
         return Path(config.APP_DIR) / self._MAINT_CACHE_FILE
 
     def _maint_save_cache(self) -> None:
         """Persist tool results to disk so a 30k-file walk survives an app
-        restart. Best-effort: a failed save just means a re-run later."""
-        import pickle
-        try:
-            payload = {"version": self._MAINT_CACHE_VERSION, "cache": self._maint_cache}
-            self._maint_cache_path().write_bytes(pickle.dumps(payload))
-        except Exception:
-            logger.debug("Maintenance cache save failed.", exc_info=True)
+        restart. Best-effort: a failed save just means a re-run later.
+        JSON on purpose — a cache file must never be able to execute code
+        in this (elevated) process."""
+        json_cache.save_json_cache(
+            self._maint_cache_path(), self._maint_cache,
+            version=self._MAINT_CACHE_VERSION,
+            legacy_paths=[Path(config.APP_DIR) / self._MAINT_CACHE_LEGACY])
 
     def _maint_load_cache(self) -> None:
-        import pickle
-        try:
-            path = self._maint_cache_path()
-            if not path.is_file():
-                return
-            payload = pickle.loads(path.read_bytes())
-            if payload.get("version") == self._MAINT_CACHE_VERSION:
-                self._maint_cache = payload.get("cache", {})
-                logger.info("Maintenance cache loaded: %s", ", ".join(self._maint_cache))
-        except Exception:
-            logger.debug("Maintenance cache load failed (stale format?).", exc_info=True)
+        cache = json_cache.load_json_cache(
+            self._maint_cache_path(), version=self._MAINT_CACHE_VERSION,
+            dataclass_types=self._MAINT_CACHE_TYPES)
+        if isinstance(cache, dict) and cache:
+            self._maint_cache = cache
+            logger.info("Maintenance cache loaded: %s", ", ".join(self._maint_cache))
 
     def _apply_maint_filter(self) -> None:
         """
@@ -2952,45 +3047,41 @@ class DesktopApp:
                 "the filter bar so the cleanup targets a single library.")
             return
         media_type = active[0]
-        self._maint_set_busy(f"Combo Clean preview ({media_type})")
 
-        def worker() -> None:
-            try:
-                from maintenance import build_combo_renames
-                pairs = build_combo_renames(media_type)
-            except Exception as exc:
-                logger.exception("Combo Clean preview failed.")
-                self._post_to_ui(
-                    lambda: self._maint_status_var.set(f"Combo Clean error: {exc}"))
-                return
+        def job(progress, cancel_check) -> Any:
+            from maintenance import build_combo_renames
+            progress(phase=f"Building combo-clean renames for {media_type}…")
+            pairs = build_combo_renames(media_type)
+            return maint_jobs.JobResult(
+                summary={"renames_proposed": len(pairs)}, result=pairs)
 
-            def render() -> None:
-                self._maint_tool_name = "custom_rename"
-                self._maint_results = pairs
-                if not pairs:
-                    self._maint_status_var.set(
-                        f"Combo Clean: nothing to rename in {media_type} — "
-                        "names are already clean.")
-                    self._populate_maint_tree(
-                        [], col1="Current name", col2="New name", col3="")
-                    return
-                self._maint_status_var.set(
-                    f"Combo Clean: {len(pairs)} file(s) in {media_type} would "
-                    "be renamed. Review, tick, then Apply Selected.")
-                typed_rows = [
-                    (media_type,
-                     ("", Path(pr.original).name, Path(pr.sanitized).name, ""),
-                     pr, 0)
-                    for pr in pairs
-                ]
-                self._populate_maint_tree(
-                    [], col1="Current name", col2="New name", col3="",
-                    check_label="Rename?", typed_rows=typed_rows,
-                )
-            self._post_to_ui(render)
+        self._maint_submit("combo_clean", f"Combo Clean preview ({media_type})",
+                           job, meta={"media_type": media_type})
 
-        threading.Thread(target=worker, name="maint-combo-clean",
-                         daemon=True).start()
+    def _handle_combo_clean_result(self, job, pairs: list[SanitizePair]) -> None:
+        media_type = job.meta.get("media_type", "mixed")
+        self._maint_tool_name = "custom_rename"
+        self._maint_results = pairs
+        if not pairs:
+            self._maint_status_var.set(
+                f"Combo Clean: nothing to rename in {media_type} — "
+                "names are already clean.")
+            self._populate_maint_tree(
+                [], col1="Current name", col2="New name", col3="")
+            return
+        self._maint_status_var.set(
+            f"Combo Clean: {len(pairs)} file(s) in {media_type} would "
+            "be renamed. Review, tick, then Apply Selected.")
+        typed_rows = [
+            (media_type,
+             ("", Path(pr.original).name, Path(pr.sanitized).name, ""),
+             pr, 0)
+            for pr in pairs
+        ]
+        self._populate_maint_tree(
+            [], col1="Current name", col2="New name", col3="",
+            check_label="Rename?", typed_rows=typed_rows,
+        )
 
     def _grab_missing_selected(self, gaps: list[tuple]) -> None:
         """Missing Episodes -> Apply Selected: search + download each checked
@@ -3056,21 +3147,326 @@ class DesktopApp:
             self._maint_tree.item(item, values=vals)
 
     # =====================================================================
+    # Maintenance tab — job registry plumbing (Task I)
+    # =====================================================================
+
+    def _maint_submit(self, tool_key: str, label: str, fn,
+                      *, meta: dict[str, Any] | None = None,
+                      dedupe: bool = True):
+        """Queue a tool run on the shared registry. One job runs at a time;
+        anything else queues visibly (RESOLVED DECISION 8)."""
+        current = self._maint_registry.current_job()
+        job = self._maint_registry.submit(tool_key, label, fn, meta=meta,
+                                          dedupe=dedupe)
+        if current is not None and job.state == "queued":
+            self._maint_status_var.set(
+                f"Queued: {label} (waiting for {current.label})")
+        return job
+
+    def _on_maint_job_event(self, event: str, job) -> None:
+        """Registry listener — fires on the worker thread; marshal to Tk."""
+        self._post_to_ui(lambda: self._maint_job_event_ui(event, job))
+
+    def _maint_job_event_ui(self, event: str, job) -> None:
+        if self._quitting:
+            return
+        if event == "started":
+            self._maint_status_var.set(f"Running {job.label}...")
+            self._maint_phase_var.set(job.phase or "Working…")
+            self._maint_set_bar(job)
+            self._maint_start_elapsed_tick()
+            if self._maint_cancel_btn is not None:
+                self._maint_cancel_btn.configure(state=tk.NORMAL)
+        elif event == "progress":
+            self._maint_set_bar(job)
+            phase = job.phase or "Working…"
+            if job.progress_total:
+                phase += f"  ({job.progress_current or 0}/{job.progress_total})"
+            self._maint_phase_var.set(phase)
+        elif event == "cancel_requested":
+            self._maint_phase_var.set(
+                f"{job.phase or 'Working…'}  (cancelling…)")
+        elif event == "finished":
+            self._maint_job_finished_ui(job)
+        elif event == "idle":
+            # Queue drained — rest the progress strip (the banner stays).
+            self._maint_bar_idle()
+            self._maint_phase_var.set("")
+            if self._maint_cancel_btn is not None:
+                self._maint_cancel_btn.configure(state=tk.DISABLED)
+        self._maint_update_queue_label()
+
+    def _maint_set_bar(self, job) -> None:
+        """Honest progressbar: determinate with real counts, indeterminate
+        motion otherwise — never a made-up percentage."""
+        bar = self._maint_progressbar
+        if bar is None:
+            return
+        if job.progress_total:
+            if self._maint_bar_indeterminate:
+                bar.stop()
+                bar.configure(mode="determinate")
+                self._maint_bar_indeterminate = False
+            bar.configure(maximum=job.progress_total,
+                          value=job.progress_current or 0)
+        elif not self._maint_bar_indeterminate:
+            bar.configure(mode="indeterminate")
+            bar.start(80)
+            self._maint_bar_indeterminate = True
+
+    def _maint_bar_idle(self) -> None:
+        bar = self._maint_progressbar
+        if bar is None:
+            return
+        if self._maint_bar_indeterminate:
+            bar.stop()
+            bar.configure(mode="determinate")
+            self._maint_bar_indeterminate = False
+        bar.configure(value=0, maximum=100)
+
+    def _maint_start_elapsed_tick(self) -> None:
+        if not self._maint_tick_scheduled:
+            self._maint_tick_scheduled = True
+            self._maint_elapsed_tick()
+
+    def _maint_elapsed_tick(self) -> None:
+        job = self._maint_registry.current_job()
+        if job is None or self._quitting:
+            self._maint_elapsed_var.set("")
+            self._maint_tick_scheduled = False
+            return
+        secs = int(job.elapsed_seconds() or 0)
+        self._maint_elapsed_var.set(f"{secs // 60}:{secs % 60:02d} elapsed")
+        self.root.after(1000, self._maint_elapsed_tick)
+
+    def _maint_update_queue_label(self) -> None:
+        current, queued = self._maint_registry.snapshot()
+        if queued:
+            names = ", ".join(j.label for j in queued[:3])
+            if len(queued) > 3:
+                names += f", … +{len(queued) - 3}"
+            self._maint_queue_var.set(f"Queued ({len(queued)}): {names}")
+        else:
+            self._maint_queue_var.set("")
+        # Header indicator — visible from every tab.
+        if current is None and not queued:
+            self._maint_job_indicator_var.set("")
+        elif current is None:
+            self._maint_job_indicator_var.set(
+                f"🛠 Maintenance: {len(queued)} job(s) queued")
+        else:
+            text = f"🛠 Maintenance: {current.label} running"
+            if current.progress_total:
+                text += f" ({current.progress_current or 0}/{current.progress_total})"
+            if queued:
+                text += f" — {len(queued)} queued"
+            self._maint_job_indicator_var.set(text)
+
+    def _maint_sync_from_registry(self) -> None:
+        """Repaint the progress strip from the registry — called on tab
+        select so a run started before the tab switch is still shown live."""
+        current, _queued = self._maint_registry.snapshot()
+        if current is not None:
+            self._maint_status_var.set(f"Running {current.label}...")
+            phase = current.phase or "Working…"
+            if current.progress_total:
+                phase += (f"  ({current.progress_current or 0}"
+                          f"/{current.progress_total})")
+            self._maint_phase_var.set(phase)
+            self._maint_set_bar(current)
+            self._maint_start_elapsed_tick()
+            if self._maint_cancel_btn is not None:
+                self._maint_cancel_btn.configure(state=tk.NORMAL)
+        else:
+            self._maint_bar_idle()
+            self._maint_phase_var.set("")
+            if self._maint_cancel_btn is not None:
+                self._maint_cancel_btn.configure(state=tk.DISABLED)
+        self._maint_update_queue_label()
+
+    def _maint_cancel_current(self) -> None:
+        job = self._maint_registry.current_job()
+        if job is None:
+            queued = self._maint_registry.queued_jobs()
+            if not queued:
+                return
+            job = queued[0]
+        self._maint_registry.request_cancel(job.job_id)
+
+    def _maint_job_finished_ui(self, job) -> None:
+        """Completion path: persistent banner, status, result rendering,
+        journal already written, toast when the window isn't focused.
+        Failures are as loud as successes."""
+        if self._maint_registry.current_job() is None:
+            self._maint_bar_idle()
+            self._maint_phase_var.set("")
+            if self._maint_cancel_btn is not None:
+                self._maint_cancel_btn.configure(state=tk.DISABLED)
+
+        finished_local = _local_ts(job.finished_at or "")
+        if job.state == "done":
+            summary_bits = ", ".join(
+                f"{k.replace('_', ' ')}: {v}"
+                for k, v in (job.summary or {}).items() if k != "note")
+            banner = f"✔ {job.label} finished {finished_local}"
+            if summary_bits:
+                banner += f" — {summary_bits}"
+            color = _DOT_GREEN
+            toast = f"{job.label} finished. {summary_bits}".strip()
+        elif job.state == "cancelled":
+            msg = (job.summary or {}).get("message", "cancelled")
+            banner = f"⏹ {job.label} {msg} ({finished_local})"
+            color = _DOT_AMBER
+            toast = f"{job.label}: {msg}"
+            self._maint_status_var.set(f"{job.label}: {msg}")
+        else:  # failed
+            err = (job.error or {}).get("message", "unknown error")
+            banner = f"✖ {job.label} FAILED {finished_local} — {err}"
+            color = _DOT_RED
+            toast = f"{job.label} failed: {err}"
+            self._maint_status_var.set(f"{job.label} failed: {err}")
+
+        self._maint_banner_var.set(banner)
+        if self._maint_banner_label is not None:
+            self._maint_banner_label.configure(foreground=color)
+        if not job.meta.get("idle"):
+            self._notify_if_unfocused(f"Plexxarr — {job.label}", toast)
+
+        if job.state == "done":
+            try:
+                self._maint_dispatch_result(job)
+            except Exception:
+                logger.exception("Result handler failed for %s.", job.tool_key)
+                self._maint_status_var.set(
+                    f"{job.label}: result rendering failed (see log)")
+
+        # Idle-pass bookkeeping: popups stay suppressed until the last
+        # overnight job is done.
+        if job.job_id in self._maint_idle_pending:
+            self._maint_idle_pending.discard(job.job_id)
+            if not self._maint_idle_pending:
+                self._maint_popups_ok = True
+                self._maint_status_var.set(
+                    "Overnight pre-cache finished — every tool below opens "
+                    "instantly from cache. 🔄 Re-run refreshes any of them.")
+                logger.info("Idle pre-cache pass finished.")
+
+    def _maint_dispatch_result(self, job) -> None:
+        """Route a completed job's in-memory result to its render handler."""
+        handlers = {
+            "daily_check": self._handle_daily_check_job,
+            "library_inventory": self._handle_library_inventory_result,
+            "find_duplicates": self._handle_duplicates_result,
+            "sanitize": self._handle_sanitize_result,
+            "sanitize_show": self._handle_sanitize_result,
+            "clean_junk": self._handle_junk_result,
+            "missing_episodes": self._handle_missing_episodes_result,
+            "unindexed": self._handle_unindexed_result,
+            "movie_migration": lambda res: self._handle_movie_migration_plan(*res),
+            "combo_clean": lambda res: self._handle_combo_clean_result(job, res),
+        }
+        handler = handlers.get(job.tool_key)
+        if handler is None:
+            return
+        if job.tool_key == "daily_check":
+            handler(job)
+        else:
+            handler(job.result)
+
+    def _notify_if_unfocused(self, title: str, message: str) -> None:
+        """Tray toast when the window is hidden or another app has focus —
+        matches the existing pystray tray-icon pattern (no new deps)."""
+        try:
+            focused = (self.root.winfo_viewable()
+                       and self.root.focus_displayof() is not None)
+        except Exception:
+            focused = False
+        if focused:
+            return
+        try:
+            self._tray_icon.notify(message, title)
+        except Exception:
+            logger.debug("Tray notification failed.", exc_info=True)
+
+    def _maint_open_run_history(self) -> None:
+        """Run history — the journalled maintenance_jobs rows, newest first."""
+        win = tk.Toplevel(self.root)
+        win.title("Maintenance run history")
+        win.geometry("860x420")
+        win.transient(self.root)
+        win.columnconfigure(0, weight=1)
+        win.rowconfigure(0, weight=1)
+        tree = ttk.Treeview(
+            win, columns=("tool", "state", "started", "duration", "progress",
+                          "summary"),
+            show="headings")
+        for col, text, width, stretch in (
+                ("tool", "Tool", 170, False), ("state", "State", 90, False),
+                ("started", "Started", 130, False),
+                ("duration", "Duration", 80, False),
+                ("progress", "Progress", 90, False),
+                ("summary", "Summary / Error", 320, True)):
+            tree.heading(col, text=text)
+            tree.column(col, width=width, anchor=tk.W, stretch=stretch)
+        tree.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+        scroll = ttk.Scrollbar(win, orient=tk.VERTICAL, command=tree.yview)
+        scroll.grid(row=0, column=1, sticky="ns", pady=10)
+        tree.configure(yscrollcommand=scroll.set)
+        make_sortable(tree)
+
+        import json as _json
+        rows = self._maint_registry.history(limit=200)
+        for row in rows:
+            started = _local_ts(row["started_at"]) if row["started_at"] else "—"
+            duration = "—"
+            if row["started_at"] and row["finished_at"]:
+                try:
+                    fmt = "%Y-%m-%d %H:%M:%S"
+                    delta = (datetime.datetime.strptime(row["finished_at"], fmt)
+                             - datetime.datetime.strptime(row["started_at"], fmt))
+                    duration = f"{int(delta.total_seconds())}s"
+                except ValueError:
+                    pass
+            progress = ""
+            if row["progress_total"]:
+                progress = f"{row['progress_current'] or 0}/{row['progress_total']}"
+            detail = ""
+            for blob in (row["error_json"], row["summary_json"]):
+                if blob:
+                    try:
+                        parsed = _json.loads(blob)
+                        detail = ", ".join(f"{k}: {v}" for k, v in parsed.items())
+                    except (ValueError, AttributeError):
+                        detail = str(blob)
+                    break
+            tree.insert("", "end", values=(row["label"], row["state"],
+                                           started, duration, progress, detail))
+        ttk.Label(win, text=f"{len(rows)} journalled run(s) — survives app "
+                            "restarts (interrupted runs are marked, never "
+                            "silently lost)",
+                  font=("Segoe UI", 9, "italic")).grid(
+            row=1, column=0, sticky="w", padx=10, pady=(0, 10))
+        self._apply_dark_widget_styles(win)
+
+    # =====================================================================
     # Maintenance tab — daily library check
     # =====================================================================
 
     def _run_daily_check(self, *, silent: bool = False) -> None:
-        self._maint_set_busy("Daily Library Check")
-
-        def worker() -> None:
+        def job(progress, cancel_check) -> Any:
+            progress(phase="Checking open requests against the library…")
             try:
                 summary = daily_library_check()
             except Exception as exc:
                 logger.exception("Daily library check failed.")
                 summary = {"checked": 0, "newly_found": 0, "errors": [str(exc)]}
+            if cancel_check():
+                raise maint_jobs.JobCancelled(
+                    items_done=summary.get("checked", 0))
             # Task E retention: the ONE prune entrypoint rides the daily pass.
             # Loser detail rows older than 90 days go; receipts + histograms
             # stay forever (RESOLVED DECISION 5).
+            progress(phase="Pruning selection-run details (90-day retention)…")
             try:
                 pruned = downloads_store.prune_selection_run_details()
                 if pruned.get("rows_deleted"):
@@ -3079,18 +3475,30 @@ class DesktopApp:
                                 pruned["runs_pruned"])
             except Exception:
                 logger.exception("Selection retention prune failed.")
-            self._post_to_ui(lambda: self._handle_daily_check_result(summary, silent=silent))
             # Piggyback the app-update check on the nightly pass.
+            progress(phase="Checking for app updates…")
             try:
                 import updater
                 info = updater.check_for_update()
             except Exception:
                 logger.debug("Nightly update check failed.", exc_info=True)
                 info = None
-            if info is not None:
-                self._post_to_ui(lambda: self._show_update_banner(info))
+            return maint_jobs.JobResult(
+                summary={"checked": summary.get("checked", 0),
+                         "newly_found": summary.get("newly_found", 0),
+                         "errors": len(summary.get("errors", []))},
+                result={"summary": summary, "update": info})
 
-        threading.Thread(target=worker, name="maint-daily-check", daemon=True).start()
+        self._maint_submit("daily_check", "Daily Library Check", job,
+                           meta={"silent": silent})
+
+    def _handle_daily_check_job(self, job) -> None:
+        payload = job.result or {}
+        self._handle_daily_check_result(payload.get("summary", {}),
+                                        silent=bool(job.meta.get("silent")))
+        info = payload.get("update")
+        if info is not None:
+            self._show_update_banner(info)
 
     # ------------------------------------------------------------------
     # In-app updates — nightly check, dismissable Status-tab banner
@@ -3273,100 +3681,107 @@ class DesktopApp:
         self.root.after(15 * 60 * 1000, self._idle_cache_tick)
 
     def _run_idle_cache_pass(self) -> None:
-        """Refresh every expensive scan sequentially, popups suppressed, so
-        each tool opens instantly from cache the next day. One scan at a
-        time — the pass is I/O-bound and deliberately unhurried."""
+        """Refresh every expensive scan overnight, popups suppressed, so each
+        tool opens instantly from cache the next day.
+
+        Task I item 7: the pass runs THROUGH the job registry — one journalled
+        job per scan instead of one invisible thread — so overnight runs show
+        up in Run history exactly like button clicks, the queue is visible,
+        and a mid-pass cancel behaves like any other cancel. The registry
+        already serializes jobs, which keeps the pass deliberately unhurried.
+        """
         logger.info("Idle pre-cache pass starting.")
         self._maint_popups_ok = False
+        jobs: list[Any] = []
 
-        def worker() -> None:
-            import time as _time
-
-            def ui(fn) -> None:
-                self._post_to_ui(fn)
-                _time.sleep(1)  # let the UI thread breathe between renders
-
+        def index_job(progress, cancel_check) -> Any:
+            from library_index import refresh_library_index
+            progress(phase="Refreshing the library index…")
+            added = removed = 0
             try:
-                from library_index import list_all_files, refresh_library_index
-                try:
-                    refreshed = refresh_library_index()
-                    logger.info("Idle cache: index delta +%d/−%d.",
-                                refreshed.added, refreshed.removed)
-                except Exception:
-                    logger.exception("Idle cache: index refresh failed.")
-                try:
-                    anime_db.ensure_fresh(background=False)
-                except Exception:
-                    logger.exception("Idle cache: anime metadata refresh failed.")
+                refreshed = refresh_library_index()
+                added, removed = refreshed.added, refreshed.removed
+                logger.info("Idle cache: index delta +%d/−%d.", added, removed)
+            except Exception:
+                logger.exception("Idle cache: index refresh failed.")
+            if cancel_check():
+                raise maint_jobs.JobCancelled()
+            progress(phase="Refreshing anime metadata…")
+            try:
+                anime_db.ensure_fresh(background=False)
+            except Exception:
+                logger.exception("Idle cache: anime metadata refresh failed.")
+            return maint_jobs.JobResult(
+                summary={"index_added": added, "index_removed": removed})
 
-                steps = [
-                    ("inventory", library_inventory, self._handle_library_inventory_result),
-                    ("duplicates", find_duplicates, self._handle_duplicates_result),
-                    ("sanitize", lambda: sanitize_all(dry_run=True), self._handle_sanitize_result),
-                    ("clean junk", find_junk_files, self._handle_junk_result),
-                    ("unindexed", find_unindexed_files, self._handle_unindexed_result),
-                    ("missing episodes", find_missing_episodes, self._handle_missing_episodes_result),
-                ]
-                for label, compute, handler in steps:
-                    try:
-                        result = compute()
-                        ui(lambda h=handler, r=result: h(r))
-                        logger.info("Idle cache: %s done.", label)
-                    except Exception:
-                        logger.exception("Idle cache: %s failed.", label)
+        jobs.append(self._maint_submit(
+            "idle_index_refresh", "Pre-cache: index + anime metadata",
+            index_job, meta={"idle": True}))
 
-                # Movie-quality scan: probes only new/changed files (ffprobe
-                # durations persist in SQLite) and refreshes the pickled
-                # result the Library tab shows on first click.
-                try:
-                    import pickle
-                    from video_quality import find_low_quality_movies
-                    movies = [
-                        (e.path, e.name, e.size_bytes) for e in list_all_files()
-                        if media_type_for_path(e.root_path) == "movie"
-                    ]
-                    results = find_low_quality_movies(movies)
-                    self._lib_lowqual_cache_path().write_bytes(pickle.dumps({
-                        "results": results, "scanned": len(movies),
-                        "at": datetime.datetime.now().strftime("%b %d %H:%M"),
-                    }))
-                    self._lib_lowqual_showing_cache = False
-                    logger.info("Idle cache: movie-quality scan done (%d flagged).",
-                                len(results))
-                except Exception:
-                    logger.exception("Idle cache: movie-quality scan failed.")
-            finally:
-                def done() -> None:
-                    self._maint_popups_ok = True
-                    self._maint_status_var.set(
-                        "Overnight pre-cache finished — every tool below opens "
-                        "instantly from cache. 🔄 Re-run refreshes any of them.")
-                self._post_to_ui(done)
-                logger.info("Idle pre-cache pass finished.")
+        # The same registry jobs the toolbar buttons use — fresh scans, no
+        # cache short-circuit, results rendered + cached by the same handlers.
+        for runner in (self._run_library_inventory, self._run_find_duplicates,
+                       self._run_sanitize, self._run_clean_junk,
+                       self._run_unindexed, self._run_missing_episodes):
+            job = runner(from_idle=True)
+            if job is not None:
+                jobs.append(job)
 
-        threading.Thread(target=worker, name="idle-cache", daemon=True).start()
+        def lowqual_job(progress, cancel_check) -> Any:
+            # Probes only new/changed files (ffprobe durations persist in
+            # SQLite) and refreshes the JSON cache the Library tab shows on
+            # first click.
+            from library_index import list_all_files
+            from video_quality import find_low_quality_movies
+            progress(phase="Collecting movie files…")
+            movies = [
+                (e.path, e.name, e.size_bytes) for e in list_all_files()
+                if media_type_for_path(e.root_path) == "movie"
+            ]
+
+            def scan_progress(done: int, total: int) -> None:
+                if cancel_check():
+                    raise maint_jobs.JobCancelled(items_done=done)
+                progress(done, total, phase="Analysing movie quality…")
+
+            results = find_low_quality_movies(movies, progress=scan_progress)
+            self._lib_lowqual_save_cache(results, len(movies))
+            self._lib_lowqual_showing_cache = False
+            logger.info("Idle cache: movie-quality scan done (%d flagged).",
+                        len(results))
+            return maint_jobs.JobResult(
+                summary={"movies_scanned": len(movies),
+                         "flagged": len(results)})
+
+        jobs.append(self._maint_submit(
+            "idle_lowqual_scan", "Pre-cache: movie quality scan",
+            lowqual_job, meta={"idle": True}))
+
+        self._maint_idle_pending = {j.job_id for j in jobs if j is not None}
 
     # =====================================================================
     # Maintenance tab — find duplicates
     # =====================================================================
 
-    def _run_find_duplicates(self) -> None:
-        if self._maint_render_cached("find_duplicates"):
-            return
-        if not self._maint_require_library_paths("Find Duplicates"):
-            return
-        self._maint_set_busy("Find Duplicates")
+    def _run_find_duplicates(self, *, from_idle: bool = False):
+        if not from_idle:
+            if self._maint_render_cached("find_duplicates"):
+                return None
+            if not self._maint_require_library_paths("Find Duplicates"):
+                return None
+        elif not config.PLEX_LIBRARY_PATHS:
+            return None
 
-        def worker() -> None:
-            try:
-                results = find_duplicates()
-            except Exception as exc:
-                logger.exception("find_duplicates failed.")
-                self._post_to_ui(lambda: self._maint_status_var.set(f"Find duplicates error: {exc}"))
-                return
-            self._post_to_ui(lambda: self._handle_duplicates_result(results))
+        def job(progress, cancel_check) -> Any:
+            # find_duplicates() is one monolithic walk — no honest count is
+            # available, so the bar stays indeterminate with a real phase.
+            progress(phase="Walking the library for duplicate titles…")
+            results = find_duplicates()
+            return maint_jobs.JobResult(
+                summary={"duplicate_groups": len(results)}, result=results)
 
-        threading.Thread(target=worker, name="maint-duplicates", daemon=True).start()
+        return self._maint_submit("find_duplicates", "Find Duplicates", job,
+                                  meta={"idle": from_idle})
 
     def _handle_duplicates_result(self, results: list[DuplicateGroup]) -> None:
         self._maint_tool_name = "find_duplicates"
@@ -3486,23 +3901,23 @@ class DesktopApp:
     # Maintenance tab — sanitize filenames
     # =====================================================================
 
-    def _run_sanitize(self) -> None:
-        if self._maint_render_cached("sanitize"):
-            return
-        if not self._maint_require_library_paths("Sanitize Names"):
-            return
-        self._maint_set_busy("Sanitize Names (preview)")
+    def _run_sanitize(self, *, from_idle: bool = False):
+        if not from_idle:
+            if self._maint_render_cached("sanitize"):
+                return None
+            if not self._maint_require_library_paths("Sanitize Names"):
+                return None
+        elif not config.PLEX_LIBRARY_PATHS:
+            return None
 
-        def worker() -> None:
-            try:
-                results = sanitize_all(dry_run=True)
-            except Exception as exc:
-                logger.exception("sanitize_all failed.")
-                self._post_to_ui(lambda: self._maint_status_var.set(f"Sanitize error: {exc}"))
-                return
-            self._post_to_ui(lambda: self._handle_sanitize_result(results))
+        def job(progress, cancel_check) -> Any:
+            progress(phase="Previewing Plex-friendly renames…")
+            results = sanitize_all(dry_run=True)
+            return maint_jobs.JobResult(
+                summary={"renames_proposed": len(results)}, result=results)
 
-        threading.Thread(target=worker, name="maint-sanitize", daemon=True).start()
+        return self._maint_submit("sanitize", "Sanitize Names (preview)", job,
+                                  meta={"idle": from_idle})
 
     def _handle_sanitize_result(self, results: list[SanitizePair]) -> None:
         self._maint_tool_name = "sanitize"
@@ -3549,22 +3964,19 @@ class DesktopApp:
             self._show_warning("Organize Movies",
                                "No movie library folder is configured.")
             return
-        self._maint_set_busy("Organize Movies (dry-run scan)")
 
-        def worker() -> None:
-            try:
-                plan, skipped = movie_migration.plan_migration(
-                    roots, resolver=movie_migration.tmdb_resolver)
-            except Exception as exc:
-                logger.exception("Movie migration scan failed.")
-                self._post_to_ui(lambda: self._maint_status_var.set(
-                    f"Organize Movies error: {exc}"))
-                return
-            self._post_to_ui(
-                lambda: self._handle_movie_migration_plan(plan, skipped))
+        # Deliberately UNCACHED: the dry-run plan is recomputed fresh on
+        # every click so it always reflects the disk as it is right now.
+        def job(progress, cancel_check) -> Any:
+            progress(phase="Dry-run scan of the movie roots (fresh, uncached)…")
+            plan, skipped = movie_migration.plan_migration(
+                roots, resolver=movie_migration.tmdb_resolver)
+            return maint_jobs.JobResult(
+                summary={"planned_moves": len(plan), "skipped": len(skipped)},
+                result=(plan, skipped))
 
-        threading.Thread(target=worker, name="maint-movie-migration",
-                         daemon=True).start()
+        self._maint_submit("movie_migration", "Organize Movies (dry-run scan)",
+                           job)
 
     def _handle_movie_migration_plan(self, plan, skipped) -> None:
         self._maint_tool_name = "movie_migration"
@@ -3617,23 +4029,23 @@ class DesktopApp:
     # Maintenance tab — junk cleanup (samples, release notes, empty folders)
     # =====================================================================
 
-    def _run_clean_junk(self) -> None:
-        if self._maint_render_cached("clean_junk"):
-            return
-        if not self._maint_require_library_paths("Clean Junk"):
-            return
-        self._maint_set_busy("Clean Junk")
+    def _run_clean_junk(self, *, from_idle: bool = False):
+        if not from_idle:
+            if self._maint_render_cached("clean_junk"):
+                return None
+            if not self._maint_require_library_paths("Clean Junk"):
+                return None
+        elif not config.PLEX_LIBRARY_PATHS:
+            return None
 
-        def worker() -> None:
-            try:
-                results = find_junk_files()
-            except Exception as exc:
-                logger.exception("find_junk_files failed.")
-                self._post_to_ui(lambda: self._maint_status_var.set(f"Clean Junk error: {exc}"))
-                return
-            self._post_to_ui(lambda: self._handle_junk_result(results))
+        def job(progress, cancel_check) -> Any:
+            progress(phase="Scanning for samples, release junk, empty folders…")
+            results = find_junk_files()
+            return maint_jobs.JobResult(
+                summary={"junk_items": len(results)}, result=results)
 
-        threading.Thread(target=worker, name="maint-clean-junk", daemon=True).start()
+        return self._maint_submit("clean_junk", "Clean Junk", job,
+                                  meta={"idle": from_idle})
 
     def _handle_junk_result(self, results: list[JunkFile]) -> None:
         self._maint_tool_name = "clean_junk"
@@ -3668,23 +4080,25 @@ class DesktopApp:
     # Maintenance tab — missing episodes
     # =====================================================================
 
-    def _run_missing_episodes(self) -> None:
-        if self._maint_render_cached("missing_episodes"):
-            return
-        if not self._maint_require_library_paths("Missing Episodes"):
-            return
-        self._maint_set_busy("Missing Episodes")
+    def _run_missing_episodes(self, *, from_idle: bool = False):
+        if not from_idle:
+            if self._maint_render_cached("missing_episodes"):
+                return None
+            if not self._maint_require_library_paths("Missing Episodes"):
+                return None
+        elif not config.PLEX_LIBRARY_PATHS:
+            return None
 
-        def worker() -> None:
-            try:
-                results = find_missing_episodes()
-            except Exception as exc:
-                logger.exception("find_missing_episodes failed.")
-                self._post_to_ui(lambda: self._maint_status_var.set(f"Missing episodes error: {exc}"))
-                return
-            self._post_to_ui(lambda: self._handle_missing_episodes_result(results))
+        def job(progress, cancel_check) -> Any:
+            progress(phase="Scanning seasons for numbering gaps…")
+            report = find_missing_episodes()
+            return maint_jobs.JobResult(
+                summary={"shows_scanned": report.shows_scanned,
+                         "gaps": len(report.gaps)},
+                result=report)
 
-        threading.Thread(target=worker, name="maint-missing-eps", daemon=True).start()
+        return self._maint_submit("missing_episodes", "Missing Episodes", job,
+                                  meta={"idle": from_idle})
 
     def _handle_missing_episodes_result(self, report: Any) -> None:
         # `report` is a MissingEpisodesReport — typed Any so the import doesn't
@@ -3759,23 +4173,23 @@ class DesktopApp:
     # Maintenance tab — unindexed files
     # =====================================================================
 
-    def _run_unindexed(self) -> None:
-        if self._maint_render_cached("unindexed"):
-            return
-        if not self._maint_require_library_paths("Unindexed Files"):
-            return
-        self._maint_set_busy("Unindexed Files")
+    def _run_unindexed(self, *, from_idle: bool = False):
+        if not from_idle:
+            if self._maint_render_cached("unindexed"):
+                return None
+            if not self._maint_require_library_paths("Unindexed Files"):
+                return None
+        elif not config.PLEX_LIBRARY_PATHS:
+            return None
 
-        def worker() -> None:
-            try:
-                results = find_unindexed_files()
-            except Exception as exc:
-                logger.exception("find_unindexed_files failed.")
-                self._post_to_ui(lambda: self._maint_status_var.set(f"Unindexed files error: {exc}"))
-                return
-            self._post_to_ui(lambda: self._handle_unindexed_result(results))
+        def job(progress, cancel_check) -> Any:
+            progress(phase="Comparing disk contents against the index…")
+            results = find_unindexed_files()
+            return maint_jobs.JobResult(
+                summary={"unindexed_files": len(results)}, result=results)
 
-        threading.Thread(target=worker, name="maint-unindexed", daemon=True).start()
+        return self._maint_submit("unindexed", "Unindexed Files", job,
+                                  meta={"idle": from_idle})
 
     def _handle_unindexed_result(self, results: list[UnindexedFile]) -> None:
         self._maint_tool_name = "unindexed"
@@ -3815,6 +4229,11 @@ class DesktopApp:
     # =====================================================================
 
     def _apply_maint_selection(self) -> None:
+        # note: deferred — the APPLY phase (deletes/renames/moves after the
+        # user ticks rows and confirms) still runs on short bare threads with
+        # its own confirm dialogs and popups. Task I converted the scan tools
+        # (the long, cancellable walks); routing these apply actions through
+        # the registry is a follow-up so their runs journal too.
         if self._maint_tool_name not in ("sanitize", "find_duplicates",
                                          "custom_rename", "clean_junk",
                                          "missing_episodes", "movie_migration"):
@@ -4368,23 +4787,25 @@ class DesktopApp:
     # Maintenance tab — library inventory (per-show season/episode counts)
     # =====================================================================
 
-    def _run_library_inventory(self) -> None:
-        if self._maint_render_cached("library_inventory"):
-            return
-        if not self._maint_require_library_paths("Library Inventory"):
-            return
-        self._maint_set_busy("Library Inventory")
+    def _run_library_inventory(self, *, from_idle: bool = False):
+        if not from_idle:
+            if self._maint_render_cached("library_inventory"):
+                return None
+            if not self._maint_require_library_paths("Library Inventory"):
+                return None
+        elif not config.PLEX_LIBRARY_PATHS:
+            return None
 
-        def worker() -> None:
-            try:
-                inventory = library_inventory()
-            except Exception as exc:
-                logger.exception("library_inventory failed.")
-                self._post_to_ui(lambda: self._maint_status_var.set(f"Library inventory error: {exc}"))
-                return
-            self._post_to_ui(lambda: self._handle_library_inventory_result(inventory))
+        def job(progress, cancel_check) -> Any:
+            progress(phase="Counting shows, seasons, and movie files…")
+            inventory = library_inventory()
+            return maint_jobs.JobResult(
+                summary={"shows": len(inventory.shows),
+                         "movie_files": inventory.movie_count},
+                result=inventory)
 
-        threading.Thread(target=worker, name="maint-inventory", daemon=True).start()
+        return self._maint_submit("library_inventory", "Library Inventory",
+                                  job, meta={"idle": from_idle})
 
     def _handle_library_inventory_result(self, inventory: LibraryInventory) -> None:
         self._maint_tool_name = "library_inventory"
@@ -5224,12 +5645,18 @@ class DesktopApp:
         if not runner_dir.is_dir():
             status_var.set(f"torrent_runner folder not found at {runner_dir}")
             return
+        # Task S item 2: resolve the real npm binary and run it with
+        # shell=False — no cmd.exe in the middle to reinterpret anything.
+        npm_path = shutil.which("npm") or shutil.which("npm.cmd")
+        if npm_path is None:
+            status_var.set("npm not found on PATH — install Node.js 20+ first.")
+            return
         status_var.set("Running npm install in torrent_runner/…")
 
         def worker() -> None:
             try:
                 result = subprocess.run(
-                    ["npm", "install"], cwd=str(runner_dir), shell=True,
+                    [npm_path, "install"], cwd=str(runner_dir), shell=False,
                     capture_output=True, text=True, timeout=600,
                 )
                 msg = ("Torrent runner ready ✔" if result.returncode == 0
@@ -5247,11 +5674,11 @@ class DesktopApp:
     def open_sanitize_for_show(self, show: Any) -> None:
         """Shows tab → Maintenance: preview sanitize renames for one show's
         files. Nothing is renamed until the user ticks rows + Apply Selected."""
-        self._maint_set_busy(f"Sanitize preview for '{show.title}'")
         if self._notebook is not None and self._maintenance_tab is not None:
             self._notebook.select(self._maintenance_tab)
 
-        def worker() -> None:
+        def job(progress, cancel_check) -> Any:
+            progress(phase=f"Previewing renames for '{show.title}'…")
             extensions = set(config.LIBRARY_INDEX_EXTENSIONS)
             pairs: list[SanitizePair] = []
             for folder in show.folders:
@@ -5267,9 +5694,14 @@ class DesktopApp:
                         continue
                     if pair.original != pair.sanitized:
                         pairs.append(pair)
-            self._post_to_ui(lambda: self._handle_sanitize_result(pairs))
+            return maint_jobs.JobResult(
+                summary={"renames_proposed": len(pairs)}, result=pairs)
 
-        threading.Thread(target=worker, name="maint-sanitize-show", daemon=True).start()
+        # dedupe=False: two different shows share the tool_key, and the
+        # second preview must not be swallowed by the first.
+        self._maint_submit("sanitize_show",
+                           f"Sanitize preview for '{show.title}'", job,
+                           dedupe=False)
 
     def open_watch_history(self) -> None:
         """Users tab → Plex watch history (who watched what, when)."""

@@ -18,22 +18,24 @@ pystray==0.19.5
 
 # Ollama Python client — used for fuzzy title matching and 'Other' request categorization
 # Talks to your locally running Ollama instance (ollama.com)
-ollama>=0.4.0
+# All pins below are exact (==): the versions proven on the dev machine
+# (pip show, 2026-07-14). Bump deliberately, not by float.
+ollama==0.5.1
 
 # Fuzzy string matching — fallback for title similarity when Ollama is unavailable
-rapidfuzz>=3.0.0
+rapidfuzz==3.14.3
 
 # Sun Valley ttk theme — dark mode for the desktop UI (optional at runtime;
 # the app falls back to the stock ttk look if missing)
-sv-ttk>=2.6.0
+sv-ttk==2.6.1
 
 # Recycle-bin deletes for the Maintenance tab (falls back to permanent
 # unlink if missing)
-send2trash>=1.8.0
+send2trash==2.1.0
 
 # Subtitle fetching for the Library tab (optional at runtime — the button
 # explains how to install it if missing)
-subliminal>=2.2.0
+subliminal==2.6.0
 
 # Deterministic torrent-name ranking + parsing for the selection engine.
 # Pinned to the exact PyPI-confirmed release (live-verified 2026-07-13:
