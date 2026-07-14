@@ -788,3 +788,38 @@ def test_smoke_flag_exits_zero_in_bounded_time():
         capture_output=True, text=True, timeout=150, cwd=str(REPO), env=env)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "SMOKE RESULT: PASS" in result.stdout
+
+def test_packaged_run_never_loads_env_from_cwd(tmp_path):
+    """A .env sitting in the CURRENT WORKING DIRECTORY must never load.
+
+    dotenv's bare load_dotenv() walks the cwd upward, so a packaged binary
+    launched from an unrelated folder would silently adopt that folder's
+    tokens — proven live when a Linux exercise run picked up the repo's real
+    .env through /mnt/c and polled the production Telegram bot. Only the two
+    known homes (CONFIG_DIR, install dir) may ever be read."""
+    trap_cwd = tmp_path / "cwd"
+    trap_cwd.mkdir()
+    (trap_cwd / ".env").write_text(
+        "PLEXXARR_ENV_TRAP=leaked\n", encoding="utf-8")
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("PLEXXARR_") and k != "PLEXXARR_ENV_TRAP"}
+    env["PLEXXARR_CONFIG_DIR"] = str(config_dir)   # empty: no .env here
+    env["PYTHONPATH"] = str(REPO)
+    env["APP_DB_PATH"] = str(tmp_path / "trap.db")
+    code = ("import os, config; "
+            "print('TRAP=' + repr(os.getenv('PLEXXARR_ENV_TRAP')))")
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True,
+        timeout=60, cwd=str(trap_cwd), env=env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "TRAP=None" in result.stdout, result.stdout
+
+    # The pinned CONFIG_DIR home still loads normally.
+    (config_dir / ".env").write_text(
+        "PLEXXARR_ENV_TRAP=from_config_home\n", encoding="utf-8")
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True,
+        timeout=60, cwd=str(trap_cwd), env=env)
+    assert "TRAP='from_config_home'" in result.stdout, result.stdout

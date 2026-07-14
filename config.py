@@ -47,11 +47,14 @@ if (not DOTENV_PATH.is_file() and _LEGACY_DOTENV.is_file()
 
 load_dotenv = _load_dotenv_func()
 
-if load_dotenv is not None:
-    if DOTENV_PATH.is_file():
-        load_dotenv(DOTENV_PATH)
-    elif not os.getenv("PLEXXARR_CONFIG_DIR"):
-        load_dotenv()
+if load_dotenv is not None and DOTENV_PATH.is_file():
+    # Only the two known homes (config dir, install dir) are ever loaded.
+    # No bare load_dotenv() fallback: dotenv's default search walks the
+    # CURRENT WORKING DIRECTORY upward, so a packaged binary launched from an
+    # unrelated folder would silently adopt whatever .env sits there — proven
+    # live when a Linux exercise run picked up the repo's real tokens through
+    # /mnt/c and polled the production Telegram bot.
+    load_dotenv(DOTENV_PATH)
 
 
 def _require(key: str) -> str:
