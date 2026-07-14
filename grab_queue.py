@@ -284,6 +284,78 @@ def list_grab_queue_rows() -> list[GrabQueueRow]:
     return rows
 
 
+@dataclass(frozen=True)
+class StatusCounts:
+    """Every count worth showing on the Status page. The `needs_*` group is
+    things the USER must act on; the rest is live activity. Kept here (not in
+    the Tk layer) so it is testable and one source of truth."""
+    downloading: int = 0
+    queued: int = 0
+    needs_identity: int = 0      # resolve a provider match to enable grabbing
+    needs_attention: int = 0     # a grab failed verification — decide what to do
+    needs_placement: int = 0     # a download is staged, waiting for a folder
+    deferred: int = 0            # waiting for the next attempt (informational)
+    open_requests: int = 0       # qualified, waiting to be grabbed
+    grabbing: int = 0            # actively being selected/fetched
+
+    @property
+    def actionable(self) -> int:
+        """How many things genuinely need the user. Deferred/open are waiting on
+        the app, not the user, so they are shown but not counted here."""
+        return (self.needs_identity + self.needs_attention
+                + self.needs_placement)
+
+
+def status_counts() -> StatusCounts:
+    """Compute the Status-page counts from the stores in one pass."""
+    active = [r for r in downloads_store.list_downloads(limit=500)
+              if r.status in ("downloading", "queued")]
+    by_status: dict[str, int] = {}
+    for req in queue_store.list_requests(status="active", limit=1000):
+        by_status[req.status] = by_status.get(req.status, 0) + 1
+    try:
+        needs_placement = len(downloads_store.list_needs_placement())
+    except Exception:
+        logger.debug("needs_placement count failed", exc_info=True)
+        needs_placement = 0
+    return StatusCounts(
+        downloading=sum(1 for r in active if r.status == "downloading"),
+        queued=sum(1 for r in active if r.status == "queued"),
+        needs_identity=by_status.get(queue_store.STATUS_NEEDS_IDENTITY, 0),
+        needs_attention=by_status.get(queue_store.STATUS_NEEDS_ATTENTION, 0),
+        needs_placement=needs_placement,
+        deferred=by_status.get(queue_store.STATUS_DEFERRED, 0),
+        open_requests=by_status.get(queue_store.STATUS_OPEN, 0),
+        grabbing=by_status.get(queue_store.STATUS_GRABBING, 0),
+    )
+
+
+def status_summary_line(counts: StatusCounts | None = None) -> str:
+    """Human 'Needs you' line for the Status page. Empty string when nothing
+    needs the user AND nothing is in flight (the page shows 'all clear')."""
+    c = counts or status_counts()
+    needs = []
+    if c.needs_identity:
+        needs.append(f"{c.needs_identity} need identity resolved")
+    if c.needs_attention:
+        needs.append(f"{c.needs_attention} need attention (grab failed)")
+    if c.needs_placement:
+        needs.append(f"{c.needs_placement} need a folder (staged)")
+    waiting = []
+    if c.open_requests:
+        waiting.append(f"{c.open_requests} open")
+    if c.deferred:
+        waiting.append(f"{c.deferred} deferred")
+    if c.grabbing:
+        waiting.append(f"{c.grabbing} grabbing")
+    parts = []
+    if needs:
+        parts.append("⚠ Needs you: " + ", ".join(needs))
+    if waiting:
+        parts.append("Waiting: " + ", ".join(waiting))
+    return "   |   ".join(parts)
+
+
 # ---------------------------------------------------------------------------
 # Decision detail (the pane rendering a SelectionDecision from its run rows)
 # ---------------------------------------------------------------------------

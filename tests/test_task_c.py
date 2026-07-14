@@ -351,6 +351,79 @@ def test_reconcile_clears_needs_identity_false_found(monkeypatch):
     assert queue_store.get_request(req.request_id).found_in_library is False
 
 
+def test_reconcile_closes_movie_already_in_library(monkeypatch):
+    # The real-world bug: a movie the user already has stays 'open' forever with
+    # found_in_library=1, cluttering the grab queue, because found was only ever
+    # an observation and nothing closed the request.
+    req = queue_store.add_request(
+        "the wizard of oz", "cole", media_type="movie",
+        resolved_title="The Wizard of Oz", external_id="630",
+        identity_source="tmdb", canonical_year=1939)
+    queue_store.update_library_status(req.request_id, found=True)
+    monkeypatch.setattr(
+        "library_index.search_library",
+        lambda *a, **k: [_Entry("The Wizard of Oz (1939)")])
+
+    summary = maintenance.daily_library_check()
+
+    r = queue_store.get_request(req.request_id)
+    assert r.status == queue_store.STATUS_FULFILLED       # actually closes now
+    assert r.found_in_library is True
+    assert r.library_verified_at is not None              # library-satisfied
+    assert r.placed_at is None                            # not a Plexxarr placement
+    assert summary["fulfilled_from_library"] >= 1
+
+
+def test_reconcile_does_not_close_season_specific_request(monkeypatch):
+    # A season-specific TV request must NOT close just because the show exists:
+    # 'found' proves the show is present, not that S05 is complete.
+    req = queue_store.add_request(
+        "law and order svu", "cole", media_type="tv",
+        resolved_title="Law & Order: Special Victims Unit", external_id="75692",
+        identity_source="tvdb", season=5)
+    queue_store.update_library_status(req.request_id, found=True)
+    monkeypatch.setattr(
+        "library_index.search_library",
+        lambda *a, **k: [_Entry("Law & Order Special Victims Unit - S01E01")])
+
+    summary = maintenance.daily_library_check()
+
+    r = queue_store.get_request(req.request_id)
+    assert r.status == queue_store.STATUS_OPEN            # stays open
+    assert summary.get("fulfilled_from_library", 0) == 0
+
+
+def test_reconcile_does_not_close_grabbing_request(monkeypatch):
+    # An in-flight grab must never be yanked closed from under itself.
+    req = queue_store.add_request(
+        "dune", "cole", media_type="movie", resolved_title="Dune",
+        external_id="438631", identity_source="tmdb", canonical_year=2021)
+    queue_store.update_library_status(req.request_id, found=True)
+    queue_store.set_status(req.request_id, queue_store.STATUS_GRABBING)
+    monkeypatch.setattr(
+        "library_index.search_library",
+        lambda *a, **k: [_Entry("Dune (2021)")])
+
+    maintenance.daily_library_check()
+    assert queue_store.get_request(req.request_id).status == \
+        queue_store.STATUS_GRABBING
+
+
+def test_reconcile_does_not_close_other_type(monkeypatch):
+    # 'other' has no identity to trust — never auto-closed on a name hit.
+    req = queue_store.add_request(
+        "some request", "cole", media_type="other",
+        resolved_title="Some Request")
+    queue_store.update_library_status(req.request_id, found=True)
+    monkeypatch.setattr(
+        "library_index.search_library",
+        lambda *a, **k: [_Entry("Some Request")])
+    maintenance.daily_library_check()
+    # 'other' can't even be found by identity; it must stay open regardless.
+    assert queue_store.get_request(req.request_id).status != \
+        queue_store.STATUS_FULFILLED
+
+
 def test_reconcile_reopens_mislinked_fulfilled(monkeypatch, tmp_path):
     req = queue_store.add_request(
         "inception", "cole", media_type="movie", resolved_title="Inception",

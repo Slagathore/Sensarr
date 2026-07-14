@@ -182,6 +182,26 @@ def _library_identity_eval(want, entries) -> tuple[bool, list]:
     return matched, contradicting
 
 
+_CLOSEABLE_MEDIA = ("movie", "tv", "anime", "xanime")
+
+
+def _closeable_on_library_match(req) -> bool:
+    """Whether a genuine library identity match means this request is DONE.
+
+    Unambiguous cases only: a movie, or a whole-show request with no specific
+    season. A season-specific request is NOT closed on the found flag — "found"
+    proves the show is in the library, not that the REQUESTED season is present
+    and complete (season completeness is tracked per-episode, not here). 'other'
+    is never auto-closed (no identity to trust). note: deferred - season-aware
+    closing needs the episode set, tracked via the Shows tab, not this check.
+    """
+    if getattr(req, "media_type", None) not in _CLOSEABLE_MEDIA:
+        return False
+    if req.media_type != "movie" and getattr(req, "season", None) is not None:
+        return False
+    return True
+
+
 def daily_library_check() -> dict:
     """Reconcile requests against the library BY IDENTITY (Task C item 5).
 
@@ -208,7 +228,23 @@ def daily_library_check() -> dict:
     cleared_false_found = 0
     reopened = 0
     sequels_blocked = 0
+    fulfilled_from_library = 0
     errors: list[str] = []
+
+    def _close_if_satisfied(req) -> bool:
+        """A request whose identity is genuinely in the library is DONE — close
+        it (fulfilled, library_verified_at stamped, placed_at left NULL so it
+        reads as 'you already had this' rather than 'Plexxarr placed it'). Only
+        from open/deferred; never yanks an in-flight grab. Returns True if it
+        closed one."""
+        if (_closeable_on_library_match(req)
+                and req.status in (qs.STATUS_OPEN, qs.STATUS_DEFERRED)):
+            qs.set_status(req.request_id, qs.STATUS_FULFILLED)
+            logger.info("Reconcile: request #%s (%s) is already in the library "
+                        "— closed as fulfilled.", req.request_id,
+                        req.resolved_title or req.content)
+            return True
+        return False
 
     def _block_contradictions(want, entries) -> int:
         n = 0
@@ -236,6 +272,8 @@ def daily_library_check() -> dict:
             checked += 1
             if matched and not req.found_in_library:
                 newly_found += 1
+            if matched and _close_if_satisfied(req):
+                fulfilled_from_library += 1
             elif req.found_in_library and not matched:
                 cleared_false_found += 1
                 if contradicting:
@@ -272,6 +310,12 @@ def daily_library_check() -> dict:
                             "Reconcile: request #%s had a POISONED found flag — "
                             "cleared and blocked the contradicting entry.",
                             req.request_id)
+                elif _close_if_satisfied(req):
+                    # Genuinely in the library and safe to close: an existing
+                    # open/deferred request that was never getting grabbed
+                    # (auto-grab already skips found rows) now actually CLOSES,
+                    # instead of lingering in the grab queue forever.
+                    fulfilled_from_library += 1
             if req.status in (qs.STATUS_FULFILLED, qs.STATUS_PLACED):
                 if not _placement_still_valid(req):
                     qs.set_status(req.request_id, qs.STATUS_OPEN)
@@ -283,7 +327,8 @@ def daily_library_check() -> dict:
 
     return {"checked": checked, "newly_found": newly_found,
             "cleared_false_found": cleared_false_found, "reopened": reopened,
-            "sequels_blocked": sequels_blocked, "errors": errors}
+            "sequels_blocked": sequels_blocked,
+            "fulfilled_from_library": fulfilled_from_library, "errors": errors}
 
 
 def _placement_still_valid(req) -> bool:

@@ -598,7 +598,7 @@ class DesktopApp:
         self.watchlist_tab = WatchlistTab(watchlist_tab, self)
 
         status_tab.columnconfigure(0, weight=1)
-        status_tab.rowconfigure(3, weight=1)
+        status_tab.rowconfigure(4, weight=1)
         # Requests hosts two SUBTABS (Task E): the classic request list and
         # the grab queue. The sub-notebook fills the whole tab; the classic
         # widgets below are parented into requests_list_tab.
@@ -686,8 +686,18 @@ class DesktopApp:
         ttk.Label(vitals, textvariable=self._activity_summary_var,
                   font=("Segoe UI", 9, "italic")).pack(side=tk.LEFT)
 
+        # "Needs you" line: every count that means the user has something to do,
+        # so it is visible without hunting through tabs. Amber when nonzero.
+        needs_row = ttk.Frame(status_tab)
+        needs_row.grid(row=3, column=0, sticky="ew", pady=(0, 2))
+        self._needs_you_var = tk.StringVar(value="")
+        self._needs_you_label = ttk.Label(
+            needs_row, textvariable=self._needs_you_var,
+            font=("Segoe UI", 10, "bold"))
+        self._needs_you_label.pack(side=tk.LEFT)
+
         status_panes = ttk.PanedWindow(status_tab, orient=tk.VERTICAL)
-        status_panes.grid(row=3, column=0, sticky="nsew")
+        status_panes.grid(row=4, column=0, sticky="nsew")
 
         activity_frame = ttk.LabelFrame(
             status_panes, text="Live activity — downloads, renames, moves", padding=4)
@@ -2264,6 +2274,29 @@ class DesktopApp:
         queued = len(active) - downloading
         self._activity_summary_var.set(
             f"{downloading} downloading, {queued} queued" if active else "no active downloads")
+        self._refresh_needs_you()
+
+    def _refresh_needs_you(self) -> None:
+        """The Status tab's 'Needs you' line: every user-actionable count plus
+        what's waiting on the app. Amber when something needs the user."""
+        var = getattr(self, "_needs_you_var", None)
+        if var is None:
+            return
+        try:
+            import grab_queue
+            counts = grab_queue.status_counts()
+            line = grab_queue.status_summary_line(counts)
+        except Exception:
+            logger.debug("needs-you refresh failed", exc_info=True)
+            return
+        var.set(line or "✓ All clear — nothing needs you")
+        label = getattr(self, "_needs_you_label", None)
+        if label is not None:
+            try:
+                label.configure(
+                    foreground=(_DOT_AMBER if counts.actionable else _DOT_GREEN))
+            except tk.TclError:
+                pass
 
     def _persist_dl_toggle(self, key: str, var: tk.BooleanVar) -> None:
         value = bool(var.get())
@@ -3666,16 +3699,24 @@ class DesktopApp:
         self._last_library_check_date = datetime.date.today().isoformat()
         checked = summary.get("checked", 0)
         newly_found = summary.get("newly_found", 0)
+        fulfilled = summary.get("fulfilled_from_library", 0)
+        reopened = summary.get("reopened", 0)
         errors = summary.get("errors", [])
 
         status = f"Daily check complete -- {checked} checked, {newly_found} newly found"
+        if fulfilled:
+            status += f", {fulfilled} closed (already in library)"
         if errors:
             status += f", {len(errors)} error(s)"
         self._maint_status_var.set(status)
 
         rows: list[tuple[str, str, str, str]] = []
+        if fulfilled:
+            rows.append(("", f"{fulfilled} request(s) closed — already in your library", "", ""))
         if newly_found:
             rows.append(("", f"{newly_found} request(s) now found in library", "", ""))
+        if reopened:
+            rows.append(("", f"{reopened} request(s) reopened (no longer on disk)", "", ""))
         rows.append(("", f"Scanned {checked} open requests", "", ""))
         for err in errors:
             rows.append(("", "Error", err, ""))
