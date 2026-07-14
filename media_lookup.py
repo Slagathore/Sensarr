@@ -66,6 +66,10 @@ class MediaResult:
     source: str             # "tmdb" | "tvdb" | "jikan" | "anidb"
     qualifier: str | None = None   # anime season/arc from the parsed request
     alt_titles: tuple[str, ...] = ()  # romaji/english/original — for matching
+    # Origin country codes (TMDB origin_country for shows; TVDB country where
+    # available; empty for movies and jikan/anidb). This is what lets the user
+    # pick the right AU vs US edition — TVDB gives those distinct ids.
+    origin_countries: tuple[str, ...] = ()
 
 
 def best_title_similarity(query: str, result: "MediaResult") -> float:
@@ -293,6 +297,12 @@ def search_tmdb_shows(title: str, year: int | None = None, *, limit: int = 5) ->
 
         name = item.get("name") or item.get("original_name") or "Unknown"
         original = item.get("original_name") or ""
+        countries = tuple(
+            code for code in (
+                media_identity.normalize_country(c)
+                for c in (item.get("origin_country") or [])
+            ) if code
+        )
         results.append(MediaResult(
             title=name,
             year=release_year,
@@ -302,6 +312,7 @@ def search_tmdb_shows(title: str, year: int | None = None, *, limit: int = 5) ->
             overview=(item.get("overview") or "")[:200],
             source="tmdb",
             alt_titles=(original,) if original and original != name else (),
+            origin_countries=countries,
         ))
 
     return results
@@ -499,6 +510,10 @@ def search_tvdb_shows(title: str, year: int | None = None, *, limit: int = 5) ->
             else f"https://thetvdb.com/?id={tvdb_id}&tab=series"
         )
 
+        # TVDB v4 country is an ISO alpha-3 code ("usa") — normalise it to the
+        # alpha-2 form the display contract and comparator expect ("US").
+        raw_country = media_identity.normalize_country(item.get("country"))
+        countries = (raw_country,) if raw_country else ()
         results.append(MediaResult(
             title=item.get("name") or item.get("title") or "Unknown",
             year=release_year,
@@ -507,6 +522,7 @@ def search_tvdb_shows(title: str, year: int | None = None, *, limit: int = 5) ->
             media_type="tv",
             overview=(item.get("overview") or "")[:200],
             source="tvdb",
+            origin_countries=countries,
         ))
 
     return results
@@ -1287,6 +1303,133 @@ def get_tvdb_series_status(series_id: str) -> str:
     except RuntimeError:
         return ""
     return ((data.get("data") or {}).get("status") or {}).get("name") or ""
+
+
+# ---------------------------------------------------------------------------
+# Season enumeration — powers the TV season-selection keyboard (Task A item 4)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ShowSeasons:
+    """Which seasons a show currently has, for the season picker.
+
+    regular_seasons: sorted season numbers >= 1 that have already aired (an
+        air date in the past, or at least one episode counted). "All currently
+        available" expands to exactly these — never a future, unaired season.
+    has_specials: True when a season 0 (Specials) exists with content. Specials
+        are an explicit opt-in button, never folded into "All".
+    resolved: False when no provider data could be fetched (network down / no
+        key); the caller then offers a minimal fallback instead of an empty grid.
+    """
+    regular_seasons: tuple[int, ...] = ()
+    has_specials: bool = False
+    resolved: bool = False
+
+
+def _today_iso() -> str:
+    from datetime import date
+    return date.today().isoformat()
+
+
+def get_show_seasons(source: str | None, external_id: str | None) -> ShowSeasons:
+    """Enumerate a show's aired seasons for the season keyboard.
+
+    TMDB ids read the per-season stub list (season_number, air_date,
+    episode_count) on the /tv/{id} detail call. TVDB ids read the default
+    episode list (/series/{id}/episodes/default) and derive aired seasons from
+    it — TVDB is the primary TV search source, so a TVDB-resolved show (the
+    MAFS flagship case) must get a real season grid, not the manual fallback.
+    Providers with no season data (jikan/anidb model each season as its own
+    entry) return resolved=False and the caller offers the manual fallback.
+    Network call — mock in tests.
+    """
+    if source == "tmdb" and external_id:
+        return _tmdb_show_seasons(str(external_id))
+    if source == "tvdb" and external_id:
+        return _tvdb_show_seasons(str(external_id))
+    return ShowSeasons(resolved=False)
+
+
+def _tmdb_show_seasons(tv_id: str | None) -> ShowSeasons:
+    if not tv_id or not _tmdb_enabled():
+        return ShowSeasons(resolved=False)
+    try:
+        data = _get_json(f"{_TMDB_BASE}/tv/{tv_id}?api_key={config.TMDB_API_KEY}")
+    except RuntimeError as exc:
+        logger.debug("TMDB season list fetch failed for %s: %s", tv_id, exc)
+        return ShowSeasons(resolved=False)
+
+    today = _today_iso()
+    regular: list[int] = []
+    has_specials = False
+    for stub in (data.get("seasons") or []):
+        num = stub.get("season_number")
+        if num is None:
+            continue
+        try:
+            num = int(num)
+        except (TypeError, ValueError):
+            continue
+        ep_count = stub.get("episode_count") or 0
+        air = stub.get("air_date") or ""
+        aired = bool(ep_count) and (not air or air <= today)
+        if num == 0:
+            has_specials = has_specials or bool(ep_count)
+        elif aired:
+            regular.append(num)
+    return ShowSeasons(
+        regular_seasons=tuple(sorted(set(regular))),
+        has_specials=has_specials,
+        resolved=True,
+    )
+
+
+def _tvdb_show_seasons(series_id: str | None) -> ShowSeasons:
+    """Aired seasons for a TVDB series, from its default-order episode list.
+
+    TVDB v4: GET /series/{id}/episodes/default returns data.episodes with
+    seasonNumber + aired. The season keyboard only needs which regular seasons
+    have aired and whether an S00 exists, so the first page (500 episodes) is
+    plenty for any show a season grid makes sense for.
+    """
+    token = _tvdb_get_token()
+    if not series_id or not token:
+        return ShowSeasons(resolved=False)
+    try:
+        data = _get_json(
+            f"{_TVDB_BASE}/series/{series_id}/episodes/default?page=0",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    except RuntimeError as exc:
+        logger.debug("TVDB episode list fetch failed for %s: %s", series_id, exc)
+        return ShowSeasons(resolved=False)
+
+    today = _today_iso()
+    regular: set[int] = set()
+    has_specials = False
+    episodes = ((data.get("data") or {}).get("episodes")) or []
+    for ep in episodes:
+        if not isinstance(ep, dict):
+            continue
+        num = ep.get("seasonNumber")
+        if num is None:
+            continue
+        try:
+            num = int(num)
+        except (TypeError, ValueError):
+            continue
+        aired = ep.get("aired") or ""
+        if aired and str(aired)[:10] > today:
+            continue  # future episode — its season may still air later
+        if num == 0:
+            has_specials = True
+        else:
+            regular.add(num)
+    return ShowSeasons(
+        regular_seasons=tuple(sorted(regular)),
+        has_specials=has_specials,
+        resolved=True,
+    )
 
 
 _runtime_cache: dict[str, float | None] = {}

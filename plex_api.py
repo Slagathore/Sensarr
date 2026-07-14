@@ -326,6 +326,52 @@ class WatchlistItem:
     title: str
     year: int | None
     item_type: str      # "movie" | "show"
+    # Provider ids parsed from the Plex Guid list — a watchlist item usually
+    # already carries a tmdb/tvdb/imdb GUID, so we keep the identity instead of
+    # re-searching by title (Task A). None when Plex gave no GUID.
+    tmdb_id: str | None = None
+    tvdb_id: str | None = None
+    imdb_id: str | None = None
+
+    @property
+    def identity(self) -> tuple[str, str] | None:
+        """(identity_source, external_id) preferring the provider Plex's own
+        agents key on: tmdb for movies, tvdb then tmdb for shows. None when no
+        usable GUID is present."""
+        if self.item_type == "show":
+            if self.tvdb_id:
+                return ("tvdb", self.tvdb_id)
+            if self.tmdb_id:
+                return ("tmdb", self.tmdb_id)
+        else:
+            if self.tmdb_id:
+                return ("tmdb", self.tmdb_id)
+        if self.imdb_id:
+            return ("omdb", self.imdb_id)
+        return None
+
+
+def _parse_plex_guids(item: dict) -> dict[str, str]:
+    """Extract {provider: id} from a Plex Metadata item's Guid list.
+
+    Discover/PMS return GUIDs as [{"id": "tmdb://12345"}, {"id": "tvdb://678"},
+    {"id": "imdb://tt123"}]. A single legacy 'guid' string is also handled.
+    """
+    out: dict[str, str] = {}
+
+    def _add(raw: str) -> None:
+        raw = (raw or "").strip()
+        for prov, prefix in (("tmdb", "tmdb://"), ("tvdb", "tvdb://"), ("imdb", "imdb://")):
+            if raw.startswith(prefix):
+                out[prov] = raw[len(prefix):].split("?")[0]
+
+    for g in _as_list(item.get("Guid")):
+        if isinstance(g, dict):
+            _add(str(g.get("id") or ""))
+    single = item.get("guid")
+    if isinstance(single, str):
+        _add(single)
+    return out
 
 
 _accounts_cache: list[str] = []
@@ -365,10 +411,14 @@ def get_watchlist(limit: int = 100) -> list[WatchlistItem]:
     for item in items:
         if not isinstance(item, dict):
             continue
+        guids = _parse_plex_guids(item)
         out.append(WatchlistItem(
             title=str(item.get("title") or "Unknown"),
             year=_safe_int(item.get("year")) or None,
             item_type=str(item.get("type") or "movie"),
+            tmdb_id=guids.get("tmdb"),
+            tvdb_id=guids.get("tvdb"),
+            imdb_id=guids.get("imdb"),
         ))
     return out
 

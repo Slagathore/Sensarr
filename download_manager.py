@@ -187,6 +187,44 @@ def _ascii_preferring_title(resolved: str | None, content: str | None) -> str:
     return resolved or content
 
 
+def _row_search_alias(req) -> str:
+    """The SEARCH alias for a request row (Task A item 6 / bootstrap item 0.5).
+
+    Prefers the stored aliases_json[0] — that is the ASCII-preferring alias the
+    intake path computed, and for a same-title country edition it is the
+    disambiguating form ("Married at First Sight US"), which is exactly what
+    auto-grab must query with. Falls back to the live ASCII-preferring
+    derivation for legacy rows that predate aliases_json.
+    """
+    aliases = getattr(req, "aliases", None) or []
+    if aliases and str(aliases[0]).strip():
+        return str(aliases[0]).strip()
+    return _ascii_preferring_title(
+        getattr(req, "resolved_title", None), getattr(req, "content", None)).strip()
+
+
+def _auto_grab_query(req, *, season: int | None = None) -> str:
+    """Build the indexer query for a request row from its stored identity.
+
+    Never raw user text, never a native-script canonical title. Movies append
+    the canonical year ("Alias YYYY"); a tv season row appends "S{NN}" (the
+    "Alias Season N" fallback is the season-pack search's second attempt). The
+    tv premiere year is a scoring signal only and is deliberately never a query
+    term (release names routinely omit it).
+    """
+    alias = _row_search_alias(req)
+    if not alias:
+        return ""
+    media_type = getattr(req, "media_type", None)
+    if season is not None:
+        return f"{alias} S{int(season):02d}"
+    if media_type == "movie":
+        year = getattr(req, "canonical_year", None)
+        if year:
+            return f"{alias} {year}"
+    return alias
+
+
 def _build_want_snapshot(
     result: TorrentResult, req, *, request_title: str | None,
     show_id: int | None, season: int | None, episode: int | None,
@@ -925,10 +963,19 @@ class DownloadManager:
 
     def _grab_season_pack(self, title: str, media_type: str, season: int,
                           ep_count: int, *, request_id: int | None,
-                          show: shows_store.TrackedShow | None = None) -> list[int]:
+                          show: shows_store.TrackedShow | None = None,
+                          search_title: str | None = None) -> list[int]:
         """Search and grab one season as a pack (max-size cap scaled to the
-        season's episode count so packs aren't vetoed by per-episode caps)."""
-        search_title = self._search_title_for(show) if show is not None else title
+        season's episode count so packs aren't vetoed by per-episode caps).
+
+        `search_title` is the caller-supplied QUERY text and always wins when
+        given. Request-linked callers pass the row's stored search alias, which
+        carries country disambiguation ("Married at First Sight US") — a fuzzy
+        tracked-show match may inform routing/filtering via `show`, but must
+        never override the query text or the wrong-country grab returns.
+        """
+        if not search_title:
+            search_title = self._search_title_for(show) if show is not None else title
         results: list[TorrentResult] = []
         for query in (f"{search_title} S{season:02d}", f"{search_title} Season {season}"):
             try:
@@ -985,16 +1032,34 @@ class DownloadManager:
         - show not owned at all → grab season 1
         """
         from datetime import date
-        title = _ascii_preferring_title(req.resolved_title, req.content).strip()
+        title = _row_search_alias(req)
         if not title:
             return []
         today = date.today().isoformat()
         show = self._match_tracked_show(title)
 
+        # Task A explicit season rows: a request row carrying a concrete season
+        # grabs exactly that season's pack via the alias query, instead of the
+        # legacy new-show/next-season heuristic. (The heuristic still drives
+        # legacy season=NULL rows until Phase 3/Task D wires request-linked
+        # grabs through show_id. note: deferred - full show_id routing is Task D.)
+        req_season = getattr(req, "season", None)
+        if req_season is not None:
+            display = show.title if show is not None else title
+            ep_count = 0
+            if show is not None:
+                ep_count = sum(1 for e in shows_store.list_episodes(show.show_id)
+                               if e.season == req_season)
+            return self._grab_season_pack(
+                display, req.media_type, int(req_season),
+                ep_count or 12, request_id=req.request_id, show=show,
+                search_title=title)
+
         if show is None or show.have_count == 0:
             display = show.title if show is not None else title
             return self._grab_season_pack(display, req.media_type, 1, 12,
-                                          request_id=req.request_id, show=show)
+                                          request_id=req.request_id, show=show,
+                                          search_title=title)
 
         eps = shows_store.list_episodes(show.show_id)
         owned_seasons = sorted({e.season for e in eps if e.has_file and e.season > 0})
@@ -1023,7 +1088,8 @@ class DownloadManager:
         ep_count = sum(1 for e in eps if e.season == target
                        and e.air_date and e.air_date <= today)
         return self._grab_season_pack(show.title, show.media_type, target,
-                                      ep_count, request_id=req.request_id, show=show)
+                                      ep_count, request_id=req.request_id, show=show,
+                                      search_title=title)
 
     def _grab_one_episode(self, show: shows_store.TrackedShow,
                           ep: shows_store.EpisodeRow) -> list[int]:
@@ -1102,7 +1168,9 @@ class DownloadManager:
                     "identity — skipping (needs_identity).",
                     req.request_id, req.media_type)
                 continue
-            query = _ascii_preferring_title(req.resolved_title, req.content)
+            # Query from the stored identity (search alias + canonical year for
+            # movies), never raw user text or a native-script canonical title.
+            query = _auto_grab_query(req)
             media_type = req.media_type if req.media_type != "unknown" else "other"
 
             if media_type in ("tv", "anime", "xanime"):

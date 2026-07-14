@@ -24,7 +24,8 @@ from library_index import (format_library_summary_message,
 from metrics_report import format_combined_metrics_message
 import config
 from plex_control import control_busy, get_status, hard_reset, launch_plex
-from queue_store import add_request, format_requests_message, format_requests_message_user
+import request_intake
+from queue_store import format_requests_message_user
 
 logger = logging.getLogger(__name__)
 
@@ -197,9 +198,17 @@ async def request_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     requester = _requester_name(update)
     loop = asyncio.get_running_loop()
-    created = await loop.run_in_executor(None, lambda: add_request(content, requester))
+    # A bare /request carries no type and no resolved identity, so it lands as
+    # needs_identity (visible, never auto-grabbed) rather than an untyped 'open'
+    # row that the old auto-grab coerced to 'other' and grabbed — the #85 path.
+    # Users resolve it via the structured 📝 Requests flow or the desktop app.
+    created = await loop.run_in_executor(
+        None, lambda: request_intake.add_needs_identity(content, requester))
     await update.message.reply_text(
-        f"Added request #{created.request_id} from {created.requester}: {created.content}"
+        f"Added request #{created.request_id} from {created.requester}: "
+        f"{created.content}\n\nI couldn't resolve a specific title from that, so "
+        f"it's waiting on identification. Use the 📝 Requests button to pick the "
+        f"exact movie or show, or it will stay visible but won't auto-download."
     )
 
 

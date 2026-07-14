@@ -40,11 +40,12 @@ import config
 from llm_service import categorize_other_request, fuzzy_correct_title, llm_available
 from media_lookup import (
     LookupResult, MediaResult, ParsedRequest,
-    check_library_for_title, clean_library_name, lookup_media,
+    check_library_for_title, clean_library_name, get_show_seasons, lookup_media,
     parse_request_list, title_similarity,
     search_tmdb_movies, search_tmdb_shows, search_tvdb_shows,
     search_jikan_anime, search_anidb, search_omdb_movies,
 )
+import request_intake
 from queue_store import add_request, format_requests_message_user
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,7 @@ SELECT_TYPE = 0
 AWAITING_CONTENT = 1
 CONFIRMING = 2
 CORRECTING = 3
+SELECTING_SEASONS = 4
 
 # user_data keys
 _UD_MEDIA_TYPE = "req_media_type"           # str: "movie" | "tv" | "anime" | "xanime"
@@ -66,6 +68,8 @@ _UD_CORRECTION_OPTS = "req_correction_opts" # list[MediaResult]: candidates for 
 _UD_CORRECTION_QUEUE = "req_correction_queue"  # list[int]: 0-based indices still to fix
 _UD_CORRECTION_PAGE  = "req_correction_page"   # int: current result page (0-based, 5 per page)
 _UD_REMOVED          = "req_removed"           # set[int]: 0-based indices dropped by the user
+_UD_SEASON_QUEUE     = "req_season_queue"      # list[int]: 0-based TV indices still needing a season pick
+_UD_SEASON_ADDED     = "req_season_added"      # list[str]: human summary of rows added so far
 
 _CORRECTION_PAGE_SIZE = 5
 _CORRECTION_FETCH_LIMIT = 15  # fetch this many results upfront so paging works without extra calls
@@ -178,6 +182,16 @@ def _requester_name(update: Update) -> str:
     return user.full_name or "Unknown"
 
 
+def _country_tag(m: MediaResult) -> str:
+    """' [US]' style origin tag for the confirmation display, or '' when the
+    provider gave no country. This is the signal that lets the user pick the
+    right AU vs US edition (TVDB gives those distinct ids)."""
+    countries = getattr(m, "origin_countries", ()) or ()
+    if not countries:
+        return ""
+    return " [" + "/".join(str(c).upper() for c in countries[:2]) + "]"
+
+
 def _display_for_in_lib(lr: LookupResult) -> str:
     """
     Pick the best display string for an in-library item.
@@ -274,8 +288,11 @@ def _build_results_message(
             assert m is not None
             year_str = f" ({m.year})" if m.year else ""
             qualifier_str = f" [{m.qualifier}]" if m.qualifier else ""
+            country_str = _country_tag(m)
             title_link = f'<a href="{m.external_url}">{m.title}</a>' if m.external_url else f"<b>{m.title}</b>"
-            lines.append(f"  <b>{num}.</b> {title_link}{qualifier_str}{year_str}  <i>[{m.source.upper()}]</i>")
+            lines.append(
+                f"  <b>{num}.</b> {title_link}{qualifier_str}{year_str}{country_str}"
+                f"  <i>[{m.source.upper()}]</i>")
         lines.append("")
 
     if uncertain:
@@ -422,16 +439,23 @@ async def handle_content_input(update: Update, context: ContextTypes.DEFAULT_TYP
         reasoning = analysis.get("reasoning", "")
         flagged = analysis.get("flagged", False)
 
-        # Add to queue with what we know
-        await loop.run_in_executor(
-            None,
-            lambda: add_request(
-                raw_text,
-                requester,
-                media_type=category,
-                resolved_title=guessed_title,
-            ),
-        )
+        # Identity rule holds even here: if the LLM decided this is actually a
+        # movie/tv/anime but we have no external id for it, the row is
+        # needs_identity (visible, never auto-grabbed as that type) rather than
+        # an open typed row with no identity — the exact #85 shape. A genuinely
+        # 'other' guess (game/software/music/…) is an exempt deliberate choice
+        # and is queued as-is.
+        def _add_other(cat=category, title=guessed_title) -> None:
+            if cat in ("movie", "tv", "anime", "xanime"):
+                request_intake.add_needs_identity(
+                    raw_text, requester, media_type=cat)
+            else:
+                add_request(
+                    raw_text, requester,
+                    media_type=cat, resolved_title=title,
+                )
+
+        await loop.run_in_executor(None, _add_other)
 
         flag_note = " ⚠️ <b>[Flagged for review]</b>" if flagged else ""
         category_emoji = _MEDIA_TYPE_EMOJI.get(category, "❓")
@@ -521,41 +545,38 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
             "No problem — what would you like to request?",
             reply_markup=_type_keyboard(),
         )
-        context.user_data.pop(_UD_RESULTS, None)
-        context.user_data.pop(_UD_MEDIA_TYPE, None)
-        context.user_data.pop(_UD_REMOVED, None)
+        _clear_flow_state(context)
         return SELECT_TYPE
 
     if data == "req_confirm_yes":
         results: list[LookupResult] = context.user_data.get(_UD_RESULTS, [])
         media_type: str = context.user_data.get(_UD_MEDIA_TYPE, "unknown")
         removed: set[int] = context.user_data.get(_UD_REMOVED, set())
+
+        submittable = [
+            i for i, lr in enumerate(results)
+            if i not in removed and not lr.in_library
+        ]
+
+        # TV goes through the per-item season picker (Task A item 4) so each
+        # submitted show becomes explicit season rows, never a whole-show row.
+        # Anime is intentionally excluded from the season grid (RESOLVED
+        # DECISION 11): its qualifier/provider flow is untouched and it is added
+        # by _add_non_season_items below.
+        # note: deferred - anime seasons return with provider-aware cour mappings.
+        if media_type == "tv" and submittable:
+            context.user_data[_UD_SEASON_QUEUE] = submittable
+            context.user_data[_UD_SEASON_ADDED] = []
+            return await _prompt_next_season(update, context)
+
+        # Everything else (movie / anime / xanime) is added now, carrying its
+        # full provider-qualified identity.
         requester = _requester_name(update)
-
         loop = asyncio.get_running_loop()
-        added: list[str] = []
-
-        for i, lr in enumerate(results):
-            if i in removed:
-                continue  # user dropped this item
-            if lr.in_library:
-                continue  # already there — skip
-
-            display = lr.request.display()
-            match = lr.best_match
-
-            def _add(lr=lr, match=match, display=display) -> None:
-                add_request(
-                    content=display,
-                    requester=requester,
-                    media_type=media_type,
-                    resolved_title=match.title if match else None,
-                    external_id=match.external_id if match else None,
-                    external_url=match.external_url if match else None,
-                )
-
-            await loop.run_in_executor(None, _add)
-            added.append(display)
+        added = await loop.run_in_executor(
+            None,
+            lambda: _add_non_season_items(results, submittable, media_type, requester),
+        )
 
         if added:
             bullet_list = "\n".join(f"• {t}" for t in added)
@@ -568,12 +589,262 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
                 "Nothing new to add — everything was already in your library!"
             )
 
-        context.user_data.pop(_UD_RESULTS, None)
-        context.user_data.pop(_UD_MEDIA_TYPE, None)
-        context.user_data.pop(_UD_REMOVED, None)
+        _clear_flow_state(context)
         return ConversationHandler.END
 
     # Unknown confirm action — just end
+    return ConversationHandler.END
+
+
+def _add_non_season_items(
+    results: list[LookupResult],
+    submittable: list[int],
+    media_type: str,
+    requester: str,
+) -> list[str]:
+    """Add movie/anime/xanime rows with their full identity (blocking)."""
+    added: list[str] = []
+    for i in submittable:
+        lr = results[i]
+        display = lr.request.display()
+        match = lr.best_match
+        candidate_titles = [m.title for m in lr.external_matches]
+        if match is not None:
+            request_intake.add_matched_request(
+                display, requester, media_type=media_type, match=match,
+                candidate_titles=candidate_titles,
+            )
+        else:
+            # No external match at all — visible needs_identity, not grabbed.
+            request_intake.add_needs_identity(
+                display, requester, media_type=media_type)
+        added.append(display)
+    return added
+
+
+def _clear_flow_state(context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.user_data:
+        return
+    for key in (_UD_RESULTS, _UD_MEDIA_TYPE, _UD_REMOVED,
+                _UD_SEASON_QUEUE, _UD_SEASON_ADDED,
+                _UD_SEASON_CURRENT, _UD_SEASON_DATA):
+        context.user_data.pop(key, None)
+
+
+# ---------------------------------------------------------------------------
+# SELECTING_SEASONS state — TV season picker (Task A item 4)
+# ---------------------------------------------------------------------------
+# tv only (anime is frozen for the new grid — RESOLVED DECISION 11). "All
+# currently available" expands into one request row per aired regular season
+# under one batch_id; a single pick makes one row; Specials (S00) is an
+# explicit opt-in button, never folded into "All".
+
+_UD_SEASON_CURRENT = "req_season_current"   # int: 0-based index being seasoned
+_UD_SEASON_DATA    = "req_season_data"      # dict: {"regular":[...], "specials":bool, "resolved":bool}
+
+_SEASON_BUTTONS_PER_ROW = 4
+
+
+async def _reply_html(update: Update, text: str,
+                      keyboard: InlineKeyboardMarkup | None = None) -> None:
+    """Reply with HTML from either a callback-query or a text-message update."""
+    query = update.callback_query
+    if query is not None and query.message is not None:
+        await cast(Message, query.message).reply_html(text, reply_markup=keyboard)
+    elif update.message is not None:
+        await update.message.reply_html(text, reply_markup=keyboard)
+
+
+def _season_keyboard(seasons: list[int], *, has_specials: bool,
+                     has_all: bool) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if has_all:
+        rows.append([InlineKeyboardButton(
+            "📚 All currently available", callback_data="req_season_all")])
+    btn_row: list[InlineKeyboardButton] = []
+    for s in seasons:
+        btn_row.append(InlineKeyboardButton(
+            f"S{s:02d}", callback_data=f"req_season_pick_{s}"))
+        if len(btn_row) == _SEASON_BUTTONS_PER_ROW:
+            rows.append(btn_row)
+            btn_row = []
+    if btn_row:
+        rows.append(btn_row)
+    if has_specials:
+        rows.append([InlineKeyboardButton(
+            "🎞️ S00 Specials", callback_data="req_season_specials")])
+    rows.append([InlineKeyboardButton(
+        "⏭️ Skip this show", callback_data="req_season_skip")])
+    rows.append([InlineKeyboardButton("❌ Cancel", callback_data="req_cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _prompt_next_season(update: Update,
+                              context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Show the season keyboard for the next queued TV item, or finish."""
+    assert context.user_data is not None
+    queue: list[int] = context.user_data.get(_UD_SEASON_QUEUE, [])
+    results: list[LookupResult] = context.user_data.get(_UD_RESULTS, [])
+    requester = _requester_name(update)
+
+    while queue:
+        idx = queue[0]
+        queue = queue[1:]
+        context.user_data[_UD_SEASON_QUEUE] = queue
+        lr = results[idx]
+        match = lr.best_match
+        if match is None or not (match.source and str(match.external_id or "").strip()):
+            # No usable identity — store needs_identity and move on (visible,
+            # not grabbed). Cannot offer a season grid without an identity.
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None,
+                lambda d=lr.request.display(): request_intake.add_needs_identity(
+                    d, requester, media_type="tv"))
+            _record_season_added(context, f"{lr.request.display()} (needs identity)")
+            continue
+
+        context.user_data[_UD_SEASON_CURRENT] = idx
+        loop = asyncio.get_running_loop()
+        seasons_data = await loop.run_in_executor(
+            None,
+            lambda m=match: get_show_seasons(m.source, m.external_id))
+
+        regular = list(seasons_data.regular_seasons)
+        has_all = bool(seasons_data.resolved and regular)
+        if seasons_data.resolved and not regular:
+            regular = [1]  # resolved but nothing aired yet — offer S01
+        if not seasons_data.resolved:
+            regular = list(range(1, 11))  # provider unavailable — manual range
+        context.user_data[_UD_SEASON_DATA] = {
+            "regular": regular,
+            "specials": seasons_data.has_specials,
+            "resolved": seasons_data.resolved,
+        }
+        note = ("" if seasons_data.resolved else
+                "\n<i>(couldn't fetch the season list — pick a season number "
+                "or type one, e.g. <code>3</code>)</i>")
+        keyboard = _season_keyboard(
+            regular, has_specials=seasons_data.has_specials, has_all=has_all)
+        await _reply_html(
+            update,
+            f"📺 <b>{match.title}</b> — which season(s) would you like?"
+            f"\nTap <b>All currently available</b> or a single season.{note}",
+            keyboard)
+        return SELECTING_SEASONS
+
+    return await _finish_season_flow(update, context)
+
+
+def _record_season_added(context: ContextTypes.DEFAULT_TYPE, summary: str) -> None:
+    assert context.user_data is not None
+    added: list[str] = context.user_data.get(_UD_SEASON_ADDED, [])
+    added.append(summary)
+    context.user_data[_UD_SEASON_ADDED] = added
+
+
+async def _apply_season_choice(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                               *, seasons: list[int], label: str) -> None:
+    """Add the chosen season rows for the current TV item."""
+    assert context.user_data is not None
+    results: list[LookupResult] = context.user_data.get(_UD_RESULTS, [])
+    idx: int = context.user_data.get(_UD_SEASON_CURRENT, -1)
+    requester = _requester_name(update)
+    lr = results[idx]
+    match = lr.best_match
+    if match is None:  # guarded upstream in _prompt_next_season; defensive
+        return
+    candidate_titles = [m.title for m in lr.external_matches]
+    display = lr.request.display()
+
+    loop = asyncio.get_running_loop()
+    outcome = await loop.run_in_executor(
+        None,
+        lambda: request_intake.add_season_selection(
+            display, requester, match=match, seasons=seasons,
+            candidate_titles=candidate_titles),
+    )
+    tag = "" if outcome.status != "needs_identity" else " (needs identity)"
+    _record_season_added(context, f"{match.title} — {label}{tag}")
+
+
+async def handle_season_selection(update: Update,
+                                  context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Callback handler for the season keyboard."""
+    query = update.callback_query
+    if query is None:
+        return SELECTING_SEASONS
+    await query.answer()
+    assert context.user_data is not None
+    data = query.data or ""
+    season_data: dict = context.user_data.get(_UD_SEASON_DATA, {})
+    regular: list[int] = list(season_data.get("regular", []))
+
+    if data == "req_season_skip":
+        pass  # add nothing for this item
+    elif data == "req_season_all":
+        await _apply_season_choice(
+            update, context, seasons=regular, label="all currently available")
+    elif data == "req_season_specials":
+        await _apply_season_choice(update, context, seasons=[0], label="Specials")
+    elif data.startswith("req_season_pick_"):
+        try:
+            season = int(data.removeprefix("req_season_pick_"))
+        except ValueError:
+            return SELECTING_SEASONS
+        await _apply_season_choice(
+            update, context, seasons=[season], label=f"S{season:02d}")
+    else:
+        return SELECTING_SEASONS
+
+    return await _prompt_next_season(update, context)
+
+
+async def handle_season_text(update: Update,
+                             context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Text fallback in SELECTING_SEASONS: 'all', a season number, 'specials',
+    'skip'. Lets the picker work even when the provider list couldn't load."""
+    if update.message is None or update.message.text is None:
+        return SELECTING_SEASONS
+    assert context.user_data is not None
+    text = update.message.text.strip().lower()
+    season_data: dict = context.user_data.get(_UD_SEASON_DATA, {})
+    regular: list[int] = list(season_data.get("regular", []))
+
+    if text in {"skip", "next"}:
+        return await _prompt_next_season(update, context)
+    if text in {"all", "everything"}:
+        await _apply_season_choice(
+            update, context, seasons=regular, label="all currently available")
+        return await _prompt_next_season(update, context)
+    if text in {"specials", "s0", "s00", "0"}:
+        await _apply_season_choice(update, context, seasons=[0], label="Specials")
+        return await _prompt_next_season(update, context)
+    m = re.search(r"\d+", text)
+    if m:
+        season = int(m.group())
+        await _apply_season_choice(
+            update, context, seasons=[season], label=f"S{season:02d}")
+        return await _prompt_next_season(update, context)
+
+    await update.message.reply_text(
+        "Type a season number (e.g. 3), 'all', 'specials', or 'skip'.")
+    return SELECTING_SEASONS
+
+
+async def _finish_season_flow(update: Update,
+                              context: ContextTypes.DEFAULT_TYPE) -> int:
+    assert context.user_data is not None
+    added: list[str] = context.user_data.get(_UD_SEASON_ADDED, [])
+    if added:
+        bullet_list = "\n".join(f"• {t}" for t in added)
+        await _reply_html(
+            update,
+            f"✅ <b>Added {len(added)} TV request(s) to the queue:</b>\n{bullet_list}"
+            f"\n\nUse the <b>📝 Requests</b> button anytime to see the full queue.")
+    else:
+        await _reply_html(update, "Nothing added — no seasons were selected.")
+    _clear_flow_state(context)
     return ConversationHandler.END
 
 
@@ -1031,11 +1302,7 @@ async def cancel_request_flow(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif update.message is not None:
         await update.message.reply_text("Request cancelled.")
 
-    if context.user_data:
-        context.user_data.pop(_UD_RESULTS, None)
-        context.user_data.pop(_UD_MEDIA_TYPE, None)
-        context.user_data.pop(_UD_REMOVED, None)
-
+    _clear_flow_state(context)
     return ConversationHandler.END
 
 
@@ -1066,6 +1333,11 @@ REQUEST_CONV_HANDLER = ConversationHandler(
             # Allow the confirm/cancel buttons to still work if tapped from old message
             CallbackQueryHandler(handle_confirmation, pattern=r"^req_confirm_"),
             CallbackQueryHandler(cancel_request_flow, pattern=r"^req_cancel$"),
+        ],
+        SELECTING_SEASONS: [
+            CallbackQueryHandler(handle_season_selection, pattern=r"^req_season_"),
+            CallbackQueryHandler(cancel_request_flow, pattern=r"^req_cancel$"),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_season_text),
         ],
     },
     fallbacks=[

@@ -20,6 +20,7 @@ from tkinter import ttk
 
 import config
 import queue_store
+import request_intake
 from ui_helpers import add_tooltip, make_sortable
 
 logger = logging.getLogger(__name__)
@@ -356,17 +357,21 @@ class WatchlistTab:
             )
             return
         queued = 0
+        needs_id = 0
         for item in items:
-            content = f"{item.title} ({item.year})" if item.year else item.title
-            queue_store.add_request(
-                content, "Watchlist",
-                media_type=_TYPE_TO_MEDIA.get(item.item_type, "movie"),
-                resolved_title=item.title,
-            )
-            queued += 1
+            # Use the item's parsed Plex GUID identity instead of re-searching
+            # by title (Task A). Items without a usable GUID (or shows whose
+            # season list can't be resolved) land as needs_identity: visible,
+            # never silently grabbed as the wrong thing.
+            outcome = request_intake.queue_watchlist_item(item, "Watchlist")
+            queued += len(outcome.request_ids)
+            if outcome.status == queue_store.STATUS_NEEDS_IDENTITY:
+                needs_id += 1
+        note = (f" ({needs_id} need a title/season picked before they grab)"
+                if needs_id else "")
         self._status_var.set(
-            f"Queued {queued} request(s) — the auto-grab pass (runs every 5 min) "
-            "will search and download them.")
+            f"Queued {queued} request(s){note} — the auto-grab pass (runs every "
+            "5 min) will search and download the resolved ones.")
         self.app.refresh_requests()
 
     def _on_watchlist_right_click(self, event) -> None:

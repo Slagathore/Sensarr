@@ -458,6 +458,45 @@ def complete_request(request_id: int) -> bool:
         return cursor.rowcount > 0
 
 
+def update_identity(
+    request_id: int,
+    *,
+    media_type: str,
+    resolved_title: str | None,
+    external_id: str | None,
+    external_url: str | None = None,
+    identity_source: str | None = None,
+    canonical_year: int | None = None,
+    origin_countries: list[str] | None = None,
+    aliases: list[str] | None = None,
+    season: int | None = None,
+) -> QueueRequest | None:
+    """Attach a resolved provider identity to an existing row (the resolve path
+    for needs_identity rows). Flips the row to 'open' (auto-grabbable) only when
+    the identity is actually qualified; otherwise it stays needs_identity."""
+    qualified = bool(identity_source) and bool(external_id)
+    new_status = STATUS_OPEN if qualified else STATUS_NEEDS_IDENTITY
+    countries_json = json.dumps(origin_countries) if origin_countries else None
+    aliases_json = json.dumps(aliases) if aliases else None
+    initialize_queue_db()
+    with _DB_LOCK, db.connect(_db_path()) as conn:
+        conn.execute(
+            """
+            UPDATE requests
+            SET media_type = ?, resolved_title = ?, external_id = ?,
+                external_url = ?, identity_source = ?, canonical_year = ?,
+                origin_countries_json = ?, aliases_json = ?, season = ?,
+                status = ?
+            WHERE id = ?
+            """,
+            (media_type, resolved_title, external_id, external_url,
+             identity_source, canonical_year, countries_json, aliases_json,
+             season, new_status, request_id),
+        )
+        conn.commit()
+    return get_request(request_id)
+
+
 def set_status(request_id: int, status: str) -> None:
     """Move a request to an explicit lifecycle state. Stamps placed_at /
     library_verified_at when entering those states."""
@@ -524,9 +563,12 @@ def find_duplicate_requests() -> list[list[QueueRequest]]:
     """
     Find open requests that look like duplicates of each other.
 
-    Two requests are considered duplicates when their resolved_title (or content,
-    normalised to lowercase stripped of punctuation) is identical and they have
-    the same media_type.
+    Two requests are duplicates when they share a provider-qualified identity
+    tuple (media_type, identity_source, external_id, season) — the durable key,
+    which correctly separates S01 and S02 of the same show and correctly merges
+    two rows resolved to the same tmdb id under different typed titles. Rows
+    that lack a qualified identity fall back to the normalised-title key so
+    needs_identity / 'other' rows still dedupe by what the user typed.
 
     Returns a list of groups; each group contains 2+ QueueRequest objects.
     """
@@ -540,8 +582,12 @@ def find_duplicate_requests() -> list[list[QueueRequest]]:
 
     seen: dict[str, list[QueueRequest]] = {}
     for req in requests:
-        key_text = req.resolved_title or req.content
-        key = f"{req.media_type}::{_normalize(key_text)}"
+        if req.is_qualified:
+            key = (f"id::{req.media_type}::{req.identity_source}::"
+                   f"{req.external_id}::{req.season}")
+        else:
+            key_text = req.resolved_title or req.content
+            key = f"{req.media_type}::{_normalize(key_text)}"
         seen.setdefault(key, []).append(req)
 
     return [group for group in seen.values() if len(group) >= 2]

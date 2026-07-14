@@ -140,12 +140,38 @@ _COUNTRY_SYNONYMS = {
     "NZ": "NZ", "NZL": "NZ",
 }
 
+# ISO 3166-1 alpha-3 -> alpha-2 for the realistic TV-origin codes. TVDB v4
+# returns alpha-3 ("usa"); TMDB returns alpha-2 ("US"); both must land on the
+# same canonical form or the display renders [USA] and comparisons drift. An
+# unknown code passes through unchanged (uppercased) rather than being guessed.
+_ALPHA3_TO_ALPHA2 = {
+    "USA": "US", "GBR": "UK", "AUS": "AU", "CAN": "CA", "NZL": "NZ",
+    "JPN": "JP", "KOR": "KR", "CHN": "CN", "IND": "IN", "FRA": "FR",
+    "DEU": "DE", "ESP": "ES", "ITA": "IT", "NLD": "NL", "BEL": "BE",
+    "SWE": "SE", "NOR": "NO", "DNK": "DK", "FIN": "FI", "IRL": "IE",
+    "POL": "PL", "TUR": "TR", "RUS": "RU", "BRA": "BR", "MEX": "MX",
+    "ARG": "AR", "COL": "CO", "ZAF": "ZA", "CHE": "CH", "AUT": "AT",
+    "PRT": "PT", "GRC": "GR", "CZE": "CZ", "ISL": "IS", "ISR": "IL",
+    "THA": "TH", "PHL": "PH", "IDN": "ID", "MYS": "MY", "SGP": "SG",
+    "TWN": "TW", "HKG": "HK", "UKR": "UA", "HUN": "HU", "ROU": "RO",
+}
 
-def _canon_country(code: str) -> str:
+
+def normalize_country(code: str | None) -> str:
+    """Canonical short country code: alpha-2 style (UK for GB, matching the
+    comparator's existing convention), accepting alpha-3 codes and common
+    names. Unknown codes pass through uppercased rather than guessed.
+    Returns '' for empty input."""
     if not code:
         return ""
-    key = code.strip().upper()
-    return _COUNTRY_SYNONYMS.get(key, key)
+    key = str(code).strip().upper()
+    if not key:
+        return ""
+    return _COUNTRY_SYNONYMS.get(key) or _ALPHA3_TO_ALPHA2.get(key, key)
+
+
+def _canon_country(code: str) -> str:
+    return normalize_country(code)
 
 
 def _country_set(value) -> set[str]:

@@ -31,7 +31,7 @@ from maintenance import (
     find_missing_episodes, find_unindexed_files, library_inventory,
     media_type_for_path, sanitize_all, sanitize_filename,
 )
-from queue_store import (add_request, complete_request, find_duplicate_requests,
+from queue_store import (complete_request, find_duplicate_requests,
                           get_request, initialize_queue_db, list_requests,
                           open_request_count)
 from settings_store import (load_current_settings, reload_config_from_env,
@@ -41,6 +41,7 @@ from telegram_service import TelegramBotService
 import anime_db
 import auth_store
 import downloads_store
+import request_intake
 import shows_store
 import telegram_service
 import torrent_routing
@@ -634,6 +635,7 @@ class DesktopApp:
         request_entry.bind("<Return>", lambda _event: self.add_request_from_ui())
         ttk.Button(requests_toolbar, text="Add", command=self.add_request_from_ui).grid(row=0, column=4, padx=(0, 6))
         ttk.Button(requests_toolbar, text="🔍 Find Source", command=self.search_source_for_selected_request).grid(row=0, column=5, padx=(0, 6))
+        ttk.Button(requests_toolbar, text="🆔 Resolve", command=self.resolve_selected_request).grid(row=0, column=9, padx=(0, 6))
         ttk.Button(requests_toolbar, text="⬇ Grab Torrent", command=self.grab_torrent_for_selected_request).grid(row=0, column=6, padx=(0, 6))
         ttk.Button(requests_toolbar, text="Complete Selected", command=self.complete_selected_request).grid(row=0, column=7, padx=(0, 6))
         ttk.Button(requests_toolbar, text="Refresh", command=self.refresh_requests).grid(row=0, column=8)
@@ -1051,10 +1053,138 @@ class DesktopApp:
             self._show_warning("Missing request", "Enter the request details before adding it.")
             return
 
-        created = add_request(content, requester)
+        # Route through the same resolve-or-needs_identity path as the Telegram
+        # surfaces (Task A): look up candidates, let the user pick the exact
+        # movie/show, and only then store a qualified, auto-grabbable identity.
+        # No candidate / no pick => needs_identity (visible, never grabbed).
+        self.status_var.set(f"Looking up '{content}'…")
+        try:
+            candidates = request_intake.search_candidates(content)
+        except Exception:
+            logger.exception("Candidate lookup failed for %r", content)
+            candidates = []
+
+        if not candidates:
+            created = request_intake.add_needs_identity(content, requester)
+            self._finish_request_add(created, needs_identity=True)
+            return
+
+        self._show_candidate_picker(content, requester, candidates)
+
+    def _finish_request_add(self, created, *, needs_identity: bool) -> None:
         self.request_content_var.set("")
-        self.last_action_var.set(f"Last action: added request #{created.request_id}")
-        self.status_var.set(f"Queued request #{created.request_id}: {created.content}")
+        tag = " (needs identity — pick a title to enable auto-grab)" if needs_identity else ""
+        self.last_action_var.set(f"Last action: added request #{created.request_id}{tag}")
+        self.status_var.set(f"Queued request #{created.request_id}: {created.content}{tag}")
+        self.refresh_requests()
+
+    def _pick_from_list(self, title: str, header: str, labels: list[str]) -> int | None:
+        """Modal Tk listbox picker. Returns the chosen index or None (cancel).
+
+        Pure Tk glue: all decision logic lives in request_intake (testable in
+        CI); this method only collects a click.
+        """
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.transient(self.root)
+        win.grab_set()
+        ttk.Label(win, text=header, padding=8).grid(row=0, column=0, sticky="w")
+        listbox = tk.Listbox(win, width=70, height=min(12, len(labels)))
+        for label in labels:
+            listbox.insert(tk.END, label)
+        listbox.grid(row=1, column=0, padx=8, sticky="nsew")
+        if labels:
+            listbox.selection_set(0)
+        chosen: list[int | None] = [None]
+
+        def _confirm() -> None:
+            sel = listbox.curselection()
+            chosen[0] = sel[0] if sel else None
+            win.destroy()
+
+        btns = ttk.Frame(win)
+        btns.grid(row=2, column=0, pady=8)
+        ttk.Button(btns, text="OK", command=_confirm).grid(row=0, column=0, padx=4)
+        ttk.Button(btns, text="Cancel", command=win.destroy).grid(row=0, column=1, padx=4)
+        win.columnconfigure(0, weight=1)
+        win.rowconfigure(1, weight=1)
+        self.root.wait_window(win)
+        return chosen[0]
+
+    def _show_candidate_picker(self, content: str, requester: str, candidates: list) -> None:
+        """Tk glue over request_intake.add_picked_candidate: collect the pick
+        (and a season answer for TV), then hand the decision to the store layer.
+        'None of these' stores needs_identity; a TV pick never creates a
+        season=NULL whole-show row."""
+        labels = [request_intake.format_candidate_label(m) for m in candidates]
+        labels.append("None of these — leave as needs identity")
+        idx = self._pick_from_list("Which one did you mean?",
+                                   f"Results for: {content}", labels)
+        if idx is None:
+            return  # dialog cancelled — add nothing
+
+        seasons = None
+        if 0 <= idx < len(candidates) and candidates[idx].media_type == "tv":
+            from tkinter import simpledialog
+            answer = simpledialog.askstring(
+                "Which season?",
+                f"{candidates[idx].title}: enter a season number, or 'all' for "
+                "every aired season.",
+                parent=self.root)
+            if answer is None:
+                return  # season prompt cancelled — add nothing
+            seasons = request_intake.seasons_for_answer(answer, candidates[idx])
+
+        outcome = request_intake.add_picked_candidate(
+            content, requester, candidates, idx, seasons=seasons)
+        self.request_content_var.set("")
+        needs = outcome.status == "needs_identity"
+        tag = " (needs identity — pick a title to enable auto-grab)" if needs else ""
+        self.last_action_var.set(
+            f"Last action: added {len(outcome.request_ids)} request(s){tag}")
+        self.status_var.set(
+            f"Queued {len(outcome.request_ids)} request(s) for '{content}'{tag}")
+        self.refresh_requests()
+
+    def resolve_selected_request(self) -> None:
+        """The resolve path for a needs_identity row: pick the exact title, then
+        attach the identity so it becomes auto-grabbable."""
+        request_id = self._selected_request_id()
+        if request_id is None:
+            self._show_warning("No request selected", "Select a request to resolve.")
+            return
+        req = get_request(request_id)
+        if req is None:
+            self._show_warning("Request not found", f"Request #{request_id} is gone.")
+            return
+        content = (req.resolved_title or req.content or "").strip()
+        self.status_var.set(f"Looking up '{content}'…")
+        try:
+            candidates = request_intake.search_candidates(content)
+        except Exception:
+            logger.exception("Resolve lookup failed for %r", content)
+            candidates = []
+        if not candidates:
+            self._show_info("No matches", f"No candidates found for '{content}'.")
+            return
+
+        labels = [request_intake.format_candidate_label(m) for m in candidates]
+        idx = self._pick_from_list("Resolve identity", f"Resolve: {content}", labels)
+        if idx is None or not (0 <= idx < len(candidates)):
+            return  # cancelled — leave the row as needs_identity
+
+        match = candidates[idx]
+        season = None
+        if match.media_type == "tv":
+            from tkinter import simpledialog
+            ans = simpledialog.askstring(
+                "Season", f"{match.title}: season number (blank = S1)",
+                parent=self.root)
+            season = request_intake.parse_single_season(ans, default=1)
+        updated = request_intake.resolve_request(request_id, match, season=season)
+        if updated is not None:
+            self.status_var.set(
+                f"Resolved request #{request_id} → {match.title} ({updated.status})")
         self.refresh_requests()
 
     def complete_selected_request(self) -> None:
