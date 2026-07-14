@@ -203,6 +203,24 @@ def get_show(show_id: int) -> TrackedShow | None:
     return shows[0] if shows else None
 
 
+def get_show_by_identity(source: str, external_id: str) -> TrackedShow | None:
+    """The tracked show for a provider-qualified identity (source, external_id).
+
+    This is the identity-first lookup Task D routes through instead of fuzzy
+    title matching: a request row carrying tvdb:12345 resolves to exactly the
+    show that (source, external_id) uniquely keys, so a same-title country
+    edition can never route to the wrong folder."""
+    if not (source and external_id):
+        return None
+    initialize_shows_db()
+    with _SHOWS_LOCK, db.connect() as conn:
+        row = conn.execute(
+            "SELECT id FROM tracked_shows WHERE source = ? AND external_id = ?",
+            (source, str(external_id)),
+        ).fetchone()
+    return get_show(int(row[0])) if row is not None else None
+
+
 def list_shows() -> list[TrackedShow]:
     """All tracked shows with folder lists and have/missing rollups."""
     initialize_shows_db()

@@ -279,6 +279,24 @@ CREATE TABLE IF NOT EXISTS request_downloads (
 )
 """
 
+# ---------------------------------------------------------------------------
+# Needs-placement (Task D item 3) — a download that COULDN'T route confidently
+# and is sitting in staging. The grab-queue subtab (Phase 6) renders these with
+# a one-click "create <root>/<Show>/Season NN" action; the store row + the
+# action function (DownloadManager.create_placement_folder) are built now.
+# ---------------------------------------------------------------------------
+_SCHEMA_NEEDS_PLACEMENT = """
+CREATE TABLE IF NOT EXISTS needs_placement (
+    download_id   INTEGER PRIMARY KEY,
+    show_id       INTEGER,
+    season        INTEGER,
+    suggested_dir TEXT,
+    reason        TEXT,
+    created_at    TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    resolved_at   TEXT
+)
+"""
+
 
 def _init_failed_grabs(conn) -> None:
     conn.execute("""
@@ -386,6 +404,7 @@ def initialize_downloads_db() -> None:
         conn.execute(_SCHEMA_BLOCKLIST)
         conn.execute(_SCHEMA_DOWNLOAD_FILES)
         conn.execute(_SCHEMA_REQUEST_DOWNLOADS)
+        conn.execute(_SCHEMA_NEEDS_PLACEMENT)
         for table, column, col_def in (_MIGRATIONS + _DEFERRAL_MIGRATIONS):
             existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
             if existing and column not in existing:
@@ -644,6 +663,22 @@ def add_history(download_id: int, action: str, *, before: str | None,
             (download_id, action, before, after),
         )
         conn.commit()
+
+
+def history_for_download(download_id: int) -> list[HistoryRow]:
+    """Every history row for one download (oldest first). Used by the move loop
+    to attribute a partial file at a target to THIS download's own interrupted
+    earlier pass — anything unattributed is a foreign file and never replaced."""
+    initialize_downloads_db()
+    with _DL_LOCK, db.connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, download_id, action, before_value, after_value, at
+            FROM download_history WHERE download_id = ? ORDER BY id
+            """,
+            (download_id,),
+        ).fetchall()
+    return [HistoryRow(*r) for r in rows]
 
 
 def list_history(*, limit: int = 200) -> list[HistoryRow]:
@@ -1040,6 +1075,63 @@ def link_request_download(request_id: int, download_id: int,
             " DO UPDATE SET role = excluded.role",
             (request_id, download_id, role))
         conn.commit()
+
+
+@dataclass(frozen=True)
+class NeedsPlacementRow:
+    download_id: int
+    show_id: int | None
+    season: int | None
+    suggested_dir: str | None
+    reason: str | None
+    created_at: str
+
+
+def record_needs_placement(download_id: int, *, show_id: int | None,
+                           season: int | None, suggested_dir: str | None,
+                           reason: str | None) -> None:
+    """Flag a download that landed in staging without a confident route. Upsert
+    on download_id so a re-processed download refreshes rather than duplicates."""
+    initialize_downloads_db()
+    with _DL_LOCK, db.connect() as conn:
+        conn.execute(
+            "INSERT INTO needs_placement (download_id, show_id, season,"
+            " suggested_dir, reason, resolved_at) VALUES (?, ?, ?, ?, ?, NULL)"
+            " ON CONFLICT(download_id) DO UPDATE SET show_id = excluded.show_id,"
+            " season = excluded.season, suggested_dir = excluded.suggested_dir,"
+            " reason = excluded.reason, resolved_at = NULL",
+            (download_id, show_id, season, suggested_dir, reason))
+        conn.commit()
+
+
+def clear_needs_placement(download_id: int) -> None:
+    """Mark a needs-placement row resolved (the download was placed)."""
+    with _DL_LOCK, db.connect() as conn:
+        conn.execute(
+            "UPDATE needs_placement SET resolved_at = CURRENT_TIMESTAMP"
+            " WHERE download_id = ?", (download_id,))
+        conn.commit()
+
+
+def list_needs_placement() -> list[NeedsPlacementRow]:
+    """Unresolved needs-placement rows for the grab queue."""
+    initialize_downloads_db()
+    with _DL_LOCK, db.connect() as conn:
+        rows = conn.execute(
+            "SELECT download_id, show_id, season, suggested_dir, reason,"
+            " created_at FROM needs_placement WHERE resolved_at IS NULL"
+            " ORDER BY created_at DESC").fetchall()
+    return [NeedsPlacementRow(r[0], r[1], r[2], r[3], r[4], r[5]) for r in rows]
+
+
+def get_needs_placement(download_id: int) -> NeedsPlacementRow | None:
+    initialize_downloads_db()
+    with _DL_LOCK, db.connect() as conn:
+        r = conn.execute(
+            "SELECT download_id, show_id, season, suggested_dir, reason,"
+            " created_at FROM needs_placement WHERE download_id = ?"
+            " AND resolved_at IS NULL", (download_id,)).fetchone()
+    return NeedsPlacementRow(r[0], r[1], r[2], r[3], r[4], r[5]) if r else None
 
 
 def downloads_for_request(request_id: int, *,

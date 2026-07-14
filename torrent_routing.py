@@ -24,7 +24,12 @@ import config
 logger = logging.getLogger(__name__)
 
 VIDEO_EXTENSIONS = set(config.LIBRARY_INDEX_EXTENSIONS)
-SUBTITLE_EXTENSIONS = {".srt", ".ass", ".ssa", ".sub", ".vtt"}
+# .smi (SAMI) added in Task D2 item 4. .sub/.idx are a PAIRED VobSub asset —
+# both listed here, but the move loop moves them together or not at all (a lone
+# .sub VobSub track is broken without its .idx index; see VOBSUB_EXTENSIONS).
+SUBTITLE_EXTENSIONS = {".srt", ".ass", ".ssa", ".sub", ".vtt", ".smi", ".idx"}
+# The VobSub pair: neither half is usable alone.
+VOBSUB_EXTENSIONS = {".sub", ".idx"}
 
 _INVALID_FS_CHARS = re.compile(r'[<>:"/\\|?*]')
 
@@ -32,6 +37,29 @@ _INVALID_FS_CHARS = re.compile(r'[<>:"/\\|?*]')
 def sanitize_for_filesystem(name: str) -> str:
     """Strip characters Windows refuses in file/folder names."""
     return _INVALID_FS_CHARS.sub("", name).strip()
+
+
+# --- Movie folder + stem naming (Task D2) -----------------------------------
+
+def movie_display_base(title: str, year: int | None) -> str:
+    """The `<Canonical Title (Year)>` base both the per-movie folder and the
+    primary video stem share. Only filesystem-hostile characters are stripped;
+    the year parens are preserved (Plex reads them)."""
+    base = f"{title} ({year})" if year else title
+    return sanitize_for_filesystem(base)
+
+
+def movie_folder_name(title: str, year: int | None,
+                      tmdb_id: str | int | None = None) -> str:
+    """Per-movie folder name.  RESOLVED DECISION 4: a VERIFIED TMDB identity is
+    tagged as `<Canonical Title (Year)> {tmdb-12345}`; without one the folder is
+    just `<Canonical Title (Year)>` (never a fabricated/translated id). The brace
+    tag is appended AFTER sanitising the base so the braces survive."""
+    base = movie_display_base(title, year)
+    tmdb = str(tmdb_id).strip() if tmdb_id not in (None, "") else ""
+    if tmdb:
+        return f"{base} {{tmdb-{tmdb}}}"
+    return base
 
 # Confidence needed before we'll route into an existing show folder.
 _SHOW_MATCH_THRESHOLD = 0.85
@@ -109,11 +137,22 @@ class RoutePlan:
     confident: bool
     dest_dir: str                    # where the media should land
     reason: str                      # human explanation shown in the UI
-    new_filename: str | None = None  # None = keep original name
+    # new_filename is a STEM, not a full filename: `_post_process` appends the
+    # source extension per file, and multi-file payloads (season packs,
+    # multipart movies) derive one stem PER FILE from it. None = keep original.
+    new_filename: str | None = None
     show_folder: str | None = None
     season_folder: str | None = None
     parsed: ParsedName | None = None
     library_root: str | None = None
+    # True when a per-movie folder was created WITHOUT a verified TMDB tag —
+    # the folder is valid but flagged for later metadata repair (Task D2 item 1).
+    missing_folder_id: bool = False
+
+    @property
+    def new_stem(self) -> str | None:
+        """Explicit alias — new_filename has always been a stem (Task D2 item 2)."""
+        return self.new_filename
 
     def describe(self) -> str:
         target = self.dest_dir
@@ -217,12 +256,18 @@ def _season_folder_name(show_dir: Path, season: int) -> str:
 
 # --- Public entry point --------------------------------------------------
 
-def plan_route(torrent_name: str, media_type: str, *, request_title: str | None = None) -> RoutePlan:
+def plan_route(torrent_name: str, media_type: str, *, request_title: str | None = None,
+               movie_title: str | None = None, movie_year: int | None = None,
+               movie_tmdb_id: str | int | None = None) -> RoutePlan:
     """Plan destination + optional rename for a torrent, before or after download.
 
     request_title, when provided (the resolved title from the request queue),
     is preferred over the parsed torrent name for show matching — it's the
     canonical name the user actually asked for.
+
+    movie_title/movie_year/movie_tmdb_id (Task D2), when a qualified movie
+    identity is known, drive the per-movie folder + `{tmdb-ID}` tag. Without a
+    TMDB id the folder is created untagged and missing_folder_id is set.
     """
     staging = str(Path(config.TORRENT_DOWNLOAD_DIR))
     parsed = parse_torrent_name(torrent_name)
@@ -299,13 +344,44 @@ def plan_route(torrent_name: str, media_type: str, *, request_title: str | None 
         if media_type == "movie" else []
     if media_type == "movie" and roots:
         chosen = pick_root_by_free_space(roots) or roots[0]
+        # Task D2 item 1: per-movie folder, always. A qualified canonical title
+        # (from want_json) drives `<Title (Year) {tmdb-ID}>/` + a readable
+        # `<Title (Year)>` stem; an unlinked/manual movie folders under its
+        # parsed title with NO fabricated tag (missing_folder_id flagged).
+        title = (movie_title or "").strip() or parsed.show_title.strip()
+        if title:
+            year = movie_year if movie_year is not None else _detect_year(torrent_name)
+            tmdb = str(movie_tmdb_id).strip() if movie_tmdb_id not in (None, "") else ""
+            folder = movie_folder_name(title, year, tmdb or None)
+            dest = str(Path(chosen) / folder)
+            # NB: show_folder stays None — it means a TV SHOW folder to _post_
+            # process (it derives the rename base from it). A movie's rename base
+            # is new_filename, not the folder name.
+            return RoutePlan(
+                confident=True, dest_dir=dest, parsed=parsed,
+                library_root=chosen,
+                new_filename=movie_display_base(title, year),
+                missing_folder_id=not tmdb,
+                reason=(f"movie folder '{folder}' under {Path(chosen).name}"
+                        + ("" if tmdb else " (no verified TMDB id)")),
+            )
+        # No usable title at all — keep the file flat rather than invent a folder
+        # name from release junk.
         return RoutePlan(
             confident=True, dest_dir=chosen, parsed=parsed,
             library_root=chosen,
             reason=f"movie root ({Path(chosen).name}, most free space)",
-            new_filename=None,  # movies keep their original filename
+            new_filename=None,
         )
     return RoutePlan(
         confident=False, dest_dir=staging, parsed=parsed,
         reason="no library root configured for this media type",
     )
+
+
+_YEAR_IN_NAME_RE = re.compile(r"(?<!\d)(19\d{2}|20\d{2})(?!\d)")
+
+
+def _detect_year(name: str) -> int | None:
+    m = _YEAR_IN_NAME_RE.search(name)
+    return int(m.group(1)) if m else None

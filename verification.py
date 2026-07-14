@@ -18,7 +18,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import media_identity
@@ -152,10 +152,35 @@ class VerificationResult:
         return [v for v in self.file_verdicts if v.role in _IDENTITY_GATING_ROLES]
 
 
+# A trailing standalone number on an EPISODIC file is an episode/absolute number
+# ("Bare Show - 05"), NOT a sequel number — stripping it before the sequel guard
+# keeps such files (which carry no season evidence) from being read as sequels.
+# Movies keep the full sequel logic; only tv/anime episodic wants strip.
+_EPISODIC_TRAILING_NUM_RE = re.compile(r"[\s._\-]+\d{1,4}\s*$")
+_BRACKET_BLOCK_RE = re.compile(r"\[[^\]]*\]|\([^)]*\)")
+
+
+def _episodic_compare_title(raw: str) -> str:
+    t = _BRACKET_BLOCK_RE.sub(" ", raw)
+    t = re.sub(r"\s{2,}", " ", t).strip()
+    prev = None
+    while prev != t:
+        prev = t
+        t = _EPISODIC_TRAILING_NUM_RE.sub("", t).strip()
+    return t or raw
+
+
 def verify_file(path: Path, want: MediaIdentity, role: str) -> FileVerdict:
     parsed = parse_file(path)
     if role not in _IDENTITY_GATING_ROLES:
         return FileVerdict(path, role, True, "ok", "", parsed)
+    # Episodic wants: compare on the SHOW-TITLE portion, not the trailing episode
+    # number (Task D item 2 composes with the season contradiction gate — the
+    # parsed seasons tuple is untouched, so an S03-vs-S02 contradiction still
+    # fails; only the bare-number false sequel is defused).
+    if want.media_type in ("tv", "anime", "xanime"):
+        parsed = replace(
+            parsed, parsed_title=_episodic_compare_title(parsed.parsed_title))
     verdict = media_identity.compare_media_identity(want, parsed)
     return FileVerdict(path, role, verdict.ok, verdict.reason_code,
                        verdict.detail, parsed)

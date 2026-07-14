@@ -41,6 +41,7 @@ from telegram_service import TelegramBotService
 import anime_db
 import auth_store
 import downloads_store
+import movie_migration
 import request_intake
 import shows_store
 import telegram_service
@@ -728,6 +729,10 @@ class DesktopApp:
              "You tick what to DELETE — subtitles, Plex artwork, and Extras folders are never flagged."),
             ("Missing Episodes", self._run_missing_episodes,
              "Detect numbering gaps inside seasons you already have files for."),
+            ("Organize Movies", self._run_movie_migration,
+             "Move flat movie files into per-movie folders named "
+             "'Title (Year) {tmdb-ID}'. Dry-run preview first — you tick what "
+             "moves; every move is journalled and reversible."),
             ("Unindexed Files", self._run_unindexed,
              "Files on disk that aren't in the local search index yet — fix with Reindex."),
             ("Reindex", self.rebuild_library_index_from_ui,
@@ -3505,6 +3510,86 @@ class DesktopApp:
         )
 
     # =====================================================================
+    # Maintenance tab — flat-movie migration (Task D2 item 7)
+    # =====================================================================
+
+    def _run_movie_migration(self) -> None:
+        """Dry-run scan: flat movies under the movie roots get a per-movie
+        folder plan (verified TMDB identity -> {tmdb-ID} tag). Nothing moves
+        until rows are ticked and Apply Selected confirms."""
+        if not self._maint_require_library_paths("Organize Movies"):
+            return
+        roots = [p for p in config.media_paths_for_types("movie")
+                 if Path(p).is_dir()]
+        if not roots:
+            self._show_warning("Organize Movies",
+                               "No movie library folder is configured.")
+            return
+        self._maint_set_busy("Organize Movies (dry-run scan)")
+
+        def worker() -> None:
+            try:
+                plan, skipped = movie_migration.plan_migration(
+                    roots, resolver=movie_migration.tmdb_resolver)
+            except Exception as exc:
+                logger.exception("Movie migration scan failed.")
+                self._post_to_ui(lambda: self._maint_status_var.set(
+                    f"Organize Movies error: {exc}"))
+                return
+            self._post_to_ui(
+                lambda: self._handle_movie_migration_plan(plan, skipped))
+
+        threading.Thread(target=worker, name="maint-movie-migration",
+                         daemon=True).start()
+
+    def _handle_movie_migration_plan(self, plan, skipped) -> None:
+        self._maint_tool_name = "movie_migration"
+        self._maint_results = plan
+        skipped_note = (f" {len(skipped)} skipped (identity unresolved — fix "
+                        "manually, never guessed)." if skipped else "")
+        if not plan:
+            self._maint_status_var.set(
+                "Every movie already has its own folder." + skipped_note)
+            self._populate_maint_tree(
+                [], col1="Current Path", col2="New Path", col3="Identity")
+            self._show_info("Organize Movies",
+                            "No flat movie files to organize." + skipped_note)
+            return
+        self._maint_status_var.set(
+            f"{len(plan)} movie(s) would get a per-movie folder.{skipped_note} "
+            "Tick what to MOVE, then Apply Selected. Every move is journalled "
+            "and reversible.")
+        typed_rows: list[tuple[str, tuple[str, str, str, str], Any]] = [
+            (
+                "movie",
+                ("", item.old_path, item.new_path,
+                 (f"tmdb-{item.tmdb_id}" if item.has_tmdb
+                  else "no verified TMDB id")),
+                idx,
+            )
+            for idx, item in enumerate(plan)
+        ]
+        self._populate_maint_tree(
+            [], col1="Current Path", col2="New Path", col3="Identity",
+            check_label="Move?", typed_rows=typed_rows,
+        )
+
+    def _handle_movie_migration_result(self, summary: dict, run_id: str) -> None:
+        moved, failed = summary.get("moved", 0), summary.get("failed", 0)
+        self._maint_status_var.set(
+            f"Organize Movies: {moved} moved, {failed} failed (run {run_id[:8]})")
+        detail = f"{moved} movie(s) moved into per-movie folders."
+        if failed:
+            detail += (f"\n{failed} move(s) FAILED (collision/permission) — "
+                       "the files stayed where they were; details in the log.")
+        detail += ("\n\nThe run is journalled: an interrupted run resumes by "
+                   "running the tool again; the journal keeps the old paths if "
+                   "a revert is ever needed.")
+        (self._show_warning if failed else self._show_info)(
+            "Organize Movies", detail)
+        self._run_movie_migration()  # re-scan; done rows drop off the plan
+
+    # =====================================================================
     # Maintenance tab — junk cleanup (samples, release notes, empty folders)
     # =====================================================================
 
@@ -3708,7 +3793,7 @@ class DesktopApp:
     def _apply_maint_selection(self) -> None:
         if self._maint_tool_name not in ("sanitize", "find_duplicates",
                                          "custom_rename", "clean_junk",
-                                         "missing_episodes"):
+                                         "missing_episodes", "movie_migration"):
             self._show_info(
                 "Apply Selection",
                 "The current tool results have no applyable actions.\n\n"
@@ -3717,7 +3802,8 @@ class DesktopApp:
                 "  - Clean Junk         -> DELETES the checked junk/empty folders\n"
                 "  - Sanitize Names     -> RENAMES the checked files\n"
                 "  - Custom Rename...   -> RENAMES per your rules\n"
-                "  - Missing Episodes   -> DOWNLOADS the checked episodes",
+                "  - Missing Episodes   -> DOWNLOADS the checked episodes\n"
+                "  - Organize Movies    -> MOVES the checked movies into per-movie folders",
             )
             return
 
@@ -3763,6 +3849,43 @@ class DesktopApp:
             if not gaps:
                 return
             self._grab_missing_selected(gaps)
+            return
+
+        if self._maint_tool_name == "movie_migration":
+            items = [
+                self._maint_results[i] for i in selected_payloads
+                if isinstance(i, int) and 0 <= i < len(self._maint_results)
+            ]
+            if not items:
+                return
+            preview = "\n".join(
+                f"  {Path(it.old_path).name}\n    -> {it.new_path}"
+                for it in items[:8])
+            if len(items) > 8:
+                preview += f"\n  ... and {len(items) - 8} more"
+            if not self._ask_yes_no(
+                "Confirm Organize Movies",
+                f"About to move {len(items)} movie(s) into per-movie "
+                f"folders:\n\n{preview}\n\nEvery move is journalled and "
+                "reversible. Continue?",
+            ):
+                return
+            self._maint_status_var.set(f"Moving {len(items)} movie(s)...")
+
+            def worker() -> None:
+                run_id = movie_migration.begin_run(items)
+
+                def progress(done: int, total: int, _op) -> None:
+                    self._post_to_ui(lambda: self._maint_status_var.set(
+                        f"Organize Movies: {done}/{total}"))
+
+                summary = movie_migration.execute_run(
+                    run_id, on_progress=progress)
+                self._post_to_ui(lambda: self._handle_movie_migration_result(
+                    summary, run_id))
+
+            threading.Thread(target=worker, name="maint-apply-movie-migration",
+                             daemon=True).start()
             return
 
         if self._maint_tool_name == "find_duplicates":
@@ -4344,6 +4467,7 @@ class DesktopApp:
         ("XANIME_ENABLED", "Hentai (xanime) libraries, requests + search (restart to apply)", "bool"),
         ("LOW_QUALITY_MB_PER_MIN", "Low-quality threshold (MB per minute)", "text"),
         ("SUBTITLE_LANGUAGE", "Subtitle language (en, es, fr, …)", "text"),
+        ("SUBTITLE_SUBFOLDER", "Put moved subtitles in a 'Subs' subfolder (verify Plex scans it first)", "bool"),
         # Plex identity
         ("PLEX_ACCOUNT_NAME", "Which Plex user are you? (Watchlist/Recs)", "plex_account"),
         # Misc

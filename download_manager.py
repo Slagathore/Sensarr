@@ -90,6 +90,11 @@ def _size_prefs(media_type: str) -> tuple[float, float, int]:
 # recently-failed one goes first (rotating through copies across passes).
 FAILED_GRAB_RETRY_AFTER_S = 7 * 24 * 3600
 
+# Multipart movie disc markers ("Movie.cd1.mkv", "Film Part 2", "disc-01").
+_MULTIPART_RE = re.compile(
+    r"(?:^|[\W_])(?:cd|dvd|disc|disk|part|pt)[\s._-]*(\d{1,2})(?:[\W_]|$)",
+    re.IGNORECASE)
+
 
 def _magnet_hash(magnet: str) -> str:
     m = re.search(r"btih:([A-Za-z0-9]{32,40})", magnet or "")
@@ -283,6 +288,34 @@ def _build_want_snapshot(
         "size_max_rate": max_rate,
         "runtime_minutes": minutes,
     }
+
+
+def _movie_route_identity(req) -> tuple[str | None, int | None, str | None]:
+    """(canonical_title, canonical_year, tmdb_id) for per-movie folder routing
+    (Task D2). tmdb_id is only returned for a VERIFIED tmdb source — never an
+    id from another provider recast as tmdb (RESOLVED DECISION 4)."""
+    if req is None:
+        return None, None, None
+    title = getattr(req, "resolved_title", None)
+    year = getattr(req, "canonical_year", None)
+    source = getattr(req, "identity_source", None)
+    ext = getattr(req, "external_id", None)
+    tmdb = str(ext) if (source == "tmdb" and ext) else None
+    return title, year, tmdb
+
+
+def _movie_route_identity_from_want(want: dict | None
+                                    ) -> tuple[str | None, int | None, str | None]:
+    """Same as _movie_route_identity but from an immutable want_json snapshot —
+    the authoritative source at _post_process time."""
+    if not want:
+        return None, None, None
+    title = want.get("canonical_title")
+    year = want.get("canonical_year")
+    source = want.get("identity_source")
+    ext = want.get("external_id")
+    tmdb = str(ext) if (source == "tmdb" and ext) else None
+    return title, year, tmdb
 
 
 def _request_title_from_row(row) -> str | None:
@@ -531,6 +564,7 @@ class DownloadManager:
         auto_rename: bool | None = None,
         auto_move: bool | None = None,
         episode_context: tuple[int, int, int] | None = None,  # (show_id, season, episode)
+        season_context: tuple[int, int] | None = None,  # (show_id, season) for a pack
         replace_path: str | None = None,  # old low-quality file to delete after move
         failure_key: str | None = None,   # failure-memory context for pack grabs
     ) -> int:
@@ -539,6 +573,7 @@ class DownloadManager:
         auto_move = config.TORRENT_AUTO_MOVE if auto_move is None else auto_move
 
         show_id = season = episode = None
+        req = get_request(request_id) if request_id is not None else None
         if episode_context is not None:
             show_id, season, episode = episode_context
             show = shows_store.get_show(show_id)
@@ -547,6 +582,22 @@ class DownloadManager:
                 if show is not None
                 else torrent_routing.plan_route(result.title, result.media_type)
             )
+        elif season_context is not None:
+            # Request-linked season pack — route by show_id (Task D item 1),
+            # episode left None (the pack carries many, named per-file at move).
+            show_id, season = season_context
+            show = shows_store.get_show(show_id)
+            plan = (
+                show_tracker.plan_for_season(show, season)
+                if show is not None
+                else torrent_routing.plan_route(
+                    result.title, result.media_type, request_title=request_title)
+            )
+        elif result.media_type == "movie":
+            mt, my, mtmdb = _movie_route_identity(req)
+            plan = torrent_routing.plan_route(
+                result.title, result.media_type, request_title=request_title,
+                movie_title=mt, movie_year=my, movie_tmdb_id=mtmdb)
         else:
             plan = torrent_routing.plan_route(
                 result.title, result.media_type, request_title=request_title
@@ -554,8 +605,8 @@ class DownloadManager:
         staging = Path(config.TORRENT_DOWNLOAD_DIR)
         staging.mkdir(parents=True, exist_ok=True)
 
-        # Freeze the want snapshot from the request row as it stands NOW.
-        req = get_request(request_id) if request_id is not None else None
+        # Freeze the want snapshot from the request row as it stands NOW
+        # (req was already fetched above for movie/season routing).
         minutes = _request_movie_minutes(req) if (
             req is not None and result.media_type == "movie") else None
         want = _build_want_snapshot(
@@ -1076,6 +1127,29 @@ class DownloadManager:
                 best, best_score = show, score
         return best if best_score >= 0.85 else None
 
+    @staticmethod
+    def _tracked_show_for_request(req) -> shows_store.TrackedShow | None:
+        """Resolve (upserting if new) the tracked show a request-linked TV grab
+        routes through — by IDENTITY (source, external_id), never fuzzy title
+        matching (Task D item 1). Returns None for movies / unqualified rows,
+        which keep the legacy fuzzy paths."""
+        if req is None or req.media_type not in ("tv", "anime", "xanime"):
+            return None
+        source = getattr(req, "identity_source", None)
+        ext = getattr(req, "external_id", None)
+        if not (source and ext):
+            return None
+        ext = str(ext)
+        show = shows_store.get_show_by_identity(source, ext)
+        if show is not None:
+            return show
+        show_id = shows_store.upsert_show(
+            title=req.resolved_title or req.content, media_type=req.media_type,
+            source=source, external_id=ext,
+            external_url=getattr(req, "external_url", None),
+            year=getattr(req, "canonical_year", None))
+        return shows_store.get_show(show_id)
+
     # ------------------------------------------------------------------
     # Selection engine wiring (Phase 3) — every automatic decision path runs
     # torrent_select.select_torrent over a search_collect pool, injects the
@@ -1362,7 +1436,11 @@ class DownloadManager:
 
         from datetime import date
         today = date.today().isoformat()
-        show = self._match_tracked_show(_row_search_alias(req))
+        # Identity-first (Task D): resolve the show the request is linked to by
+        # its (source, external_id), falling back to fuzzy title only for
+        # unqualified legacy rows.
+        show = (self._tracked_show_for_request(req)
+                or self._match_tracked_show(_row_search_alias(req)))
         want_season = req.season
         if show is not None and want_season is not None:
             eps = [e for e in shows_store.list_episodes(show.show_id)
@@ -1535,9 +1613,13 @@ class DownloadManager:
         if not self._oversize_gate(survivors, media_type, key, minutes=season_minutes):
             downloads_store.record_selection_run(decision, request_id=request_id)
             return []
+        # Route the pack by show_id when we have an identity-backed show (Task D
+        # item 1) — the download row carries show_id + season so _post_process
+        # uses plan_for_season, never fuzzy find_show_folder.
+        season_context = (show.show_id, season) if show is not None else None
         download_id = self.grab(chosen, request_id=request_id, request_title=title,
                                 auto_rename=True, auto_move=True,
-                                failure_key=key)
+                                failure_key=key, season_context=season_context)
         downloads_store.record_selection_run(
             decision, request_id=request_id, download_id=download_id)
         logger.info("Season-pack grab: '%s' S%02d → download #%s (%s)",
@@ -1555,13 +1637,17 @@ class DownloadManager:
         if not title:
             return []
         today = date.today().isoformat()
-        show = self._match_tracked_show(title)
+        # Route by IDENTITY (source, external_id) first (Task D item 1): a
+        # request-linked TV row resolves — and upserts — its exact tracked show,
+        # so a same-title country edition can never route to the wrong folder.
+        # Fuzzy title matching survives only for rows with no qualified identity.
+        show = self._tracked_show_for_request(req) or self._match_tracked_show(title)
 
         # Task A explicit season rows: a request row carrying a concrete season
-        # grabs exactly that season's pack via the alias query, instead of the
-        # legacy new-show/next-season heuristic. (The heuristic still drives
-        # legacy season=NULL rows until Phase 3/Task D wires request-linked
-        # grabs through show_id. note: deferred - full show_id routing is Task D.)
+        # grabs exactly that season's pack via the alias query. This REPLACES the
+        # legacy new-show/next-season heuristic for request-linked grabs (Task D
+        # item 4) — the two must not coexist. The heuristic below runs only for
+        # legacy request rows that carry no explicit season.
         req_season = getattr(req, "season", None)
         if req_season is not None:
             display = show.title if show is not None else title
@@ -2366,13 +2452,25 @@ class DownloadManager:
         do_rename = force_rename or row.auto_rename
         do_move = force_move or row.auto_move
 
-        # Episode-linked grabs route deterministically — we KNOW the show,
-        # season, and episode, so no fuzzy folder matching is involved.
+        want_dict = downloads_store.get_want(download_id)
+
+        # Deterministic, identity-first routing (Task D): a KNOWN show_id routes
+        # by show_tracker (episode or whole-season pack), a qualified movie into
+        # its per-movie folder (Task D2). Fuzzy plan_route is the legacy fallback
+        # only for unlinked/manual downloads.
         plan = None
-        if row.show_id is not None and row.season is not None and row.episode is not None:
+        if row.show_id is not None:
             show = shows_store.get_show(row.show_id)
-            if show is not None:
+            if show is not None and row.season is not None and row.episode is not None:
                 plan = show_tracker.plan_for_episode(show, row.season, row.episode)
+            elif show is not None and row.season is not None:
+                # Season pack: episode is None; each file is named per-file below.
+                plan = show_tracker.plan_for_season(show, row.season)
+        if plan is None and row.media_type == "movie":
+            mt, my, mtmdb = _movie_route_identity_from_want(want_dict)
+            plan = torrent_routing.plan_route(
+                row.title, row.media_type, request_title=request_title,
+                movie_title=mt, movie_year=my, movie_tmdb_id=mtmdb)
         if plan is None:
             plan = torrent_routing.plan_route(
                 row.title, row.media_type, request_title=request_title
@@ -2385,7 +2483,10 @@ class DownloadManager:
         if not do_move and not do_rename:
             return f"left in staging (auto rename/move off) — planned: {plan.describe()}"
         if not plan.confident:
-            # Never move on a shaky route; the file stays findable in staging.
+            # Never move on a shaky route; the file stays findable in staging,
+            # and (Task D item 3) a needs-placement row surfaces it in the grab
+            # queue with a one-click create-folder action.
+            self._record_needs_placement(row, plan)
             return f"left in staging — route not confident: {plan.reason}"
 
         files = self._media_files_in_staging(row)
@@ -2397,7 +2498,6 @@ class DownloadManager:
         # media_identity. A contradictory identity-gating file (a sequel payload,
         # a wrong-country edition, a contradicting season) fails the whole
         # download: NO move, quarantine, blocklist, request reopens.
-        want_dict = downloads_store.get_want(download_id)
         if want_dict is not None:
             want_identity = verification.identity_from_want(want_dict)
             result = verification.verify_staging(
@@ -2434,15 +2534,52 @@ class DownloadManager:
         gating_total = 0
         skipped_gating = 0
         moved_final_paths: list[str] = []
+
+        # VobSub pairing (Task D2 item 4): a .sub/.idx track is only usable with
+        # its partner. Move both or neither — a lone half is broken and skipped.
+        vobsub_pair: dict[tuple[str, str], set[str]] = {}
+        for f in files:
+            if f.suffix.lower() in torrent_routing.VOBSUB_EXTENSIONS:
+                vobsub_pair.setdefault(
+                    (str(f.parent), f.stem.casefold()), set()).add(f.suffix.lower())
+        # Subtitle matched-basename collision tracking within this pass; the
+        # vobsub partner reuses its pair's resolved base rather than colliding.
+        used_sub_names: set[str] = set()
+        sub_base_for_stem: dict[tuple[str, str], str] = {}
+        movie_video_stem = plan.new_filename if row.media_type == "movie" else None
+
+        # Collision safety (Phase 5 gate: collisions never overwrite).
+        # prior_intended: names THIS download planned in an EARLIER pass — the
+        # only targets whose smaller on-disk copy may be treated as our own
+        # interrupted partial move. Snapshot BEFORE the loop (the loop appends
+        # its own 'renamed' rows). placed_this_pass: targets already taken by
+        # another file of this payload in THIS pass.
+        prior_intended = {
+            h.after_value for h in downloads_store.history_for_download(download_id)
+            if h.action in ("renamed", "moved") and h.after_value
+        }
+        placed_this_pass: set[str] = set()
+
+        roles: dict[str, str] = {}
+        for src in files:
+            roles[str(src)] = verification.classify_role(
+                src, is_video=(src.suffix.lower() in torrent_routing.VIDEO_EXTENSIONS),
+                is_subtitle=(src.suffix.lower() in torrent_routing.SUBTITLE_EXTENSIONS),
+                single_video=(len(video_files) == 1),
+                want=(verification.identity_from_want(want_dict)
+                      if want_dict else MediaIdentity(media_type=row.media_type)))
+        # Videos that will actually be PLACED — the multipart "- cdN" naming
+        # only applies when more than one of these exists (a sample/extra never
+        # makes a movie look multipart).
+        gating_video_count = sum(
+            1 for f in video_files
+            if roles[str(f)] in verification._IDENTITY_GATING_ROLES)
+
         for src in files:
             suffix = src.suffix.lower()
             is_video = suffix in torrent_routing.VIDEO_EXTENSIONS
             is_sub = suffix in torrent_routing.SUBTITLE_EXTENSIONS
-            role = verification.classify_role(
-                src, is_video=is_video, is_subtitle=is_sub,
-                single_video=(len(video_files) == 1),
-                want=(verification.identity_from_want(want_dict)
-                      if want_dict else MediaIdentity(media_type=row.media_type)))
+            role = roles[str(src)]
             is_gating = role in verification._IDENTITY_GATING_ROLES
             if is_gating:
                 gating_total += 1
@@ -2475,9 +2612,18 @@ class DownloadManager:
                         reason=f"role {role} never moves to a library root")
                 continue
 
-            # Multi-sub packs carry subtitles for every language — only the
-            # configured language (and untagged defaults) move to the library.
+            target_name = src.name
+            target_dir = dest_dir
             if is_sub:
+                # A lone VobSub half (only .sub OR only .idx) is broken — skip it.
+                if suffix in torrent_routing.VOBSUB_EXTENSIONS:
+                    have = vobsub_pair.get((str(src.parent), src.stem.casefold()), set())
+                    if len(have & torrent_routing.VOBSUB_EXTENSIONS) < 2:
+                        _record("skipped",
+                                reason="lone VobSub half (missing .sub/.idx partner)")
+                        continue
+                # Multi-sub packs carry subtitles for every language — only the
+                # configured language (and untagged defaults) come along.
                 try:
                     from subtitles import subtitle_language_ok
                     if not subtitle_language_ok(src):
@@ -2485,21 +2631,45 @@ class DownloadManager:
                         continue
                 except ImportError:
                     pass
-            target_name = src.name
-            if do_rename and is_video:
+                if config.SUBTITLE_SUBFOLDER:
+                    target_dir = dest_dir / "Subs"
+                if do_rename:
+                    base = self._subtitle_base_for(
+                        src, show_name=show_name, plan=plan,
+                        movie_stem=movie_video_stem,
+                        used=used_sub_names, reserved=sub_base_for_stem)
+                    if base:
+                        target_name = f"{base}{suffix}"
+            elif do_rename and is_video:
                 new_stem = self._episode_stem_for_file(
                     src, show_name=show_name, plan=plan,
-                    single_video=(len(video_files) == 1),
+                    single_video=(gating_video_count <= 1),
                 )
                 if new_stem:
                     target_name = f"{new_stem}{suffix}"
-                if target_name != src.name:
-                    downloads_store.add_history(
-                        download_id, "renamed", before=src.name, after=target_name,
-                    )
+            if target_name != src.name:
+                downloads_store.add_history(
+                    download_id, "renamed", before=src.name, after=target_name,
+                )
             if do_move:
-                dest_dir.mkdir(parents=True, exist_ok=True)
-                target = dest_dir / target_name
+                target_dir.mkdir(parents=True, exist_ok=True)
+                target = target_dir / target_name
+                if str(target).casefold() in placed_this_pass:
+                    # Two DIFFERENT payload files resolved to the same name
+                    # (e.g. two videos mapping to the same "- cdN"). Never
+                    # touch what we just placed — divert to a suffixed sibling.
+                    n = 2
+                    while True:
+                        cand = target_dir / f"{target.stem} ({n}){target.suffix}"
+                        if (str(cand).casefold() not in placed_this_pass
+                                and not cand.exists()):
+                            break
+                        n += 1
+                    downloads_store.add_history(
+                        download_id, "collision", before=str(target),
+                        after=f"name already taken by another file of this "
+                              f"download — kept as {cand.name}")
+                    target = cand
                 if target.exists():
                     try:
                         same_size = target.stat().st_size == src.stat().st_size
@@ -2525,7 +2695,15 @@ class DownloadManager:
                         target_smaller = target.stat().st_size < src.stat().st_size
                     except OSError:
                         target_smaller = False
-                    if target_smaller:
+                    # A smaller file at the target is replaced ONLY when it is
+                    # attributable to THIS download's own interrupted earlier
+                    # move (same release filename, or a name this download
+                    # planned before). An unattributed file is someone else's
+                    # media and is NEVER overwritten.
+                    ours = (target.name == src.name
+                            or target.name in prior_intended
+                            or str(target) in prior_intended)
+                    if target_smaller and ours:
                         # Interrupted cross-drive move left a partial copy —
                         # replace it with the complete staged file.
                         target.unlink(missing_ok=True)
@@ -2537,14 +2715,15 @@ class DownloadManager:
                     else:
                         downloads_store.add_history(
                             download_id, "error", before=str(src),
-                            after=f"NOT moved — a DIFFERENT (larger) file exists at: {target}",
+                            after=f"NOT moved — a DIFFERENT file exists at: {target}",
                         )
                         _record("failed",
-                                reason=f"a different larger file exists at {target}")
+                                reason=f"a different file exists at {target}")
                         if is_gating:
                             skipped_gating += 1
                         continue
                 shutil.move(str(src), str(target))
+                placed_this_pass.add(str(target).casefold())
                 downloads_store.add_history(
                     download_id, "moved", before=str(src), after=str(target),
                 )
@@ -2618,6 +2797,24 @@ class DownloadManager:
                     str(dest_dir),
                 ) or str(dest_dir)
                 shows_store.set_episode_file(row.show_id, row.season, row.episode, moved_video)
+            elif row.show_id is not None and row.season is not None:
+                # Season pack (episode None): record EACH placed episode from its
+                # per-file provenance, and map the show folder so later seasons
+                # land beside it (Task D — closes the tracking loop for packs).
+                if plan.show_folder:
+                    shows_store.add_show_folder(row.show_id, plan.show_folder)
+                for f in downloads_store.list_download_files(download_id):
+                    if (f.verification_state in ("verified", "duplicate")
+                            and f.parsed_episode is not None and f.final_path):
+                        shows_store.set_episode_file(
+                            row.show_id, row.season, int(f.parsed_episode),
+                            f.final_path)
+            # A per-movie folder created without a verified TMDB tag stays
+            # visible for later metadata repair (Task D2 item 1).
+            if getattr(plan, "missing_folder_id", False):
+                downloads_store.add_history(
+                    download_id, "missing_folder_id", before=str(dest_dir),
+                    after="per-movie folder created without a verified TMDB id")
             # Provenance link + AGGREGATE fulfillment (Task C item 4): the
             # download is placed; whether the REQUEST is fulfilled is decided by
             # the aggregate (a first episode never completes a season).
@@ -2656,9 +2853,103 @@ class DownloadManager:
                 return torrent_routing.sanitize_for_filesystem(
                     f"{show_name} - S{season:02d}E{parsed.episode:02d}"
                 )
-        if plan.new_filename and single_video:
+            return None
+        # Movie (no show_name): the plan stem is "<Title (Year)>". A single
+        # primary video ALWAYS takes the plain stem — a "Part 2" in the movie's
+        # own title ("Mockingjay Part 2") is not a disc marker. Only a payload
+        # with several primary videos keeps "- cdN" suffixes so discs don't
+        # collide. Extras/samples never reach here (role-gated away).
+        if plan.new_filename:
+            if not single_video:
+                m = _MULTIPART_RE.search(src.name)
+                if m:
+                    return torrent_routing.sanitize_for_filesystem(
+                        f"{plan.new_filename} - cd{int(m.group(1))}")
             return plan.new_filename
         return None
+
+    @staticmethod
+    def _subtitle_base_for(
+        src: Path, *, show_name: str | None, plan: torrent_routing.RoutePlan,
+        movie_stem: str | None, used: set[str],
+        reserved: dict[tuple[str, str], str],
+    ) -> str | None:
+        """Matched-basename stem for a subtitle: `<video stem>.<lang>[.forced|
+        .sdh]` (Task D2 item 3). Duplicate-language collisions get a `.N` suffix
+        (never an overwrite); a VobSub .sub/.idx pair reuses one resolved base so
+        the two halves match. Returns None when no video stem can be derived."""
+        from subtitles import parse_subtitle_identity, subtitle_stem
+        pair_key = (str(src.parent), src.stem.casefold())
+        if pair_key in reserved:
+            return reserved[pair_key]  # VobSub partner — reuse the pair's base
+
+        # The video stem this subtitle pairs with.
+        video_stem: str | None = None
+        if show_name:
+            parsed = torrent_routing.parse_torrent_name(src.name)
+            if parsed.episode is not None:
+                season = parsed.season or (
+                    plan.parsed.season if plan.parsed and plan.parsed.season else 1)
+                video_stem = torrent_routing.sanitize_for_filesystem(
+                    f"{show_name} - S{season:02d}E{parsed.episode:02d}")
+        else:
+            video_stem = movie_stem
+        if not video_stem:
+            return None
+
+        identity = parse_subtitle_identity(src)
+        base = subtitle_stem(video_stem, identity)
+        candidate, n = base, 2
+        while candidate in used:
+            candidate = f"{base}.{n}"
+            n += 1
+        used.add(candidate)
+        reserved[pair_key] = candidate
+        return candidate
+
+    def _record_needs_placement(self, row: downloads_store.DownloadRow,
+                                plan: torrent_routing.RoutePlan) -> None:
+        """Surface a download that couldn't route confidently as a grab-queue
+        needs-placement row (Task D item 3), with a suggested folder when the
+        show identity gives us one."""
+        suggested = None
+        if row.show_id is not None and row.season is not None:
+            show = shows_store.get_show(row.show_id)
+            if show is not None:
+                roots = [p for p in config.media_paths_for_types(show.media_type)
+                         if Path(p).is_dir()]
+                root = torrent_routing.pick_root_by_free_space(roots) if roots else None
+                base = root or (show.folders[0] if show.folders else None)
+                if base is not None:
+                    show_name = torrent_routing.sanitize_for_filesystem(show.title)
+                    suggested = str(Path(base) / show_name / f"Season {row.season:02d}")
+        downloads_store.record_needs_placement(
+            row.download_id, show_id=row.show_id, season=row.season,
+            suggested_dir=suggested, reason=plan.reason)
+
+    def create_placement_folder(self, download_id: int,
+                                dest_dir: str | None = None) -> str:
+        """One-click action behind a grab-queue needs-placement row (Task D item
+        3): create the destination folder, map it to the show, and re-run
+        placement so the staged files move. `dest_dir` overrides the suggestion."""
+        row = downloads_store.get_download(download_id)
+        if row is None:
+            return "row vanished"
+        np = downloads_store.get_needs_placement(download_id)
+        target = dest_dir or (np.suggested_dir if np else None)
+        if not target:
+            return "no destination folder to create — supply one"
+        tp = Path(target)
+        tp.mkdir(parents=True, exist_ok=True)
+        if row.show_id is not None and row.season is not None:
+            # Map the show folder (parent of "Season NN") and pin the season
+            # target so plan_for_season routes here deterministically.
+            show_dir = tp.parent if tp.name.lower().startswith("season") else tp
+            shows_store.add_show_folder(row.show_id, str(show_dir))
+            shows_store.set_season_target(row.show_id, row.season, str(tp))
+        downloads_store.clear_needs_placement(download_id)
+        out = self._post_process(download_id, force_move=True, force_rename=True)
+        return f"created {target} — {out}"
 
     def _cleanup_staging_leftovers(self, row: downloads_store.DownloadRow) -> None:
         """Remove the download's now-empty (or junk-only) staging folder."""

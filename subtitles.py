@@ -10,6 +10,7 @@
 # =============================================================================
 
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,67 @@ _LANG_ALIASES: dict[str, set[str]] = {
     "pl": {"pl", "pol", "polish"},
 }
 _ALL_LANG_TOKENS: set[str] = set().union(*_LANG_ALIASES.values())
+
+# Reverse index token -> ISO 639-1 code, for naming (parse a token back to "en").
+_TOKEN_TO_ISO: dict[str, str] = {
+    token: iso for iso, tokens in _LANG_ALIASES.items() for token in tokens
+}
+
+# Forced / SDH markers seen in subtitle filenames.
+_FORCED_TOKENS = {"forced", "foreign"}
+_SDH_TOKENS = {"sdh", "cc", "hi", "hoh"}
+
+
+@dataclass(frozen=True)
+class SubtitleIdentity:
+    """What a subtitle file IS, for both the keep-filter and Plex-matched naming
+    (Task D2 item 3). language is the ISO 639-1 code or None (unknown -> Plex
+    default track); forced/sdh drive the `.forced` / `.sdh` name suffix."""
+    language: str | None
+    forced: bool
+    sdh: bool
+
+
+def _subtitle_tokens(path) -> list[str]:
+    p = Path(path)
+    raw = p.stem
+    for ch in "[](){}_-. ":
+        raw = raw.replace(ch, ".")
+    return [t.casefold() for t in raw.split(".") if t]
+
+
+def parse_subtitle_identity(path) -> SubtitleIdentity:
+    """Parse language + forced/sdh flags out of a subtitle file name.
+
+    Only the filename is inspected (no content sniffing). Tokens are matched
+    against the same language alias table subtitle_language_ok uses, so the
+    filter and the naming agree. An unrecognised language yields None (the file
+    still moves — it becomes Plex's default/undetermined track)."""
+    lang: str | None = None
+    forced = False
+    sdh = False
+    for tok in _subtitle_tokens(path):
+        if lang is None and tok in _TOKEN_TO_ISO:
+            lang = _TOKEN_TO_ISO[tok]
+        if tok in _FORCED_TOKENS:
+            forced = True
+        if tok in _SDH_TOKENS:
+            sdh = True
+    return SubtitleIdentity(language=lang, forced=forced, sdh=sdh)
+
+
+def subtitle_stem(video_stem: str, identity: SubtitleIdentity) -> str:
+    """Assemble the Plex matched-basename subtitle stem:
+    `<video stem>.<lang>[.forced|.sdh]` (unknown language -> no code).
+    Forced wins over sdh when a file is somehow tagged both."""
+    parts = [video_stem]
+    if identity.language:
+        parts.append(identity.language)
+    if identity.forced:
+        parts.append("forced")
+    elif identity.sdh:
+        parts.append("sdh")
+    return ".".join(parts)
 
 
 def subtitle_language_ok(path, preferred: str | None = None) -> bool:

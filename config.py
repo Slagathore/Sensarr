@@ -297,6 +297,13 @@ LOW_QUALITY_MB_PER_MIN: float = float(os.getenv("LOW_QUALITY_MB_PER_MIN", "5"))
 # Subtitle language for the Library tab's "Find Subtitles" (ISO 639-1).
 SUBTITLE_LANGUAGE: str = os.getenv("SUBTITLE_LANGUAGE", "en").strip()
 
+# Where moved subtitles land relative to their video (Task D2 items 5/6).
+# Default OFF: same-folder matched-basename ("Movie (Year).en.srt" beside the
+# video) is the safest, universally-recognised layout. Turn ON only after
+# confirming your Plex version (>= 1.41.0) + agent + local-assets setting scan a
+# "Subs" subfolder — verified against your own server, never assumed.
+SUBTITLE_SUBFOLDER: bool = _env_bool("SUBTITLE_SUBFOLDER", False)
+
 # Which Plex account is YOU — used by the Watchlist/Recs tab.
 PLEX_ACCOUNT_NAME: str = os.getenv("PLEX_ACCOUNT_NAME", "").strip()
 

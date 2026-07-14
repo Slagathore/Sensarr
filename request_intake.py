@@ -29,6 +29,25 @@ import queue_store
 _TYPED_MEDIA = ("movie", "tv", "anime", "xanime")
 
 
+def _maybe_track_show(created: "queue_store.QueueRequest") -> None:
+    """On TV confirmation, upsert the identity-backed tracked_shows row so
+    routing goes by show_id, not title strings (Task D item 1). Best-effort:
+    intake must never break because the shows DB hiccuped. Anime keeps its own
+    provider flow (its season picker is frozen), so this is TV-only here — the
+    grab path still upserts for any episodic identity as a safety net."""
+    try:
+        if (created is None or created.media_type != "tv"
+                or not created.is_qualified):
+            return
+        import shows_store
+        shows_store.upsert_show(
+            title=created.resolved_title or created.content, media_type="tv",
+            source=created.identity_source, external_id=str(created.external_id),
+            external_url=created.external_url, year=created.canonical_year)
+    except Exception:  # never let show tracking break request intake
+        pass
+
+
 @dataclass(frozen=True)
 class IntakeResult:
     """Outcome of one intake attempt, for surfaces that want to report it."""
@@ -133,7 +152,7 @@ def add_matched_request(
         getattr(match, "title", None), content,
         origin_countries=countries, candidate_titles=candidate_titles,
     )
-    return queue_store.add_request(
+    created = queue_store.add_request(
         content,
         requester,
         media_type=media_type,
@@ -148,6 +167,8 @@ def add_matched_request(
         season=season,
         batch_id=batch_id,
     )
+    _maybe_track_show(created)
+    return created
 
 
 def add_from_identity(
@@ -176,7 +197,7 @@ def add_from_identity(
         return add_needs_identity(content, requester, media_type=media_type)
     aliases = build_aliases(
         resolved_title or content, content, origin_countries=origin_countries or [])
-    return queue_store.add_request(
+    created = queue_store.add_request(
         content,
         requester,
         media_type=media_type,
@@ -191,6 +212,8 @@ def add_from_identity(
         season=season,
         batch_id=batch_id,
     )
+    _maybe_track_show(created)
+    return created
 
 
 def queue_watchlist_item(item, requester, *, get_seasons=None) -> IntakeResult:

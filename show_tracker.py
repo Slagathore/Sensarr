@@ -860,3 +860,68 @@ def plan_for_episode(
         show_folder=folder, season_folder=season_name,
         reason=f"tracked show '{show.title}' → {Path(folder).name}/{season_name}",
     )
+
+
+def plan_for_season(
+    show: shows_store.TrackedShow, season: int,
+) -> torrent_routing.RoutePlan:
+    """Route plan for a whole-SEASON pack of a tracked show — by show_id, never
+    fuzzy title matching (Task D item 1). This is the season-pack sibling of
+    plan_for_episode: it resolves the season FOLDER but leaves per-file naming to
+    the move loop (a pack carries many episodes, each parsed individually).
+
+    Precedence mirrors plan_for_episode:
+      1. An explicit per-season target folder (season_targets).
+      2. The mapped folder that already contains this season.
+      3. The show's first mapped folder, creating "Season NN".
+    A brand-new show with NO mapped folders creates
+    "<type root>/<Show Title>/Season NN" from the identity-backed show title
+    (never a torrent-parsed name); with no configured root it lands in staging
+    so the grab queue surfaces a needs-placement row.
+    """
+    parsed = torrent_routing.ParsedName(show_title="", season=season, episode=None)
+
+    target = shows_store.get_season_target(show.show_id, season)
+    if target:
+        return torrent_routing.RoutePlan(
+            confident=True, dest_dir=target, parsed=parsed,
+            season_folder=None, show_folder=None,
+            reason=f"season target rule for '{show.title}' S{season}",
+        )
+
+    folder = _folder_containing_season(show, season) or (
+        torrent_routing.pick_root_by_free_space(list(show.folders))
+        or (show.folders[0] if show.folders else None)
+    )
+    if folder is not None:
+        season_name = torrent_routing._season_folder_name(Path(folder), season)
+        return torrent_routing.RoutePlan(
+            confident=True, dest_dir=str(Path(folder) / season_name),
+            parsed=parsed, show_folder=folder, season_folder=season_name,
+            reason=f"tracked show '{show.title}' → {Path(folder).name}/{season_name}",
+        )
+
+    # No mapped folders: create one under the type's root from the CANONICAL
+    # (identity-backed) show title — this is the show_id equivalent of
+    # plan_route's new-show branch, with no fuzzy folder matching involved.
+    type_roots = [p for p in config.media_paths_for_types(show.media_type)
+                  if Path(p).is_dir()]
+    new_root = torrent_routing.pick_root_by_free_space(type_roots)
+    if new_root is not None:
+        show_name = torrent_routing.sanitize_for_filesystem(show.title)
+        show_dir = Path(new_root) / show_name
+        season_name = f"Season {season:02d}"
+        dest = show_dir / season_name
+        return torrent_routing.RoutePlan(
+            confident=True, dest_dir=str(dest), parsed=parsed,
+            show_folder=str(show_dir), season_folder=season_name,
+            library_root=new_root,
+            reason=f"new show — creating '{show_name}'/{season_name} "
+                   f"under {Path(new_root).name}",
+        )
+    return torrent_routing.RoutePlan(
+        confident=False, dest_dir=str(Path(config.TORRENT_DOWNLOAD_DIR)),
+        parsed=parsed,
+        reason=f"'{show.title}' has no mapped folders and no library root "
+               f"configured — staying in staging",
+    )
