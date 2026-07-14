@@ -24,4 +24,6 @@ jobs:
       # on). If a test fails here on ModuleNotFoundError, recompute the closure
       # instead of adding one module at a time.
       - run: pip install pytest python-dotenv rapidfuzz rank-torrent-name==1.11.1 python-telegram-bot==22.5 psutil==7.0.0 ollama send2trash subliminal babelfish
-      - run: python -m pytest tests -q
+      # -rs prints the reason for every skip. A skip is not a pass, and a green
+      # check that hides what it did not run is worse than a red one.
+      - run: python -m pytest tests -q -rs
