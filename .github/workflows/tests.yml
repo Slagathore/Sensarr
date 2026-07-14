@@ -19,6 +19,7 @@ jobs:
           python-version: "3.11"
       # Only the deps the test suite actually imports — the full
       # requirements.txt includes Windows-only/GUI packages. rank-torrent-name
-      # is pinned so the selection spike runs on both OSes.
-      - run: pip install pytest python-dotenv rapidfuzz rank-torrent-name==1.11.1
+      # is pinned so the selection spike runs on both OSes; python-telegram-bot
+      # is pinned so the intake-flow tests run instead of being skipped.
+      - run: pip install pytest python-dotenv rapidfuzz rank-torrent-name==1.11.1 python-telegram-bot==22.5
       - run: python -m pytest tests -q
