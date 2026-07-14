@@ -106,7 +106,7 @@ TELEGRAM_ALLOWED_USER_IDS: tuple[int, ...] = _parse_id_list(
     os.getenv("TELEGRAM_ALLOWED_USER_IDS", "")
 )
 APP_PRODUCT_NAME: str = "Plexxarr"
-APP_VERSION: str = "1.2"
+APP_VERSION: str = "1.3"
 
 # How long (seconds) to pause between each process-gone check after Exit is clicked.
 # Plex can take 10-30s to fully stop — 3s intervals × 10 retries = 30s total window.

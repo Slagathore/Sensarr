@@ -64,6 +64,21 @@ binary and runs it without a shell, and every SQL migration uses static column
 names baked into the source, never anything user supplied. Dependencies are
 pinned to exact versions in requirements.txt and torrent_runner/package.json.
 
+## Known dependency issue I have not fixed
+
+npm audit reports four high severity advisories in the download runner. They are
+all the same root cause: the `ip` package, which webtorrent reaches through
+bittorrent-tracker, mis-categorizes some addresses as public. There is no
+version of webtorrent that fixes it. I checked the current release (3.0.16) and
+it carries the same advisories, and npm's only suggested remedy is webtorrent
+0.7.3, which is a downgrade of several major versions and does not run this
+code. So the app ships on webtorrent 2.8.5 with the issue present and known.
+
+What it means in practice: the flaw is about how a peer address is classified,
+inside a component that is already talking to untrusted peers by design. It does
+not give anyone a path into your machine or your library. If a fixed webtorrent
+lands, the pin moves.
+
 ## Reporting an issue
 
 If you find a security problem, open an issue at

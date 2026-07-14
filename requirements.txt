@@ -7,13 +7,13 @@ python-telegram-bot==22.5
 # Image processing — required by pystray (tray icon rendering).
 # Optional at runtime since Task H: if the tray stack can't import, the app
 # runs window-only and says "tray unavailable" instead of crashing.
-Pillow==10.1.0
+Pillow==12.3.0
 
 # Process inspection and management (hard reset, Plex process detection)
 psutil==7.0.0
 
 # .env file loading
-python-dotenv==1.1.1
+python-dotenv==1.2.2
 
 # System-tray icon (Windows and Linux; optional at runtime, see Pillow note).
 # There are intentionally NO Windows-only packages in this file — the split
