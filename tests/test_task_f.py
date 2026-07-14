@@ -337,14 +337,18 @@ def test_unresolved_manual_replacement_marked_manual_unresolved(
 # Identity resolution for the replacement API (Task F item 4)
 # ---------------------------------------------------------------------------
 
-def test_identity_from_movie_path_reads_folder_tag():
-    ident = identity_from_movie_path(
-        r"D:\Movies\Inception (2010) {tmdb-27205}\Inception (2010).mkv")
+def test_identity_from_movie_path_reads_folder_tag(tmp_path):
+    # Build the paths natively — a Windows backslash literal doesn't split on
+    # POSIX, and the function parses host-native library paths.
+    tagged = (tmp_path / "Movies" / "Inception (2010) {tmdb-27205}"
+              / "Inception (2010).mkv")
+    ident = identity_from_movie_path(str(tagged))
     assert ident is not None
     assert (ident.identity_source, ident.external_id) == ("tmdb", "27205")
     assert ident.canonical_title == "Inception"
     assert ident.canonical_year == 2010
-    assert identity_from_movie_path(r"D:\Movies\Flat.Movie.2015.mkv") is None
+    flat = tmp_path / "Movies" / "Flat.Movie.2015.mkv"
+    assert identity_from_movie_path(str(flat)) is None
 
 
 def test_replace_low_quality_movie_resolves_identity_from_folder(
