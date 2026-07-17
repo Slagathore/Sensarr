@@ -24,7 +24,10 @@ def newest_bundle() -> Path | None:
     dist = REPO / "dist"
     if not dist.is_dir():
         return None
-    for stamp in sorted((d for d in dist.iterdir() if d.is_dir()),
+    # Only timestamp-named dirs auto-qualify: manual folders (release-signed\,
+    # portable\) sort after the digits and would shadow every newer build.
+    for stamp in sorted((d for d in dist.iterdir()
+                         if d.is_dir() and d.name[:1].isdigit()),
                         key=lambda d: d.name, reverse=True):
         for name in ("Sensarr", "Plexxarr", "PlexResetButton"):
             exe = stamp / name / f"{name}.exe"

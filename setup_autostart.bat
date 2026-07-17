@@ -25,14 +25,20 @@ echo.
 :: --------------------------------------------------------------------------
 set "EXE_PATH="
 for /f "delims=" %%D in ('dir /b /ad /on "%SCRIPT_DIR%\dist" 2^>nul') do (
-    if exist "%SCRIPT_DIR%\dist\%%D\PlexResetButton\PlexResetButton.exe" (
-        set "EXE_PATH=%SCRIPT_DIR%\dist\%%D\PlexResetButton\PlexResetButton.exe"
-    )
-    if exist "%SCRIPT_DIR%\dist\%%D\Plexxarr\Plexxarr.exe" (
-        set "EXE_PATH=%SCRIPT_DIR%\dist\%%D\Plexxarr\Plexxarr.exe"
-    )
-    if exist "%SCRIPT_DIR%\dist\%%D\Sensarr\Sensarr.exe" (
-        set "EXE_PATH=%SCRIPT_DIR%\dist\%%D\Sensarr\Sensarr.exe"
+    rem Only timestamp-named build dirs auto-qualify; manual folders like
+    rem release-signed\ sort after the digits and would shadow newer builds.
+    set "STAMP_FIRST=%%D"
+    set "STAMP_FIRST=!STAMP_FIRST:~0,1!"
+    if "!STAMP_FIRST!" geq "0" if "!STAMP_FIRST!" leq "9" (
+        if exist "%SCRIPT_DIR%\dist\%%D\PlexResetButton\PlexResetButton.exe" (
+            set "EXE_PATH=%SCRIPT_DIR%\dist\%%D\PlexResetButton\PlexResetButton.exe"
+        )
+        if exist "%SCRIPT_DIR%\dist\%%D\Plexxarr\Plexxarr.exe" (
+            set "EXE_PATH=%SCRIPT_DIR%\dist\%%D\Plexxarr\Plexxarr.exe"
+        )
+        if exist "%SCRIPT_DIR%\dist\%%D\Sensarr\Sensarr.exe" (
+            set "EXE_PATH=%SCRIPT_DIR%\dist\%%D\Sensarr\Sensarr.exe"
+        )
     )
 )
 if not defined EXE_PATH (
