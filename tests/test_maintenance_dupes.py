@@ -162,3 +162,31 @@ def test_prefer_unfailed_rotates_copies(tmp_path, monkeypatch):
     ds.record_failed_grab(key, "c" * 40)
     survivors = _prefer_unfailed([a, b, c], key)
     assert [r.title for r in survivors] == ["a" * 40]
+
+
+def test_dupes_group_scene_named_movie_copies(tmp_path, monkeypatch):
+    """The live-audit movie miss: flat scene-named movie files carry differing
+    release junk after the quality tags (audio channels, size brackets,
+    uploader names, groups), so tag-by-tag stripping gave every copy a
+    different key and NO movie ever grouped. The scene-marker cut must unify
+    them — these four are the real on-disk names of the 2073 pileup."""
+    _fixture_library(tmp_path, monkeypatch, [
+        "2073 2024 1080p BluRay x264 AAC 5.1.mp4",
+        "2073.2024.1080p.BluRay.x264.AAC5.1-LAMA.mp4",
+        "2073.2024.720p.WEB-DL-[920MB][Feranki1980].mp4",
+        "2073.2024.720p.WEBRip.x264.AAC-LAMA.mp4",
+    ])
+    groups = find_duplicates()
+    assert len(groups) == 1
+    assert len(groups[0].candidates) == 4
+    assert groups[0].normalized_title == "2073 (2024)"
+
+
+def test_dupes_year_in_title_movies_stay_distinct(tmp_path, monkeypatch):
+    """The year cut must not merge different films that share a title core:
+    the year component of the key still separates them."""
+    _fixture_library(tmp_path, monkeypatch, [
+        "Blade Runner 2049 2017 1080p BluRay.mkv",
+        "Blade.Runner.1982.720p.BluRay.mkv",
+    ])
+    assert find_duplicates() == []

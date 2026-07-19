@@ -415,6 +415,20 @@ _QUALITY_TAGS = re.compile(
 
 _RELEASE_GROUP = re.compile(r"-[A-Z0-9]{2,12}$", re.IGNORECASE)
 _SEPARATORS = re.compile(r"[._]+")
+
+# Strong scene markers: tokens that never BEGIN a real title. The first one in
+# a filename marks where release junk starts, so everything from there on is
+# dropped whole — tag-by-tag substitution leaves differing residue per release
+# ("AAC5.1" vs "[920MB][Feranki1980]" vs "-LAMA"), which broke movie duplicate
+# grouping entirely. Short/ambiguous tags (HD, SD, NF, AAC...) stay OUT of this
+# list — "SD Gundam" is a real title — and are still removed individually by
+# _QUALITY_TAGS afterwards.
+_SCENE_CUT_RE = re.compile(
+    r"[\s.\-_(\[](?:2160p|1080p|720p|576p|480p|4K|UHD|Blu-?Ray|BDRemux|BDRip|"
+    r"BRRip|WEB-?DL|WEBRip|HDTV|DVDRip|DVDScr|HEVC|x26[45]|H\.?26[45]|AV1|"
+    r"REMUX)\b",
+    re.IGNORECASE)
+_YEAR_TOKEN_RE = re.compile(r"\b(?:19|20)\d{2}\b")
 _MULTI_SPACES = re.compile(r"\s{2,}")
 
 # --- duplicate-detection guards (learned from a real-library audit) ----------
@@ -473,6 +487,21 @@ def _normalize_title(name: str) -> str:
     stem = re.sub(r"\s*[-–]?\s*S\d{2}E\d{2}\b.*", "", stem, flags=re.IGNORECASE)
     stem = re.sub(r"\s*[-–]?\s*\d+x\d+\b.*", "", stem, flags=re.IGNORECASE)
     stem = re.sub(r"\s*\(\d{4}\)\s*$", "", stem)           # trailing (year)
+
+    # Cut at the first strong scene marker: for a movie there is no SxxExx
+    # anchor to truncate at, so without this the junk AFTER the tags (audio
+    # channels, size brackets, uploader names) differs per release and every
+    # copy gets a different key.
+    cut = _SCENE_CUT_RE.search(stem)
+    if cut:
+        stem = stem[:cut.start()]
+    # Cut at a release year that isn't the leading token: "2073 2024 ..."
+    # keeps its numeric TITLE and drops the year; "Inception 2010 ..." drops
+    # the year. A leading year is the title (or part of it) and survives.
+    for year_match in _YEAR_TOKEN_RE.finditer(stem):
+        if year_match.start() > 0:
+            stem = stem[:year_match.start()]
+            break
 
     stem = _QUALITY_TAGS.sub(" ", stem)
     stem = _RELEASE_GROUP.sub("", stem)
@@ -634,9 +663,17 @@ def find_duplicates() -> list[DuplicateGroup]:
                     year = ym.group(0).strip("()")
                     break
         if year is None:
-            ym = _DUP_YEAR_RE.search(stem)
-            if ym:
-                year = ym.group(0).strip("()")
+            # Prefer a year that isn't the leading token: for a numeric TITLE
+            # ("2073 2024 1080p...") the first year-shaped token is the title
+            # itself and the real release year comes after it.
+            leading = None
+            for ym in _DUP_YEAR_RE.finditer(stem):
+                if ym.start() > 0:
+                    year = ym.group(0).strip("()")
+                    break
+                leading = ym.group(0).strip("()")
+            if year is None:
+                year = leading
 
         key = (title, year, season, episode, part)
         groups.setdefault(key, []).append(f)
