@@ -148,8 +148,14 @@ def _core_title(name: str) -> str:
     import media_identity
     import torrent_routing
     core = torrent_routing.parse_torrent_name(name).show_title or name
-    core = re.sub(r"[\(\[]?(?:19|20)\d{2}[\)\]]?", " ", core)
-    return media_identity.normalize_title(core)
+    # A bracketed/parenthesised year is always the release year, never the
+    # title, so drop it first ("2073 (2024)" -> "2073 ").
+    core_nobracket = re.sub(r"[\(\[]\s*(?:19|20)\d{2}\s*[\)\]]", " ", core)
+    stripped = re.sub(r"(?:19|20)\d{2}", " ", core_nobracket)
+    normalized = media_identity.normalize_title(stripped)
+    # A title that IS a year-like number ("2073", "1917") must survive year
+    # stripping — otherwise the whole title vanishes and can never match.
+    return normalized or media_identity.normalize_title(core_nobracket)
 
 
 def _library_identity_eval(want, entries) -> tuple[bool, list]:
@@ -180,6 +186,27 @@ def _library_identity_eval(want, entries) -> tuple[bool, list]:
                                           "numeric_title_mismatch")):
             contradicting.append(e)
     return matched, contradicting
+
+
+def request_present_in_library(req) -> bool:
+    """At-grab-time identity check: is the request's exact identity already on
+    disk right NOW? Independent of the daily found_in_library flag (which can be
+    hours stale — the flag never catching up on numeric titles is what let the
+    2073 pileup keep grabbing). Best-effort: any lookup error answers 'not
+    present' so a hiccup never blocks a legitimate grab."""
+    try:
+        import media_identity
+        from library_index import search_library
+        want = _request_want_identity(req)
+        if not media_identity.normalize_title(want.canonical_title):
+            return False
+        entries = search_library(req.resolved_title or req.content, limit=8)
+        matched, _ = _library_identity_eval(want, entries)
+        return matched
+    except Exception:
+        logger.exception("At-grab library check failed for request #%s",
+                         getattr(req, "request_id", "?"))
+        return False
 
 
 _CLOSEABLE_MEDIA = ("movie", "tv", "anime", "xanime")
@@ -409,6 +436,18 @@ _DUP_PROMO_STEMS = {"etrg", "rarbg", "rarbg com", "sample", "readme", "info",
                     "torrent downloaded from"}
 _DUP_YEAR_RE = re.compile(r"\((19|20)\d{2}\)|\b(?:19|20)\d{2}\b")
 
+# Widened key derivation (Task G item 1): a reboot's year usually lives on
+# the SHOW folder, one or more levels above the file itself
+# ("Goosebumps (1995)/Season 02/ep.mkv") — the old code only ever looked at
+# the file's IMMEDIATE parent, so nested layouts collapsed different years
+# into one group. Likewise a season-only filename ("Sekirei Ep 05.mkv") has
+# no SxxExx to key on at all; the season lives on the "Season N" folder
+# instead. Both are discovered by walking every ancestor directory between
+# the file and its configured library root (never beyond it).
+_DUP_SEASON_DIR_RE = re.compile(r"\bSeason\s*(\d{1,3})\b", re.IGNORECASE)
+_DUP_EP_WORD_RE = re.compile(r"\bEp(?:isode)?\.?[\s_-]*0*(\d{1,4})\b",
+                             re.IGNORECASE)
+
 # Junk words the Combo Clean rename always removes (whole-word), agreed from
 # a frequency scan of the real library: quality/codec/source/group noise.
 _COMBO_REMOVE_WORDS = [
@@ -457,6 +496,36 @@ def _media_files(roots: list[str]) -> list[Path]:
     return files
 
 
+def _media_files_with_root(roots: list[str]) -> list[tuple[Path, Path]]:
+    """Like _media_files, but keeps each file paired with the configured
+    library root it came from — lets find_duplicates() bound an
+    ancestor-directory walk (year/season discovered from folder names above
+    the file) without ever wandering above the library root."""
+    extensions = set(config.LIBRARY_INDEX_EXTENSIONS)
+    files: list[tuple[Path, Path]] = []
+    for root in roots:
+        root_path = Path(root)
+        if not root_path.is_dir():
+            continue
+        for dirpath, _dirs, names in os.walk(root_path):
+            for name in names:
+                if Path(name).suffix.lower() in extensions:
+                    files.append((Path(dirpath) / name, root_path))
+    return files
+
+
+def _ancestor_dir_names(f: Path, root: Path) -> list[str]:
+    """Directory names between `root` (exclusive) and `f` (exclusive),
+    closest to the file first — so 'Show (1995)/Season 02/ep.mkv' yields
+    ["Season 02", "Show (1995)"], letting a year or season token live on
+    the show folder even when the file sits a level or more below it."""
+    try:
+        rel_parts = f.parent.relative_to(root).parts
+    except ValueError:
+        return [f.parent.name] if f.parent.name else []
+    return list(reversed(rel_parts))
+
+
 # ---------------------------------------------------------------------------
 # Duplicate detection
 # ---------------------------------------------------------------------------
@@ -472,9 +541,21 @@ def find_duplicates() -> list[DuplicateGroup]:
         - Episodes are grouped by (show, season, episode) — different episodes
           of the same show are NOT duplicates.
 
+    Year and season/episode are discovered by walking every ancestor folder
+    name up to the configured library root, not just the file's immediate
+    parent (Task G item 1) — "Show (1995)/Season 02/ep.mkv" finds its year on
+    the show folder, and "Show/Season 2/Ep 05.mkv" finds its season on the
+    season folder even though the filename alone has no SxxExx to key on.
+
+    Pairs the user has explicitly marked "not a duplicate" (dupe_ignore.py)
+    are filtered out before any group is emitted (Task G item 2) — a dismissal
+    survives rescans instead of reappearing every time.
+
     Returns a list of DuplicateGroup objects, each with ≥ 2 candidate paths.
     """
-    files = _media_files(config.PLEX_LIBRARY_PATHS)
+    import dupe_ignore
+
+    files = _media_files_with_root(config.PLEX_LIBRARY_PATHS)
     if not files:
         logger.warning("find_duplicates: no media files found in configured library paths.")
         return []
@@ -484,7 +565,7 @@ def find_duplicates() -> list[DuplicateGroup]:
     # pt1/pt2 splits of ONE item; episode is a string so 13.5 recaps and
     # SxxXyy specials stay distinct from their whole-number neighbours.
     groups: dict[tuple, list[Path]] = {}
-    for f in files:
+    for f, root in files:
         if any(_DUP_EXTRAS_DIR_RE.match(part) for part in f.parent.parts):
             continue
         stem = f.stem
@@ -496,6 +577,24 @@ def find_duplicates() -> list[DuplicateGroup]:
         ep = _parse_episode(f.name)
         season = ep[0] if ep else None
         episode: str | None = str(ep[1]) if ep else None
+
+        ancestor_names = _ancestor_dir_names(f, root)
+
+        # Season folders without SxxExx filenames ("Show/Season 2/Ep 05.mkv")
+        # still separate correctly: season from the nearest "Season N"
+        # ancestor, episode from an "Ep NN" filename token. Filename-derived
+        # season/episode (above) always wins when present.
+        if season is None:
+            for dirname in ancestor_names:
+                m = _DUP_SEASON_DIR_RE.search(dirname)
+                if m:
+                    season = int(m.group(1))
+                    break
+        if episode is None:
+            m = _DUP_EP_WORD_RE.search(stem)
+            if m:
+                episode = str(int(m.group(1)))
+
         m = _DUP_HALF_RE.search(stem)
         if m and ep and int(m.group(1)) == ep[1]:
             episode = f"{ep[1]}.5"
@@ -508,16 +607,58 @@ def find_duplicates() -> list[DuplicateGroup]:
             episode = f"{int(m.group(1))}x{int(m.group(2))}"
         m = _DUP_PART_RE.search(stem)
         part = m.group(1) if m else None
-        ym = _DUP_YEAR_RE.search(f.parent.name) or _DUP_YEAR_RE.search(stem)
-        year = ym.group(0).strip("()") if ym else None
+
+        # Year: the immediate parent folder is always trusted (the common
+        # Plex layout "Movie (Year)/Movie.mkv", and the previous behavior
+        # before ancestor-walking existed). A DEEPER ancestor's year is only
+        # trusted when that folder's OWN normalized title core (year
+        # stripped) matches the file's title core — i.e. it's plausibly the
+        # actual show/movie folder ("Goosebumps (1995)/Season 02/ep.mkv"),
+        # never an arbitrary categorization bucket sitting above it
+        # ("Recently Added 2023/My Cool Movie/movie.mkv" must NOT let "2023"
+        # attach to "My Cool Movie" — that donated a spurious year to an
+        # unrelated title and hid a real duplicate). The filename stem is
+        # the last resort.
+        year = None
+        if ancestor_names:
+            ym = _DUP_YEAR_RE.search(ancestor_names[0])
+            if ym:
+                year = ym.group(0).strip("()")
+        if year is None:
+            for dirname in ancestor_names[1:]:
+                ym = _DUP_YEAR_RE.search(dirname)
+                if not ym:
+                    continue
+                dir_core = _normalize_title(dirname)
+                if dir_core and dir_core == title:
+                    year = ym.group(0).strip("()")
+                    break
+        if year is None:
+            ym = _DUP_YEAR_RE.search(stem)
+            if ym:
+                year = ym.group(0).strip("()")
+
         key = (title, year, season, episode, part)
         groups.setdefault(key, []).append(f)
+
+    ignored_folder_pairs = dupe_ignore.ignored_folder_pair_set()
+    ignored_file_pairs = dupe_ignore.ignored_file_pair_set()
 
     results: list[DuplicateGroup] = []
     for (norm_title, year, season, episode, _part), paths in groups.items():
         if len(paths) < 2:
             continue
         sorted_paths = sorted(paths)
+        path_strs = [str(p) for p in sorted_paths]
+
+        if dupe_ignore.file_pair_key(path_strs) in ignored_file_pairs:
+            continue
+        parent_dirs = {str(p.parent) for p in sorted_paths}
+        if len(parent_dirs) == 2:
+            a, b = sorted(parent_dirs)
+            if dupe_ignore.folder_pair_key(a, b) in ignored_folder_pairs:
+                continue
+
         sizes: list[int] = []
         for p in sorted_paths:
             try:
@@ -529,7 +670,7 @@ def find_duplicates() -> list[DuplicateGroup]:
             label = f"{label} S{season:02d}E{episode}"
         results.append(DuplicateGroup(
             normalized_title=label,
-            candidates=[str(p) for p in sorted_paths],
+            candidates=path_strs,
             candidate_sizes=sizes,
             total_size_bytes=sum(sizes),
         ))

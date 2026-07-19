@@ -41,7 +41,7 @@ class TestWin32Layout:
         assert p.data_dir == install            # plex_reset_button.db beside the exe
         assert p.cache_dir == install           # caches beside the exe
         assert p.runtime_dir == install         # sensarr.pid beside the exe
-        assert p.download_dir == install / "downloads"
+        assert p.download_dir == install / "torrent_staging"
 
     def test_legacy_derivations_reproduced_exactly(self):
         """The exact paths modules used to build with `APP_DIR / ...`."""
@@ -76,7 +76,7 @@ class TestLinuxLayout:
         assert p.data_dir == Path("/xdg/data/sensarr")
         assert p.cache_dir == Path("/xdg/cache/sensarr")
         assert p.runtime_dir == Path("/xdg/run/sensarr")
-        assert p.download_dir == Path("/xdg/data/sensarr/downloads")
+        assert p.download_dir == Path("/xdg/data/sensarr/torrent_staging")
 
     def test_documented_home_fallbacks(self):
         env = {"HOME": "/home/cole"}

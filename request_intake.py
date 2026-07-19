@@ -54,6 +54,11 @@ class IntakeResult:
     request_ids: tuple[int, ...]
     status: str
     batch_id: str | None = None
+    # Subset of request_ids that were reused from an existing row (a dedupe
+    # hit) rather than newly inserted — lets a caller tell a user "nothing
+    # new was queued, you already have that" instead of claiming it added
+    # something it didn't (Task F item 1).
+    reused_ids: tuple[int, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +107,51 @@ def build_aliases(
 
 
 # ---------------------------------------------------------------------------
+# Identity dedupe (intake layer only — queue_store.add_request stays
+# insert-always so the duplicate-detection path can still be exercised)
+# ---------------------------------------------------------------------------
+
+# States where an existing request still "covers" a new identical request, so a
+# second intake should reference it rather than insert a duplicate row.
+_DEDUPE_ACTIVE_STATES = (
+    queue_store.STATUS_OPEN, queue_store.STATUS_GRABBING,
+    queue_store.STATUS_DEFERRED, queue_store.STATUS_NEEDS_ATTENTION,
+)
+
+
+def find_existing_request(*, media_type: str, identity_source: str | None,
+                          external_id: str | None, season: int | None):
+    """An existing request to reuse instead of inserting a duplicate, matched on
+    the durable identity key (media_type, identity_source, external_id, season).
+
+    A request still being worked (open/grabbing/deferred/needs_attention) always
+    wins. A fulfilled request wins only when its item is STILL in the library —
+    re-requesting something we already have must not reopen work; but a fulfilled
+    row whose file has since vanished does NOT block a fresh request. Season is
+    part of the key, so S01 and S02 of the same show stay distinct. Returns None
+    for an unqualified identity (nothing durable to match on)."""
+    if not (identity_source and external_id):
+        return None
+    key_ext = str(external_id)
+    for req in queue_store.list_requests(status="all", limit=1000):
+        if (req.media_type != media_type
+                or req.identity_source != identity_source
+                or str(req.external_id) != key_ext
+                or req.season != season):
+            continue
+        if req.status in _DEDUPE_ACTIVE_STATES:
+            return req
+        if req.status == queue_store.STATUS_FULFILLED:
+            try:
+                import maintenance
+                if maintenance.request_present_in_library(req):
+                    return req
+            except Exception:
+                pass
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Adding rows
 # ---------------------------------------------------------------------------
 
@@ -142,10 +192,45 @@ def add_matched_request(
     the row is stored as needs_identity instead of open (the identity rule holds
     even here — a MediaResult with an empty external_id is not an identity).
     """
+    row, _reused = add_matched_request_reporting(
+        content, requester, media_type=media_type, match=match, season=season,
+        batch_id=batch_id, candidate_titles=candidate_titles,
+    )
+    return row
+
+
+def add_matched_request_reporting(
+    content: str,
+    requester: str,
+    *,
+    media_type: str,
+    match,
+    season: int | None = None,
+    batch_id: str | None = None,
+    candidate_titles: list[str] | None = None,
+) -> tuple[queue_store.QueueRequest, bool]:
+    """Same as add_matched_request, plus whether the dedupe path reused an
+    existing row instead of inserting a new one.
+
+    Callers that report outcomes to a user (the Telegram flow) need this: a
+    dedupe hit means nothing new was actually queued, and saying "added"
+    anyway is a lie by omission (Task F item 1) — e.g. the season picker's
+    force-grab escape hatch (typing a season number that's already owned)
+    reaches this exact path.
+    """
     source = (getattr(match, "source", None) or "").strip() or None
     external_id = (str(getattr(match, "external_id", "") or "")).strip() or None
     if not (source and external_id):
-        return add_needs_identity(content, requester, media_type=media_type)
+        return add_needs_identity(content, requester, media_type=media_type), False
+
+    # Dedupe: reference an existing request with the same identity instead of
+    # piling up duplicate rows (the 2073 pileup). queue_store.add_request itself
+    # stays insert-always; the guard lives here at the intake layer.
+    existing = find_existing_request(
+        media_type=media_type, identity_source=source,
+        external_id=external_id, season=season)
+    if existing is not None:
+        return existing, True
 
     countries = list(getattr(match, "origin_countries", ()) or [])
     aliases = build_aliases(
@@ -168,7 +253,7 @@ def add_matched_request(
         batch_id=batch_id,
     )
     _maybe_track_show(created)
-    return created
+    return created, False
 
 
 def add_from_identity(
@@ -195,6 +280,12 @@ def add_from_identity(
     ext = (str(external_id or "")).strip() or None
     if not (source and ext):
         return add_needs_identity(content, requester, media_type=media_type)
+    # Dedupe against an existing request for the same identity (watchlist path).
+    existing = find_existing_request(
+        media_type=media_type, identity_source=source,
+        external_id=ext, season=season)
+    if existing is not None:
+        return existing
     aliases = build_aliases(
         resolved_title or content, content, origin_countries=origin_countries or [])
     created = queue_store.add_request(
@@ -214,6 +305,22 @@ def add_from_identity(
     )
     _maybe_track_show(created)
     return created
+
+
+def _mark_if_already_in_library(created) -> None:
+    """Best-effort library gate for a freshly-queued qualified request: if the
+    identity is already on disk, set found_in_library so auto-grab skips it. The
+    watchlist path had NO library check, so titles the user already owned were
+    re-queued and re-grabbed. Never raises — a library hiccup must not break
+    intake."""
+    try:
+        if created is None or not created.is_qualified:
+            return
+        import maintenance
+        if maintenance.request_present_in_library(created):
+            queue_store.update_library_status(created.request_id, found=True)
+    except Exception:
+        pass
 
 
 def queue_watchlist_item(item, requester, *, get_seasons=None) -> IntakeResult:
@@ -240,6 +347,7 @@ def queue_watchlist_item(item, requester, *, get_seasons=None) -> IntakeResult:
             title, requester, media_type="movie",
             identity_source=source, external_id=ext,
             resolved_title=title, canonical_year=year)
+        _mark_if_already_in_library(created)
         return IntakeResult((created.request_id,), created.status)
 
     # TV: enumerate aired seasons so we never store a season=NULL whole-show row.
@@ -264,6 +372,7 @@ def queue_watchlist_item(item, requester, *, get_seasons=None) -> IntakeResult:
             identity_source=source, external_id=ext,
             resolved_title=title, canonical_year=year,
             season=season, batch_id=batch_id)
+        _mark_if_already_in_library(created)
         ids.append(created.request_id)
         status = created.status
     return IntakeResult(tuple(ids), status, batch_id)
@@ -352,15 +461,18 @@ def add_season_selection(
 
     batch_id = str(uuid.uuid4()) if len(ordered) > 1 else None
     ids: list[int] = []
+    reused: list[int] = []
     status = queue_store.STATUS_OPEN
     for season in ordered:
-        created = add_matched_request(
+        created, was_reused = add_matched_request_reporting(
             content, requester, media_type="tv", match=match,
             season=season, batch_id=batch_id, candidate_titles=candidate_titles,
         )
         ids.append(created.request_id)
+        if was_reused:
+            reused.append(created.request_id)
         status = created.status
-    return IntakeResult(tuple(ids), status, batch_id)
+    return IntakeResult(tuple(ids), status, batch_id, tuple(reused))
 
 
 # ---------------------------------------------------------------------------
@@ -442,7 +554,8 @@ def add_picked_candidate(
             content, requester, match=match, seasons=seasons,
             candidate_titles=titles)
 
-    created = add_matched_request(
+    created, was_reused = add_matched_request_reporting(
         content, requester, media_type=media_type, match=match,
         candidate_titles=titles)
-    return IntakeResult((created.request_id,), created.status)
+    reused = (created.request_id,) if was_reused else ()
+    return IntakeResult((created.request_id,), created.status, reused_ids=reused)

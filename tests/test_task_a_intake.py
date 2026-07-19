@@ -449,9 +449,16 @@ def test_seasonwise_grab_query_contains_alias(monkeypatch):
 
 
 def test_find_duplicate_requests_keys_on_identity():
-    m = _movie(ext="555")
-    request_intake.add_matched_request("dune", "a", media_type="movie", match=m)
-    request_intake.add_matched_request("Dune!!", "b", media_type="movie", match=m)
+    # Intake now dedupes identical identities, so the two duplicate rows this
+    # detection test needs are created via the insert-always primitive directly
+    # (queue_store.add_request), which is exactly what find_duplicate_requests
+    # exists to surface for pre-existing / legacy pileups.
+    for content, who in (("dune", "a"), ("Dune!!", "b")):
+        queue_store.add_request(
+            content, who, media_type="movie", resolved_title="Dune",
+            external_id="555",
+            external_url="https://www.themoviedb.org/movie/555",
+            status=queue_store.STATUS_OPEN, identity_source="tmdb")
     groups = queue_store.find_duplicate_requests()
     assert len(groups) == 1 and len(groups[0]) == 2
 

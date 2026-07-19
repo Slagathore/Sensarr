@@ -56,6 +56,60 @@ def test_dupes_still_catch_real_copies(tmp_path, monkeypatch):
     assert len(groups[0].candidates) == 2
 
 
+def test_dupes_nested_year_folders_not_grouped(tmp_path, monkeypatch):
+    """The confirmed live-audit false positive: a rebooted show's year lives
+    on the SHOW folder, one level above a Season NN subfolder, so the old
+    'immediate parent only' year lookup missed it entirely and collapsed
+    Goosebumps 1995 into Goosebumps 2023."""
+    _fixture_library(tmp_path, monkeypatch, [
+        "Goosebumps (1995)/Season 01/Goosebumps - S01E01 - Pilot.mkv",
+        "Goosebumps (2023)/Season 01/Goosebumps - S01E01 - Pilot.mkv",
+    ])
+    assert find_duplicates() == []
+
+
+def test_dupes_ignore_year_from_unrelated_categorization_folder(tmp_path, monkeypatch):
+    """Verification finding 1: an intermediate categorization folder
+    ("Recently Added 2023") sitting ABOVE the real title folder must never
+    donate its year to the file inside — that's not the movie's year, it's
+    an unrelated bucket, and letting it through hid a real duplicate (the
+    same movie under two differently-dated 'Recently Added' folders came
+    back as 0 groups instead of 1). The ancestor's own normalized name core
+    has to match the file's title core before its year counts; "Recently
+    Added" never will."""
+    _fixture_library(tmp_path, monkeypatch, [
+        "Recently Added 2023/My Cool Movie/My Cool Movie.mkv",
+        "Recently Added 2024/My Cool Movie/My Cool Movie.mkv",
+    ])
+    groups = find_duplicates()
+    assert len(groups) == 1
+    assert len(groups[0].candidates) == 2
+
+
+def test_dupes_season_folder_and_ep_word_not_grouped(tmp_path, monkeypatch):
+    """The other confirmed false positive: filenames with no SxxExx at all
+    ('Sekirei Ep 05.mkv') used to key identically across different season
+    folders. Season now comes from the nearest 'Season N' ancestor and
+    episode from an 'Ep NN' filename token, so S1E05 and S2E05 stay apart."""
+    _fixture_library(tmp_path, monkeypatch, [
+        "Sekirei/Season 1/Sekirei Ep 05.mkv",
+        "Sekirei/Season 2/Sekirei Ep 05.mkv",
+    ])
+    assert find_duplicates() == []
+
+
+def test_dupes_ep_word_still_groups_real_copies_in_same_season(tmp_path, monkeypatch):
+    """Sanity check the widened key doesn't over-correct: two copies of the
+    SAME season+episode (no SxxExx, only an 'Ep NN' token) still group."""
+    _fixture_library(tmp_path, monkeypatch, [
+        "Sekirei/Season 1/Sekirei Ep 05 720p.mkv",
+        "Sekirei/Season 1/Sekirei Ep 05 1080p.mkv",
+    ])
+    groups = find_duplicates()
+    assert len(groups) == 1
+    assert len(groups[0].candidates) == 2
+
+
 def test_combo_clean_rules(tmp_path, monkeypatch):
     root = _fixture_library(tmp_path, monkeypatch, [
         "Show/Show.Name.S01E01.1080p.WEBRip.x265.10bit-GalaxyTV.mkv",

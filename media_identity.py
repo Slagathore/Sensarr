@@ -21,11 +21,59 @@ import re
 from dataclasses import dataclass
 
 # ---------------------------------------------------------------------------
+# Spelled-number <-> digit equivalence
+# ---------------------------------------------------------------------------
+# Providers disagree on whether a title's number is a word or a digit: TMDB
+# stores "Twelve Monkeys", Plex titles the same film "12 Monkeys". Canonicalising
+# spelled numbers to digits (in BOTH the title-normaliser and the sequel-number
+# tokenizer) makes "Twelve Monkeys" == "12 Monkeys" and "Ocean's Eleven" ==
+# "Ocean's 11", while genuine sequels still differ ("12 Monkeys 2" carries an
+# extra number). Scope is one..nineteen, the round tens, and simple
+# "twenty one"-style compounds. Deliberately NOT handled: leetspeak ("Se7en")
+# and multi-word year spellouts ("Nineteen Eighty-Four" -> "19 84", never
+# "1984") — those are rare and the naive expansion would be wrong.
+
+_NUM_ONES: dict[str, int] = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
+    "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16,
+    "seventeen": 17, "eighteen": 18, "nineteen": 19,
+}
+_NUM_TENS: dict[str, int] = {
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60,
+    "seventy": 70, "eighty": 80, "ninety": 90,
+}
+_ALL_NUM_WORDS: dict[str, int] = {**_NUM_ONES, **_NUM_TENS}
+
+# "twenty one", "forty-two" -> a single number, resolved BEFORE the single-word
+# pass so the tens+ones aren't emitted as two separate digits.
+_NUM_COMPOUND_RE = re.compile(
+    r"\b(twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)[\s-]+"
+    r"(one|two|three|four|five|six|seven|eight|nine)\b", re.IGNORECASE)
+_NUM_WORD_RE = re.compile(
+    r"\b(" + "|".join(sorted(_ALL_NUM_WORDS, key=len, reverse=True)) + r")\b",
+    re.IGNORECASE)
+
+
+def spell_to_digits(text: str) -> str:
+    """Replace whole-word spelled numbers with their digits. Word-boundary
+    anchored, so 'one' inside 'money'/'someone' or 'ten' inside 'often' is
+    untouched. Case-insensitive; leaves the rest of the string intact."""
+    if not text or not any(c.isalpha() for c in text):
+        return text
+    out = _NUM_COMPOUND_RE.sub(
+        lambda m: str(_NUM_TENS[m.group(1).lower()] + _NUM_ONES[m.group(2).lower()]),
+        text)
+    return _NUM_WORD_RE.sub(lambda m: str(_ALL_NUM_WORDS[m.group(0).lower()]), out)
+
+
+# ---------------------------------------------------------------------------
 # Title normalisation
 # ---------------------------------------------------------------------------
 
 def normalize_title(title: str | None) -> str:
-    """Lowercase, strip punctuation to spaces, collapse whitespace.
+    """Lowercase, strip punctuation to spaces, canonicalise spelled numbers to
+    digits, collapse whitespace.
 
     Deliberately dependency-free (does not lean on RTN.normalize_title) so this
     module stays importable with the minimal CI dep set. RTN's own normaliser
@@ -33,6 +81,7 @@ def normalize_title(title: str | None) -> str:
     """
     text = (title or "").casefold()
     text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
+    text = spell_to_digits(text)
     return " ".join(text.split())
 
 
@@ -71,8 +120,12 @@ def _signature_portion(title: str) -> list[str]:
     """Tokens of the title up to the first year or release-junk marker.
 
     "john wick 3 2019 1080p ddp5 1 x265 group" -> ["john", "wick", "3"]
+
+    Spelled numbers are canonicalised to digits first, so "Twelve Monkeys" and
+    "12 Monkeys" produce the SAME signature ({12}) and a genuine sequel
+    ("12 Monkeys 2" -> {12, 2}) still differs.
     """
-    tokens = re.findall(r"[a-z0-9]+", title.casefold())
+    tokens = re.findall(r"[a-z0-9]+", spell_to_digits(title).casefold())
     portion: list[str] = []
     for tok in tokens:
         if tok.isdigit() and len(tok) == 4 and 1880 <= int(tok) <= 2159:
@@ -309,7 +362,15 @@ def compare_media_identity(want: MediaIdentity, parsed) -> IdentityVerdict:
     parsed_year = getattr(parsed, "year", None)
     if want.media_type == "movie" and want.canonical_year and parsed_year:
         try:
-            if abs(int(parsed_year) - int(want.canonical_year)) > 1:
+            # A numeric title ("2073", "1917") is easily misread AS a year by the
+            # release parser (it IS a plausible year). When the want's own title
+            # is that exact number, the token is the title, not a contradicting
+            # year — never reject on it.
+            numeric_title = want_title.strip()
+            misread_title_as_year = (numeric_title.isdigit()
+                                     and int(numeric_title) == int(parsed_year))
+            if (not misread_title_as_year
+                    and abs(int(parsed_year) - int(want.canonical_year)) > 1):
                 return IdentityVerdict(
                     False, "year_mismatch",
                     f"wanted {want.canonical_year}, parsed {parsed_year}")

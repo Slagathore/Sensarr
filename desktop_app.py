@@ -81,6 +81,12 @@ _SOURCE_SEARCH_BY_TYPE = {
     "anime":  _NYAA_ANIME_SEARCH,
     "xanime": _SUKEBEI_SEARCH,
 }
+
+# Task E — media-type choices offered by the resolve-identity dialog's
+# selector. "auto" maps to media_type=None, i.e. request_intake.
+# search_candidates' own default (movie + tv); picking anime/xanime is what
+# makes those branches of search_candidates reachable from the UI at all.
+_RESOLVE_DIALOG_TYPES = ("auto", "movie", "tv", "anime", "xanime")
 # Sun Valley ttk theme (dark). Optional — the app falls back to the stock
 # Windows ttk look if the package isn't installed.
 try:
@@ -112,6 +118,35 @@ def _local_ts(ts: str) -> str:
     return local_ts(ts)
 
 
+def _resolve_dialog_search(
+    query: str, media_type: str | None, *, search_fn=None,
+) -> tuple[list, str | None]:
+    """Pure query/retry logic behind the resolve-identity dialog (Task E).
+
+    Module-level and Tk-free on purpose: this is the piece the dialog calls
+    on open and on every 'Search again', and it's the piece unit tests can
+    drive without a display. Runs one candidate search and never raises.
+
+    Returns (candidates, error). error is set only when the lookup itself
+    blew up (network/parsing exception) — a clean empty result is
+    ([], None) so the dialog renders 'No matches' inline and lets the user
+    edit the query, instead of dead-ending in a popup.
+
+    `search_fn` defaults to request_intake.search_candidates and is
+    injectable so tests can supply a stub instead of hitting the network.
+    """
+    fn = search_fn or request_intake.search_candidates
+    q = (query or "").strip()
+    if not q:
+        return [], None
+    try:
+        return list(fn(q, media_type) or []), None
+    except Exception:
+        logger.exception(
+            "Resolve-dialog search failed for %r (media_type=%s)", q, media_type)
+        return [], "Search failed — check the spelling and try again."
+
+
 class DesktopApp:
     def __init__(self) -> None:
         self.bot_service = TelegramBotService()
@@ -125,8 +160,12 @@ class DesktopApp:
             self.root.iconphoto(True, self._window_icon)
         except Exception:
             logger.debug("Window icon unavailable; Tk default kept.", exc_info=True)
-        self.root.geometry("860x620")
-        self.root.minsize(760, 520)
+        # Task H: 860x620/760x520 squished 11 top-level tabs against sv-ttk's
+        # default (image-based) tab padding — the old "Watchlist" label (it
+        # carried a "/Recs" suffix) and "Maintenance" were clipping at the
+        # old default, let alone minsize.
+        self.root.geometry("1100x720")
+        self.root.minsize(900, 600)
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
         if sv_ttk is not None:
             try:
@@ -137,6 +176,14 @@ class DesktopApp:
         # mistaken for a harmless refresh.
         style = ttk.Style(self.root)
         style.configure("Danger.TButton", foreground=_DOT_RED, font=("Segoe UI", 9, "bold"))
+        # Task H item 2: sv-ttk's dark theme bakes a wide default padding
+        # {16 14 16 6} into its custom tab background element (Notebook.tab,
+        # sv_ttk/theme/dark.tcl) — the sole reason 11 tabs squished. TNotebook
+        # .Tab's own -padding resource is read by the built-in Notebook.padding
+        # sub-element ttk nests inside that background, so overriding it here
+        # (after set_theme, so this configure isn't clobbered by theme setup)
+        # tightens every tab without touching sv-ttk's rounded-corner artwork.
+        style.configure("TNotebook.Tab", padding=(8, 4))
         initialize_queue_db()
         # Run auth migrations even when the Telegram bot isn't configured —
         # the Users tab reads these tables regardless.
@@ -198,6 +245,12 @@ class DesktopApp:
         # Job ids submitted by the overnight idle pass — popups stay
         # suppressed until the last of them finishes.
         self._maint_idle_pending: set[int] = set()
+        # Task B item 2: what the "custom_rename" grid was last built FROM,
+        # so 🔄 Re-run can replay it with the same parameters instead of
+        # popping a "can't re-run this" no-op. Either
+        # {"kind": "combo_clean", "media_type": ...} or
+        # {"kind": "custom_dialog", "rule": ..., "pattern": ..., "allowed_tags": ...}.
+        self._maint_custom_rename_replay: dict[str, Any] | None = None
         # Typed rows for re-rendering after a filter toggle.
         # Each entry: (media_type_tag, row_values, action_payload).
         # action_payload is opaque per-tool — for find_duplicates it's the
@@ -569,7 +622,7 @@ class DesktopApp:
         notebook.add(requests_tab, text="Requests")
         notebook.add(downloads_tab, text="Downloads")
         notebook.add(shows_tab, text="Shows")
-        notebook.add(watchlist_tab, text="Watchlist/Recs")
+        notebook.add(watchlist_tab, text="Watchlist")
         notebook.add(library_tab, text="Library")
         notebook.add(metrics_tab, text="Metrics")
         notebook.add(maintenance_tab, text="Maintenance")
@@ -823,8 +876,9 @@ class DesktopApp:
              "moves; every move is journalled and reversible."),
             ("Unindexed Files", self._run_unindexed,
              "Files on disk that aren't in the local search index yet — fix with Reindex."),
-            # note: deferred — Reindex reuses the Library tab's rebuild flow
-            # (its own status reporting), not a registry job yet.
+            # Reindex runs as a registry job (Task B item 1) — shared with
+            # the Library tab's own Reindex button; see
+            # rebuild_library_index_from_ui / _handle_library_reindex_result.
             ("Reindex", self.rebuild_library_index_from_ui,
              "Rebuild the local file index used by /search and the Library tab."),
             ("🔄 Re-run", self._maint_rerun_current,
@@ -910,6 +964,24 @@ class DesktopApp:
                     "[brackets] and {braces} stripped, junk words removed. "
                     "Pick exactly ONE library type above first. Nothing is "
                     "renamed until you Apply Selected.")
+
+        # Task G item 2: "Not a duplicate" — select a group/folder-pair
+        # header row (or a specific file row) in the Find Duplicates results
+        # above, then click this so it stops being flagged on every rescan.
+        not_dup_btn = ttk.Button(filter_row, text="Not a duplicate",
+                                 command=self._maint_mark_not_duplicate)
+        not_dup_btn.pack(side=tk.LEFT, padx=(14, 3))
+        add_tooltip(not_dup_btn,
+                    "Run Find Duplicates, select a group header, folder-pair "
+                    "header, or a specific file row above, then click this. "
+                    "The verdict is remembered (dupe_ignore.json) and survives "
+                    "🔄 Re-run and app restarts — see 'Ignored pairs…' to undo.")
+        ignored_btn = ttk.Button(filter_row, text="Ignored pairs…",
+                                 command=self._maint_open_ignored_pairs)
+        ignored_btn.pack(side=tk.LEFT, padx=3)
+        add_tooltip(ignored_btn,
+                    "Everything marked 'Not a duplicate' — un-ignore any of "
+                    "them to let Find Duplicates flag it again.")
 
         # Adjust the tab's row layout: results frame lives on row 4 (rows 2/3
         # hold the progress strip + filter row).
@@ -1240,65 +1312,191 @@ class DesktopApp:
         self.status_var.set(f"Queued request #{created.request_id}: {created.content}{tag}")
         self.refresh_requests()
 
-    def _pick_from_list(self, title: str, header: str, labels: list[str]) -> int | None:
-        """Modal Tk listbox picker. Returns the chosen index or None (cancel).
+    def _resolve_identity_dialog(
+        self,
+        title: str,
+        query: str,
+        *,
+        media_type: str | None = None,
+        initial_candidates: list | None = None,
+        include_none_of_these: bool = False,
+        search_fn=None,
+    ) -> tuple[Any, bool, list]:
+        """Modal search-and-pick dialog shared by the resolve-identity flow
+        and the add-request candidate picker (Task E).
 
-        Pure Tk glue: all decision logic lives in request_intake (testable in
-        CI); this method only collects a click.
+        Unlike the one-shot `_pick_from_list` call this replaces, the query
+        is a live Entry and 'Search again' re-runs
+        request_intake.search_candidates(query, media_type) in place: a miss
+        renders 'No matches' inline and waits for an edited query or Cancel
+        instead of dead-ending in a popup. The media-type selector is what
+        makes the anime/xanime branches of search_candidates reachable —
+        they're never guessed at automatically.
+
+        Returns (picked_MediaResult_or_None, explicit_none_of_these,
+        candidates_shown_at_the_time_of_the_pick). The third element carries
+        the full sibling list the pick was made from (not just the winner)
+        so callers that need same-title disambiguation context (build_aliases'
+        country-tag logic) get it even after a mid-dialog re-search replaced
+        the original candidate list. Cancel (button or window close) always
+        returns (None, False, <last shown list>). When `include_none_of_these`
+        is set, an extra 'None of these' row lets the add-request flow
+        explicitly file the request as needs_identity — a different outcome
+        from Cancel there, which adds nothing at all.
         """
         win = tk.Toplevel(self.root)
         win.title(title)
         win.transient(self.root)
         win.grab_set()
-        ttk.Label(win, text=header, padding=8).grid(row=0, column=0, sticky="w")
-        listbox = tk.Listbox(win, width=70, height=min(12, len(labels)))
-        for label in labels:
-            listbox.insert(tk.END, label)
-        listbox.grid(row=1, column=0, padx=8, sticky="nsew")
-        if labels:
-            listbox.selection_set(0)
-        chosen: list[int | None] = [None]
+        win.geometry("520x420")
+        win.columnconfigure(0, weight=1)
+        win.rowconfigure(4, weight=1)
+
+        candidates: list[Any] = list(initial_candidates or [])
+        result: list[Any] = [None, False, candidates]
+        NONE_LABEL = "None of these — file as needs identity"
+
+        ttk.Label(win, text="Search:").grid(
+            row=0, column=0, sticky="w", padx=10, pady=(10, 0))
+        query_var = tk.StringVar(value=query)
+        entry = ttk.Entry(win, textvariable=query_var)
+        entry.grid(row=1, column=0, sticky="ew", padx=10)
+
+        type_row = ttk.Frame(win)
+        type_row.grid(row=2, column=0, sticky="ew", padx=10, pady=(6, 0))
+        ttk.Label(type_row, text="Type:").pack(side=tk.LEFT)
+        initial_type = media_type if media_type in _RESOLVE_DIALOG_TYPES else "auto"
+        type_var = tk.StringVar(value=initial_type)
+        ttk.Combobox(
+            type_row, textvariable=type_var, state="readonly", width=10,
+            values=list(_RESOLVE_DIALOG_TYPES),
+        ).pack(side=tk.LEFT, padx=(6, 12))
+        ttk.Button(type_row, text="Search again",
+                   command=lambda: _run_search()).pack(side=tk.LEFT)
+
+        status_var = tk.StringVar(value="")
+        ttk.Label(win, textvariable=status_var, foreground=_MUTED_TEXT,
+                  wraplength=480).grid(
+            row=3, column=0, sticky="w", padx=10, pady=(4, 0))
+
+        listbox = tk.Listbox(win)
+        listbox.grid(row=4, column=0, sticky="nsew", padx=10, pady=(4, 0))
+
+        def _render(cands: list, error: str | None) -> None:
+            listbox.delete(0, tk.END)
+            for m in cands:
+                listbox.insert(tk.END, request_intake.format_candidate_label(m))
+            if include_none_of_these:
+                listbox.insert(tk.END, NONE_LABEL)
+            if cands:
+                listbox.selection_set(0)
+                status_var.set(f"{len(cands)} result(s).")
+            elif error:
+                status_var.set(error)
+            else:
+                status_var.set("No matches — edit the search above and try again.")
+
+        def _run_search() -> None:
+            nonlocal candidates
+            mt = type_var.get()
+            candidates, error = _resolve_dialog_search(
+                query_var.get(), None if mt == "auto" else mt,
+                search_fn=search_fn)
+            result[2] = candidates
+            _render(candidates, error)
 
         def _confirm() -> None:
             sel = listbox.curselection()
-            chosen[0] = sel[0] if sel else None
+            if not sel:
+                status_var.set("Select a result, or Cancel.")
+                return
+            idx = sel[0]
+            if include_none_of_these and idx == len(candidates):
+                result[0], result[1] = None, True
+            elif 0 <= idx < len(candidates):
+                result[0], result[1] = candidates[idx], False
+            else:
+                status_var.set("Select a result, or Cancel.")
+                return
+            result[2] = candidates
             win.destroy()
 
+        def _cancel() -> None:
+            result[0], result[1], result[2] = None, False, candidates
+            win.destroy()
+
+        entry.bind("<Return>", lambda _e: _run_search())
+        listbox.bind("<Double-Button-1>", lambda _e: _confirm())
+
         btns = ttk.Frame(win)
-        btns.grid(row=2, column=0, pady=8)
+        btns.grid(row=5, column=0, pady=10)
         ttk.Button(btns, text="OK", command=_confirm).grid(row=0, column=0, padx=4)
-        ttk.Button(btns, text="Cancel", command=win.destroy).grid(row=0, column=1, padx=4)
-        win.columnconfigure(0, weight=1)
-        win.rowconfigure(1, weight=1)
+        ttk.Button(btns, text="Cancel", command=_cancel).grid(row=0, column=1, padx=4)
+
+        win.protocol("WM_DELETE_WINDOW", _cancel)
+        self._apply_dark_widget_styles(win)
+
+        if candidates:
+            _render(candidates, None)
+        else:
+            _run_search()
+
+        entry.focus_set()
         self.root.wait_window(win)
-        return chosen[0]
+        return cast(Any, result[0]), bool(result[1]), cast(list, result[2])
 
     def _show_candidate_picker(self, content: str, requester: str, candidates: list) -> None:
         """Tk glue over request_intake.add_picked_candidate: collect the pick
-        (and a season answer for TV), then hand the decision to the store layer.
-        'None of these' stores needs_identity; a TV pick never creates a
-        season=NULL whole-show row."""
-        labels = [request_intake.format_candidate_label(m) for m in candidates]
-        labels.append("None of these — leave as needs identity")
-        idx = self._pick_from_list("Which one did you mean?",
-                                   f"Results for: {content}", labels)
-        if idx is None:
+        (and a season answer for TV) via the shared editable resolve dialog
+        (Task E item 3), then hand the decision to the store layer. 'None of
+        these' stores needs_identity; a TV pick never creates a season=NULL
+        whole-show row; Cancel (unlike 'None of these') adds nothing at all.
+        """
+        match, explicit_none, shown = self._resolve_identity_dialog(
+            "Which one did you mean?", content,
+            initial_candidates=candidates, include_none_of_these=True)
+        if match is None and not explicit_none:
             return  # dialog cancelled — add nothing
 
         seasons = None
-        if 0 <= idx < len(candidates) and candidates[idx].media_type == "tv":
+        if match is not None and match.media_type == "tv":
             from tkinter import simpledialog
             answer = simpledialog.askstring(
                 "Which season?",
-                f"{candidates[idx].title}: enter a season number, or 'all' for "
+                f"{match.title}: enter a season number, or 'all' for "
                 "every aired season.",
                 parent=self.root)
             if answer is None:
                 return  # season prompt cancelled — add nothing
-            seasons = request_intake.seasons_for_answer(answer, candidates[idx])
+            seasons = request_intake.seasons_for_answer(answer, match)
 
+        # Pass the FULL sibling set `shown` (not just [match]) plus the real
+        # index of the pick within it: add_picked_candidate builds
+        # candidate_titles from every row in the list it's handed
+        # (request_intake.py ~521-525), and build_aliases only appends a
+        # disambiguating " <CC>" suffix when >=2 siblings share the base
+        # title (request_intake.py:95) — same-title country-edition picks
+        # (e.g. MAFS AU vs US) need every sibling present, not a
+        # single-element list, or that check can never fire from this UI.
+        choice_index = None
+        picked = shown
+        if match is not None:
+            try:
+                choice_index = shown.index(match)
+            except ValueError:
+                # Defensive only: `shown` is set from the exact same
+                # `candidates` list the pick was read out of (Task E's
+                # dialog keeps them in lockstep), so this should be
+                # unreachable. Never silently misfile the request if it
+                # somehow happens — append the pick so it's still findable.
+                logger.warning(
+                    "Resolve dialog pick %r missing from its own shown "
+                    "list; appending before filing the request.",
+                    getattr(match, "title", match))
+                picked = shown + [match]
+                choice_index = len(picked) - 1
         outcome = request_intake.add_picked_candidate(
-            content, requester, candidates, idx, seasons=seasons)
+            content, requester, picked, choice_index, seasons=seasons)
         self.request_content_var.set("")
         needs = outcome.status == "needs_identity"
         tag = " (needs identity — pick a title to enable auto-grab)" if needs else ""
@@ -1319,28 +1517,27 @@ class DesktopApp:
 
     def resolve_request_by_id(self, request_id: int) -> None:
         """Resolve one request by id — shared by the Requests toolbar button
-        and the Grab-queue subtab's right-click action."""
+        and the Grab-queue subtab's right-click action.
+
+        Uses the shared editable resolve dialog (Task E): the query starts
+        prefilled from the request's resolved_title/content, 'Search again'
+        loops on an edited query or media type, and an empty result renders
+        inline instead of dead-ending in a popup. Seeding the type selector
+        from the request's own media_type is what lets the
+        anime/xanime branches of search_candidates actually run here. This
+        is also the repair tool for a wrong identity: re-typing the query
+        and re-searching replaces a bad pick, it doesn't just accept-or-quit.
+        """
         req = get_request(request_id)
         if req is None:
             self._show_warning("Request not found", f"Request #{request_id} is gone.")
             return
         content = (req.resolved_title or req.content or "").strip()
-        self.status_var.set(f"Looking up '{content}'…")
-        try:
-            candidates = request_intake.search_candidates(content)
-        except Exception:
-            logger.exception("Resolve lookup failed for %r", content)
-            candidates = []
-        if not candidates:
-            self._show_info("No matches", f"No candidates found for '{content}'.")
-            return
+        match, _explicit_none, _shown = self._resolve_identity_dialog(
+            "Resolve identity", content, media_type=req.media_type)
+        if match is None:
+            return  # cancelled — leave the row exactly as it was
 
-        labels = [request_intake.format_candidate_label(m) for m in candidates]
-        idx = self._pick_from_list("Resolve identity", f"Resolve: {content}", labels)
-        if idx is None or not (0 <= idx < len(candidates)):
-            return  # cancelled — leave the row as needs_identity
-
-        match = candidates[idx]
         season = None
         if match.media_type == "tv":
             from tkinter import simpledialog
@@ -1689,17 +1886,33 @@ class DesktopApp:
             self._library_metrics_refresh_pending = False
             self.refresh_library_metrics()
 
-    def rebuild_library_index_from_ui(self) -> None:
-        def worker() -> None:
+    def rebuild_library_index_from_ui(self, *, from_idle: bool = False):
+        """Full library-index rebuild as a registry job (Task B item 1).
+
+        Shared by the Library tab's Reindex button, the Maintenance tab's
+        Reindex button, and the post-settings-save prompt — one job, one
+        completion path. Before this, the Maintenance tab's Reindex button
+        called this exact method but the completion handler only ever
+        touched Library-tab widgets, so the maintenance status line/progress
+        strip never moved: clicking it there looked like a no-op. Now every
+        caller gets an honest run in the maintenance progress strip AND the
+        Library tab refresh.
+        """
+        def job(progress, cancel_check) -> Any:
+            progress(phase="Rebuilding the library file index…")
             try:
                 result = rebuild_library_index()
                 message = format_reindex_result_message(result)
+                indexed = result.indexed_files
             except Exception as exc:
                 logger.exception("Library reindex failed.")
                 message = f"Library reindex failed: {exc}"
-            self._post_to_ui(lambda: self._handle_library_reindex_result(message))
+                indexed = 0
+            return maint_jobs.JobResult(
+                summary={"indexed_files": indexed}, result=message)
 
-        threading.Thread(target=worker, name="ui-library-reindex", daemon=True).start()
+        return self._maint_submit("reindex", "Reindex Library", job,
+                                  meta={"idle": from_idle})
 
     def _handle_library_reindex_result(self, message: str) -> None:
         self.refresh_library_summary()
@@ -1707,6 +1920,18 @@ class DesktopApp:
         self._lib_show_all()
         self.status_var.set(message.splitlines()[0] if message else "Library reindex complete")
         self.last_action_var.set("Last action: library reindex")
+
+        # Task B item 1: the Maintenance tab's own tool grid + status line
+        # visibly reflect the run too, not just the Library tab.
+        self._maint_tool_name = "reindex"
+        self._maint_results = []
+        first_line = message.splitlines()[0] if message else "Library reindex complete"
+        self._maint_status_var.set(first_line)
+        lines = [ln for ln in message.splitlines() if ln.strip()]
+        self._populate_maint_tree(
+            [("", ln, "", "") for ln in lines] or [("", "Reindex complete", "", "")],
+            col1="Reindex result", col2="", col3="")
+
         self._show_info("Library Reindex", message)
 
     # =====================================================================
@@ -2458,10 +2683,16 @@ class DesktopApp:
                 (f"{row.planned_dest or ''}" + (f" / {row.planned_name}" if row.planned_name else ""))
                 or row.route_reason or ""
             )
+            # Honest queue label (fetching metadata / no peers / stalled /
+            # waiting for slot / probing) instead of a bare status + 0%.
+            dm = getattr(self, "download_manager", None)
+            phase = dm.phase_for(row.download_id) if dm is not None else None
+            status_label = downloads_store.display_status(
+                row.status, row.progress, error=row.error, phase=phase)
             iid = str(row.download_id)
             self._dl_downloads_tree.insert(
                 "", "end", iid=iid,
-                values=(row.download_id, row.title, row.status,
+                values=(row.download_id, row.title, status_label,
                         f"{row.progress * 100:.0f}", route),
             )
             if selected_id is not None and row.download_id == selected_id:
@@ -2706,7 +2937,7 @@ class DesktopApp:
                              command=self.map_selected_user_to_plex)
         map_btn.pack(side=tk.RIGHT)
         add_tooltip(map_btn, "Link the selected Telegram user to the chosen Plex "
-                             "account — used by Watchlist/Recs and history features.")
+                             "account — used by Watchlist and history features.")
 
         allowed_tree = ttk.Treeview(
             tab, columns=("id", "user_id", "name", "username", "plex", "source", "claimed"),
@@ -3003,24 +3234,74 @@ class DesktopApp:
         return True
 
     def _maint_rerun_current(self) -> None:
-        """Force-refresh the currently displayed maintenance tool."""
-        runners = {
+        """Force-refresh the currently displayed maintenance tool (Task B
+        item 2). Covers every tool that renders into the maintenance grid,
+        not just the tools that happen to use the plain results cache:
+        daily_check, movie_migration, and reindex never cached in the first
+        place (always fresh already) but still couldn't be re-triggered from
+        here before; custom_rename needs its last rule/media-type replayed
+        since it has no zero-argument re-run of its own."""
+        tool = self._maint_tool_name
+        if tool == "custom_rename":
+            self._maint_rerun_custom_rename()
+            return
+        runners: dict[str, Any] = {
             "library_inventory": self._run_library_inventory,
             "find_duplicates": self._run_find_duplicates,
             "sanitize": self._run_sanitize,
             "clean_junk": self._run_clean_junk,
             "missing_episodes": self._run_missing_episodes,
             "unindexed": self._run_unindexed,
+            "daily_check": self._run_daily_check,
+            "movie_migration": self._run_movie_migration,
+            "reindex": self.rebuild_library_index_from_ui,
         }
-        runner = runners.get(self._maint_tool_name)
+        runner = runners.get(tool)
         if runner is None:
-            self._show_info("Re-run", "Run one of the cacheable tools first "
-                                      "(Inventory / Duplicates / Sanitize / Clean Junk / "
-                                      "Missing Episodes / Unindexed).")
+            self._show_info("Re-run", "Run one of the maintenance tools first "
+                                      "(Daily Check / Inventory / Duplicates / "
+                                      "Sanitize / Custom Rename / Combo Clean / "
+                                      "Clean Junk / Missing Episodes / Organize "
+                                      "Movies / Unindexed / Reindex).")
             return
-        self._maint_cache.pop(self._maint_tool_name, None)
+        self._maint_cache.pop(tool, None)
         self._maint_tool_name = ""
         runner()
+
+    def _maint_rerun_custom_rename(self) -> None:
+        """Re-run path for the shared 'custom_rename' grid, which is fed by
+        TWO different producers (the Custom Rename dialog and Combo Clean) —
+        neither takes zero arguments, so the last-used parameters are
+        replayed from `_maint_custom_rename_replay` (Task B item 2)."""
+        replay = self._maint_custom_rename_replay
+        if replay is None:
+            self._show_info(
+                "Re-run",
+                "Custom Rename has no stored rule to replay yet — open "
+                "'Custom Rename...' (or run 'Combo Clean rename…') again.")
+            return
+        self._maint_cache.pop("custom_rename", None)
+        self._maint_tool_name = ""
+        if replay["kind"] == "combo_clean":
+            self._submit_combo_clean(replay["media_type"])
+            return
+
+        rule, pattern, allowed_tags = (replay["rule"], replay["pattern"],
+                                       replay["allowed_tags"])
+        self._maint_status_var.set("Re-running Custom Rename with the last rule…")
+
+        def worker() -> None:
+            try:
+                pairs = self._build_custom_rename_pairs(rule, pattern, allowed_tags)
+            except Exception as exc:
+                logger.exception("Custom rename re-run failed.")
+                self._post_to_ui(lambda: self._maint_status_var.set(
+                    f"Custom Rename re-run failed: {exc}"))
+                return
+            self._post_to_ui(lambda: self._apply_custom_rename_preview(pairs, None))
+
+        threading.Thread(target=worker, name="custom-rename-rerun",
+                         daemon=True).start()
 
     # Version 3 = the JSON format (Task S item 1 killed the pickle cache;
     # versions 1-2 were pickle-era and load as a miss).
@@ -3130,8 +3411,11 @@ class DesktopApp:
                 "Tick exactly ONE library type (Movies / TV / Anime / …) in "
                 "the filter bar so the cleanup targets a single library.")
             return
-        media_type = active[0]
+        self._submit_combo_clean(active[0])
 
+    def _submit_combo_clean(self, media_type: str):
+        """Shared by the toolbar button and 🔄 Re-run's replay path (Task B
+        item 2) so both go through one job-submission implementation."""
         def job(progress, cancel_check) -> Any:
             from maintenance import build_combo_renames
             progress(phase=f"Building combo-clean renames for {media_type}…")
@@ -3139,13 +3423,20 @@ class DesktopApp:
             return maint_jobs.JobResult(
                 summary={"renames_proposed": len(pairs)}, result=pairs)
 
-        self._maint_submit("combo_clean", f"Combo Clean preview ({media_type})",
-                           job, meta={"media_type": media_type})
+        return self._maint_submit(
+            "combo_clean", f"Combo Clean preview ({media_type})",
+            job, meta={"media_type": media_type})
 
     def _handle_combo_clean_result(self, job, pairs: list[SanitizePair]) -> None:
         media_type = job.meta.get("media_type", "mixed")
         self._maint_tool_name = "custom_rename"
         self._maint_results = pairs
+        # Task B item 2: remember how this grid was built so 🔄 Re-run can
+        # replay it (the grid is shared with the Custom Rename dialog, which
+        # stamps its own replay dict in _apply_custom_rename_preview).
+        self._maint_custom_rename_replay = {
+            "kind": "combo_clean", "media_type": media_type,
+        }
         if not pairs:
             self._maint_status_var.set(
                 f"Combo Clean: nothing to rename in {media_type} — "
@@ -3419,6 +3710,7 @@ class DesktopApp:
         if job.state == "done":
             try:
                 self._maint_dispatch_result(job)
+                self._maint_stamp_rescanned(job)
             except Exception:
                 logger.exception("Result handler failed for %s.", job.tool_key)
                 self._maint_status_var.set(
@@ -3435,6 +3727,38 @@ class DesktopApp:
                     "instantly from cache. 🔄 Re-run refreshes any of them.")
                 logger.info("Idle pre-cache pass finished.")
 
+    # Tool key -> what to call a row of its grid, for the rescan stamp
+    # below. Only tools that actually render into the maintenance grid are
+    # listed; anything else (the idle-only pre-cache jobs) is left out on
+    # purpose so no stamp is appended for them.
+    _MAINT_GRID_NOUN: dict[str, str] = {
+        "daily_check": "rows", "library_inventory": "rows",
+        "find_duplicates": "groups", "sanitize": "rows",
+        "clean_junk": "rows", "missing_episodes": "rows",
+        "unindexed": "rows", "movie_migration": "rows",
+        "combo_clean": "rows", "reindex": "rows",
+    }
+
+    def _maint_stamp_rescanned(self, job) -> None:
+        """Task B item 3: after ANY completed grid-rendering run, stamp the
+        status line with 'rescanned HH:MM, N <groups/rows>' — so a scan that
+        comes back with exactly the same-looking results is still visibly
+        FRESH, not silently stale. Runs after the tool's own result handler
+        has already set its own status text and populated the grid, so the
+        row count below reflects what's actually on screen."""
+        noun = self._MAINT_GRID_NOUN.get(job.tool_key)
+        if noun is None:
+            return
+        self._maint_append_rescan_stamp(len(self._maint_typed_rows), noun)
+
+    def _maint_append_rescan_stamp(self, count: int, noun: str = "rows") -> None:
+        """Shared by the registry-job stamp above and the one non-job scan
+        path (the Custom Rename dialog builds its preview on a bare thread,
+        not a maint_jobs job)."""
+        stamp = f"rescanned {datetime.datetime.now().strftime('%H:%M')}, {count} {noun}"
+        current = self._maint_status_var.get()
+        self._maint_status_var.set(f"{current}  ({stamp})" if current else stamp)
+
     def _maint_dispatch_result(self, job) -> None:
         """Route a completed job's in-memory result to its render handler."""
         handlers = {
@@ -3448,6 +3772,7 @@ class DesktopApp:
             "unindexed": self._handle_unindexed_result,
             "movie_migration": lambda res: self._handle_movie_migration_plan(*res),
             "combo_clean": lambda res: self._handle_combo_clean_result(job, res),
+            "reindex": self._handle_library_reindex_result,
         }
         handler = handlers.get(job.tool_key)
         if handler is None:
@@ -3568,6 +3893,19 @@ class DesktopApp:
             except Exception:
                 logger.debug("Nightly update check failed.", exc_info=True)
                 info = None
+            # Task I: cheap manifest-only check (no gz download) for the
+            # weekly-published anime DB artifact, right next to the app
+            # update check above. ensure_fresh()'s own 7-day age gate would
+            # otherwise delay picking up a fresh CI build by up to a week;
+            # this lets a genuinely newer artifact get pulled the same day
+            # it's published. force=True only fires refresh() when the cheap
+            # check above already confirmed something newer is available —
+            # refresh() keeps its own untouched-on-failure guarantee either way.
+            try:
+                if anime_db.check_for_manifest_update():
+                    anime_db.ensure_fresh(background=True, force=True)
+            except Exception:
+                logger.debug("Anime DB manifest check failed.", exc_info=True)
             return maint_jobs.JobResult(
                 summary={"checked": summary.get("checked", 0),
                          "newly_found": summary.get("newly_found", 0),
@@ -3944,7 +4282,14 @@ class DesktopApp:
                 ("", f"[folder pair] {Path(da).name}  <->  {Path(db).name}",
                  f"{len(gs)} matching file(s) in two folders",
                  self._fmt_bytes(total)),
-                None, 0,
+                # Task G item 2: the header payload isn't a delete action
+                # (Apply Selected only understands str/("paths", …) payloads
+                # for deletion — a ticked header checkbox here contributes
+                # nothing to paths_to_delete, and Apply Selected warns
+                # "Nothing selected" if that's ALL that's ticked, same as
+                # when this was plain None) — it's what lets "Not a
+                # duplicate" ignore the WHOLE folder pair at once.
+                ("folder_pair", da, db), 0,
             ))
             for side, side_files, side_size in sides:
                 typed_rows.append((
@@ -3969,7 +4314,9 @@ class DesktopApp:
                 ("", group.normalized_title,
                  f"{len(group.candidates)} copies",
                  self._fmt_bytes(group.total_size_bytes)),
-                None, 0,
+                # Same non-delete-action payload convention as the folder-pair
+                # header above — lets "Not a duplicate" ignore this one group.
+                ("group", list(group.candidates)), 0,
             ))
             for path, size in zip(group.candidates, group.candidate_sizes):
                 typed_rows.append((
@@ -4434,7 +4781,15 @@ class DesktopApp:
         if self._maint_tool_name == "find_duplicates":
             # Payloads: absolute file paths, or ("paths", [...]) for a whole
             # folder side. Checking a side and its children double-counts —
-            # dedupe keeps the delete list honest.
+            # dedupe keeps the delete list honest. Group/folder-pair HEADER
+            # rows carry a non-None ("group", …) / ("folder_pair", …) payload
+            # too (Task G item 2 — that's what lets "Not a duplicate" resolve
+            # a selected header), so they pass the earlier `payload is not
+            # None` filter but are never a delete action; if ticking only
+            # those is all the user did, paths_to_delete comes back empty and
+            # that must surface as the same "nothing to do" warning it always
+            # did (back when a header's payload was plain None and got
+            # filtered out before reaching here), not a silent no-op.
             paths_to_delete: list[str] = []
             for p in selected_payloads:
                 if isinstance(p, str):
@@ -4443,6 +4798,11 @@ class DesktopApp:
                     paths_to_delete.extend(p[1])
             paths_to_delete = list(dict.fromkeys(paths_to_delete))
             if not paths_to_delete:
+                self._show_warning(
+                    "Nothing selected",
+                    "Only group/folder-pair header rows are ticked — those "
+                    "aren't deletable on their own. Tick a specific file row "
+                    "(or a 'DELETE this whole side' row), then try again.")
                 return
             self._confirm_and_delete_duplicates(paths_to_delete)
             return
@@ -4592,8 +4952,170 @@ class DesktopApp:
                         "Folder Removal", f"Removed {removed_dirs} empty folder(s).",
                     )
 
-        # Re-run find_duplicates so the tree reflects what's left
+        # Re-run find_duplicates so the tree reflects what's left. Pop the
+        # cache + clear the tool name FIRST (Task B item 4, same pattern as
+        # Clean Junk) — otherwise _run_find_duplicates() sees a still-valid
+        # cache entry and re-renders the just-deleted files instead of
+        # re-scanning the disk.
+        self._maint_cache.pop("find_duplicates", None)
+        self._maint_tool_name = ""
         self._run_find_duplicates()
+
+    def _maint_mark_not_duplicate(self) -> None:
+        """Task G item 2: persist a 'not a duplicate' verdict for whatever is
+        selected in the Find Duplicates results tree, then re-scan so it
+        drops out of the grid immediately.
+
+        Uses the Treeview's own row SELECTION (click/ctrl-click/shift-click),
+        independent of the Delete? checkbox column — ticking Delete? and
+        marking 'not a duplicate' are different verbs on the same rows.
+        Recognises three selectable shapes, all built by
+        _handle_duplicates_result: a folder-pair header (ignores the whole
+        pair of folders), a single-group header (ignores that one group by
+        its full candidate set), or a leaf file row (resolved back to its
+        owning group)."""
+        if self._maint_tool_name != "find_duplicates" or self._maint_tree is None:
+            self._show_info("Not a duplicate",
+                            "Run Find Duplicates first, select a group or "
+                            "folder-pair row in the results, then try again.")
+            return
+        selected = self._maint_tree.selection()
+        if not selected:
+            self._show_warning(
+                "Not a duplicate",
+                "Select a duplicate-group row (or a folded folder-pair "
+                "header) in the results above first.")
+            return
+
+        import dupe_ignore
+        row_state = getattr(self, "_maint_row_state", {})
+        folder_pairs = 0
+        groups = 0
+        seen_group_keys: set[tuple] = set()
+        for iid in selected:
+            state = row_state.get(iid)
+            if state is None:
+                continue
+            _var, payload = state
+            if isinstance(payload, tuple) and payload and payload[0] == "folder_pair":
+                _, da, db = payload
+                key = dupe_ignore.folder_pair_key(da, db)
+                if key not in seen_group_keys:
+                    seen_group_keys.add(key)
+                    dupe_ignore.ignore_folder_pair(da, db)
+                    folder_pairs += 1
+            elif isinstance(payload, tuple) and payload and payload[0] == "group":
+                key = dupe_ignore.file_pair_key(payload[1])
+                if key not in seen_group_keys:
+                    seen_group_keys.add(key)
+                    dupe_ignore.ignore_file_pair(payload[1])
+                    groups += 1
+            elif isinstance(payload, str):
+                group = next(
+                    (g for g in self._maint_results
+                     if isinstance(g, DuplicateGroup) and payload in g.candidates),
+                    None)
+                if group is not None:
+                    key = dupe_ignore.file_pair_key(group.candidates)
+                    if key not in seen_group_keys:
+                        seen_group_keys.add(key)
+                        dupe_ignore.ignore_file_pair(group.candidates)
+                        groups += 1
+
+        if not folder_pairs and not groups:
+            self._show_warning(
+                "Not a duplicate",
+                "Select a group header, folder-pair header, or a specific "
+                "file row (not a 'DELETE this whole side' row), then try again.")
+            return
+
+        parts = []
+        if groups:
+            parts.append(f"{groups} group(s)")
+        if folder_pairs:
+            parts.append(f"{folder_pairs} folder pair(s)")
+        self._maint_status_var.set(
+            f"Marked not-a-duplicate: {', '.join(parts)}. Re-scanning…")
+        self._maint_cache.pop("find_duplicates", None)
+        self._maint_tool_name = ""
+        self._run_find_duplicates()
+
+    def _maint_open_ignored_pairs(self) -> None:
+        """Task G item 2: 'Ignored pairs' viewer with un-ignore, so a verdict
+        marked in a moment of certainty is never permanently invisible."""
+        import dupe_ignore
+
+        win = tk.Toplevel(self.root)
+        win.title("Ignored duplicate pairs")
+        win.geometry("820x420")
+        win.transient(self.root)
+        win.columnconfigure(0, weight=1)
+        win.rowconfigure(1, weight=1)
+
+        ttk.Label(win, text=(
+            "Pairs marked 'Not a duplicate' in Find Duplicates. A folder "
+            "pair covers every episode between those two folders, including "
+            "ones found on a future rescan; a file pair covers just that one "
+            "group's exact files."), wraplength=780, font=("Segoe UI", 9, "italic")
+            ).grid(row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 4))
+
+        tree = ttk.Treeview(win, columns=("kind", "a", "b", "at"), show="headings")
+        for col, text, width in (("kind", "Kind", 90), ("a", "Path A", 300),
+                                 ("b", "Path B / more", 300), ("at", "Ignored (UTC)", 140)):
+            tree.heading(col, text=text)
+            tree.column(col, width=width, anchor=tk.W)
+        tree.grid(row=1, column=0, sticky="nsew", padx=10)
+        scroll = ttk.Scrollbar(win, orient=tk.VERTICAL, command=tree.yview)
+        scroll.grid(row=1, column=1, sticky="ns")
+        tree.configure(yscrollcommand=scroll.set)
+        make_sortable(tree)
+
+        entries: dict[str, tuple[str, list[str]]] = {}
+
+        def reload() -> None:
+            for iid in tree.get_children():
+                tree.delete(iid)
+            entries.clear()
+            for e in dupe_ignore.list_ignored_folder_pairs():
+                paths = e.get("paths") or []
+                a = paths[0] if len(paths) > 0 else ""
+                b = paths[1] if len(paths) > 1 else ""
+                iid = tree.insert("", "end",
+                                  values=("Folder pair", a, b, e.get("ignored_at", "")))
+                entries[iid] = ("folder", paths)
+            for e in dupe_ignore.list_ignored_file_pairs():
+                paths = e.get("paths") or []
+                a = paths[0] if len(paths) > 0 else ""
+                b = "; ".join(paths[1:])
+                iid = tree.insert("", "end",
+                                  values=("File pair", a, b, e.get("ignored_at", "")))
+                entries[iid] = ("file", paths)
+
+        reload()
+
+        def unignore_selected() -> None:
+            changed = False
+            for iid in tree.selection():
+                kind, paths = entries.get(iid, ("", []))
+                if kind == "folder" and len(paths) == 2:
+                    changed = dupe_ignore.unignore_folder_pair(paths[0], paths[1]) or changed
+                elif kind == "file" and len(paths) >= 2:
+                    changed = dupe_ignore.unignore_file_pair(paths) or changed
+            if changed:
+                reload()
+                # The dupes grid may now be stale (fewer ignores in effect) —
+                # same pop-cache-before-rescan pattern as everywhere else.
+                self._maint_cache.pop("find_duplicates", None)
+                if self._maint_tool_name == "find_duplicates":
+                    self._maint_tool_name = ""
+
+        btn_bar = ttk.Frame(win)
+        btn_bar.grid(row=2, column=0, columnspan=2, sticky="e", padx=10, pady=10)
+        ttk.Button(btn_bar, text="Un-ignore selected",
+                  command=unignore_selected).pack(side=tk.RIGHT)
+        ttk.Button(btn_bar, text="Close",
+                  command=win.destroy).pack(side=tk.RIGHT, padx=(0, 6))
+        self._apply_dark_widget_styles(win)
 
     # =====================================================================
     # Custom Rename dialog (Bulk Rename Utility-style)
@@ -4719,6 +5241,13 @@ class DesktopApp:
             status_var.set("Building preview...")
             win.update_idletasks()
 
+            # Task B item 2: remember this exact rule/pattern/type-selection
+            # so 🔄 Re-run can replay it later without the dialog open.
+            self._maint_custom_rename_replay = {
+                "kind": "custom_dialog", "rule": rule, "pattern": pattern,
+                "allowed_tags": allowed_tags,
+            }
+
             def worker() -> None:
                 try:
                     pairs = self._build_custom_rename_pairs(rule, pattern, allowed_tags)
@@ -4797,13 +5326,17 @@ class DesktopApp:
         return pairs
 
     def _apply_custom_rename_preview(
-        self, pairs: list[SanitizePair], dialog: tk.Toplevel,
+        self, pairs: list[SanitizePair], dialog: "tk.Toplevel | None",
     ) -> None:
-        """Push the SanitizePair preview into the maintenance tree."""
-        try:
-            dialog.destroy()
-        except tk.TclError:
-            pass
+        """Push the SanitizePair preview into the maintenance tree.
+
+        `dialog` is None when this is a 🔄 Re-run replay (Task B item 2) —
+        there's no dialog open to close in that path."""
+        if dialog is not None:
+            try:
+                dialog.destroy()
+            except tk.TclError:
+                pass
 
         self._maint_tool_name = "custom_rename"
         self._maint_results = pairs
@@ -4811,6 +5344,7 @@ class DesktopApp:
         if not pairs:
             self._maint_status_var.set("Custom Rename: no files would change.")
             self._populate_maint_tree([], col1="Original", col2="Proposed", col3="Size")
+            self._maint_append_rescan_stamp(0)
             self._show_info(
                 "Custom Rename",
                 "Your rule didn't match any filenames -- no changes proposed.",
@@ -4837,6 +5371,7 @@ class DesktopApp:
             [], col1="Original", col2="Proposed", col3="Size",
             typed_rows=typed_rows,
         )
+        self._maint_append_rescan_stamp(len(self._maint_typed_rows))
         self._show_info(
             "Custom Rename",
             f"Previewing {len(pairs)} proposed rename(s).\n\n"
@@ -4868,7 +5403,20 @@ class DesktopApp:
         else:
             self._maint_status_var.set(f"{success} file(s) renamed successfully.")
             self._show_info("Rename Complete", f"Successfully renamed {success} file(s).")
-        self._run_sanitize()
+        # Pop cache + clear tool name FIRST (Task B item 4, same pattern as
+        # Clean Junk) -- otherwise the re-run below sees a still-valid cache
+        # entry and re-renders the just-renamed (now-stale) preview instead
+        # of a fresh scan. This handler serves TWO producers of the
+        # 'custom_rename' grid (the Custom Rename dialog and Combo Clean) as
+        # well as plain Sanitize Names, so re-run whichever one was actually
+        # showing when Apply Selected was clicked.
+        tool = self._maint_tool_name
+        if tool == "custom_rename":
+            self._maint_rerun_custom_rename()
+        else:
+            self._maint_cache.pop("sanitize", None)
+            self._maint_tool_name = ""
+            self._run_sanitize()
 
     # =====================================================================
     # Utilities
@@ -5014,7 +5562,7 @@ class DesktopApp:
         ("SUBTITLE_LANGUAGE", "Subtitle language (en, es, fr, …)", "text"),
         ("SUBTITLE_SUBFOLDER", "Put moved subtitles in a 'Subs' subfolder (verify Plex scans it first)", "bool"),
         # Plex identity
-        ("PLEX_ACCOUNT_NAME", "Which Plex user are you? (Watchlist/Recs)", "plex_account"),
+        ("PLEX_ACCOUNT_NAME", "Which Plex user are you? (Watchlist)", "plex_account"),
         # Misc
         ("TOOLTIPS_ENABLED", "Show hover tooltips on buttons", "bool"),
         ("IDLE_CACHE_ENABLED", "Overnight pre-cache (warm all scans while idle)", "bool"),

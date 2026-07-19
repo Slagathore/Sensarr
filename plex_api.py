@@ -1,11 +1,13 @@
 import json
 import logging
+import math
 import ssl
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import config
@@ -424,28 +426,416 @@ def get_watchlist(limit: int = 100) -> list[WatchlistItem]:
 
 
 # ---------------------------------------------------------------------------
-# Recommendations — genre affinity from one user's watch history
+# Recommendations — two honest sections: "In your library (unwatched)" and
+# "Discover (not in library)", never mixed (fix sprint, Task C).
+#
+# Presence (owned-or-not) is checked provider-id FIRST — a Plex GUID / TMDB /
+# TVDB id, read the same way _parse_plex_guids / WatchlistItem.identity
+# already do elsewhere in this module — and identity-aware title match
+# SECOND (media_lookup.check_library_for_title, which applies
+# media_identity.sequel_mismatch — different sequel/part numbers are treated
+# as a different entry no matter how similar the base titles are). Filename
+# substrings are NEVER used for presence; that was the bug in both this
+# function's old TMDB-owned relabelling and watchlist_tab's "In Library"
+# column.
+#
+# Discover is seeded from TMDB similar/recommendations on this account's
+# recency-weighted most-watched titles (a title watched recently outweighs
+# one watched the same number of times a year ago), blended with TMDB's own
+# vote_average/vote_count, excluding watched, owned, and already-requested/
+# queued titles. Falls back to the existing popular-in-genre discover when
+# watch history is too thin to seed anything trustworthy.
+#
+# Scope note: Discover candidates come from TMDB only. Anime titles within
+# that TMDB set are labelled via the same original_language=='ja'/genre-16
+# heuristic media_lookup.search_tmdb_anime uses, so they land in their own
+# item_type instead of being lumped into "show". A dedicated Jikan/AniList-
+# seeded anime discover path (mirroring the movie/tv seeding below) is a
+# reasonable follow-up, not built this sprint.
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class Recommendation:
     title: str
     year: int | None
-    item_type: str          # "movie" | "show"
+    item_type: str          # "movie" | "show" | "anime" | "xanime"
     genres: tuple[str, ...]
-    note: str               # "because you watch Action, Sci-Fi"
+    note: str               # "because you watch Action, Sci-Fi" / "similar to X"
     in_library: bool
+    tmdb_id: str | None = None   # provider id, when known (mainly Discover)
+
+
+@dataclass(frozen=True)
+class RecommendationsResult:
+    top_genres: list[str]
+    library: list[Recommendation]     # "In your library (unwatched)"
+    discover: list[Recommendation]    # "Discover (not in library)"
+    generated_at: float               # time.time() this result was built
+
+
+@dataclass(frozen=True)
+class LibraryProviderIndex:
+    """Provider ids the Plex library currently holds, split by movie/show
+    namespace — a TMDB movie id and a TMDB tv id are different id spaces, so
+    the same numeric id can legitimately mean two different titles."""
+    movie_tmdb_ids: frozenset = frozenset()
+    movie_imdb_ids: frozenset = frozenset()
+    show_tmdb_ids: frozenset = frozenset()
+    show_tvdb_ids: frozenset = frozenset()
+    show_imdb_ids: frozenset = frozenset()
+
+
+_RECS_HISTORY_DEPTH = 300
+# Fewer than this many recency-weighted seeds (or zero candidates back from
+# TMDB for the seeds we do have) is "too thin to trust" — Discover falls back
+# to the popular-in-genre list instead of guessing off one data point.
+_DISCOVER_MIN_SEEDS = 3
+_DISCOVER_HALF_LIFE_DAYS = 30.0
+
+
+def recs_cache_is_stale(generated_at: float, *, ttl_hours: float,
+                        now: float | None = None) -> bool:
+    """True when a cached recommendations payload is old enough to refetch.
+    A missing/zero timestamp (no freshness stamp yet, or a cache miss) is
+    always stale."""
+    if not generated_at:
+        return True
+    now = time.time() if now is None else now
+    return (now - generated_at) > (ttl_hours * 3600.0)
+
+
+def _section_media_kind(section: dict[str, Any], plex_type: str) -> str:
+    """Map a Plex section to Sensarr's movie/show/anime/xanime tagging via
+    the configured library-path types (config.MEDIA_LIBRARY_PATHS) — Plex
+    itself only ever reports section type "movie" or "show", so a dedicated
+    "Anime" Plex library was previously indistinguishable from a regular one
+    here. Falls back to the raw Plex section type when no configured anime/
+    xanime path matches a section's location (the common case)."""
+    locations = [
+        str(loc.get("path")) for loc in _as_list(section.get("Location"))
+        if isinstance(loc, dict) and loc.get("path")
+    ]
+    if not locations:
+        return plex_type
+    for raw in locations:
+        try:
+            loc_path = Path(raw).resolve()
+        except OSError:
+            loc_path = Path(raw)
+        for entry in config.MEDIA_LIBRARY_PATHS:
+            if entry.media_type not in ("anime", "xanime"):
+                continue
+            try:
+                root = Path(entry.path).resolve()
+            except OSError:
+                root = Path(entry.path)
+            if loc_path == root:
+                return entry.media_type
+            try:
+                loc_path.relative_to(root)
+                return entry.media_type
+            except ValueError:
+                pass
+            try:
+                root.relative_to(loc_path)
+                return entry.media_type
+            except ValueError:
+                continue
+    return plex_type
+
+
+def build_library_provider_index() -> LibraryProviderIndex:
+    """Provider ids (TMDB/TVDB/IMDB) the Plex library currently holds, read
+    from the SAME Guid field Plex itself carries on every item
+    (_parse_plex_guids) — so presence checks are provider-id exact instead of
+    filename-substring guesses. Movie/show ids are kept in separate
+    namespaces (see LibraryProviderIndex)."""
+    movie_tmdb: set[str] = set()
+    movie_imdb: set[str] = set()
+    show_tmdb: set[str] = set()
+    show_tvdb: set[str] = set()
+    show_imdb: set[str] = set()
+    for section in _library_sections():
+        section_type = str(section.get("type") or "")
+        if section_type not in ("movie", "show"):
+            continue
+        key = str(section.get("key") or "")
+        if not key:
+            continue
+        try:
+            items = _section_items(key)
+        except Exception:
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            guids = _parse_plex_guids(item)
+            if section_type == "movie":
+                if guids.get("tmdb"):
+                    movie_tmdb.add(guids["tmdb"])
+                if guids.get("imdb"):
+                    movie_imdb.add(guids["imdb"])
+            else:
+                if guids.get("tmdb"):
+                    show_tmdb.add(guids["tmdb"])
+                if guids.get("tvdb"):
+                    show_tvdb.add(guids["tvdb"])
+                if guids.get("imdb"):
+                    show_imdb.add(guids["imdb"])
+    return LibraryProviderIndex(
+        movie_tmdb_ids=frozenset(movie_tmdb), movie_imdb_ids=frozenset(movie_imdb),
+        show_tmdb_ids=frozenset(show_tmdb), show_tvdb_ids=frozenset(show_tvdb),
+        show_imdb_ids=frozenset(show_imdb))
+
+
+def check_item_in_library(
+    title: str, media_kind: str, *, tmdb_id: str | None = None,
+    tvdb_id: str | None = None, imdb_id: str | None = None,
+    provider_index: LibraryProviderIndex | None = None,
+) -> bool:
+    """Presence check for one title. Provider id FIRST (an exact Plex GUID /
+    TMDB / TVDB id match against `provider_index`), identity-aware title
+    match SECOND (media_lookup.check_library_for_title, which already applies
+    media_identity.sequel_mismatch — a candidate with a different sequel/part
+    number is never treated as the same title, however similar the base
+    titles look). Note: check_library_for_title does NOT additionally call
+    media_identity.numeric_title_mismatch — it doesn't need to, since
+    sequel_mismatch is symmetric (any differing sequel signature is already a
+    mismatch) where numeric_title_mismatch is the deliberately narrower,
+    directional guard compare_media_identity uses for grab verification.
+    Filename substrings are never used here — this is the single presence
+    check both get_recommendations and watchlist_tab's "In Library" column
+    call, replacing the two separate substring checks that used to live in
+    each."""
+    kind = "movie" if media_kind == "movie" else "show"
+    if provider_index is not None:
+        if kind == "movie":
+            if tmdb_id and str(tmdb_id) in provider_index.movie_tmdb_ids:
+                return True
+            if imdb_id and str(imdb_id) in provider_index.movie_imdb_ids:
+                return True
+        else:
+            if tvdb_id and str(tvdb_id) in provider_index.show_tvdb_ids:
+                return True
+            if tmdb_id and str(tmdb_id) in provider_index.show_tmdb_ids:
+                return True
+            if imdb_id and str(imdb_id) in provider_index.show_imdb_ids:
+                return True
+    if not title:
+        return False
+    try:
+        from media_lookup import check_library_for_title
+        found, _matches = check_library_for_title(
+            title, "movie" if kind == "movie" else "tv")
+        return found
+    except Exception:
+        return False
+
+
+def _history_seed_weights(history: list[dict[str, Any]], *,
+                          now: float | None = None,
+                          limit: int = 8) -> list[dict[str, Any]]:
+    """Recency-weighted most-watched seeds from raw Plex history entries.
+
+    Each distinct title (grandparentRatingKey for episodes, ratingKey for
+    movies) accumulates a score per watch, exponentially decayed by age
+    (half-life _DISCOVER_HALF_LIFE_DAYS) — a title watched several times
+    recently outranks one watched the same number of times a year ago.
+    Returns up to `limit` seeds, highest score first. A watch with no
+    viewedAt timestamp is treated as old (four half-lives back) rather than
+    "now", so malformed history entries never dominate the seed list.
+    """
+    now = time.time() if now is None else now
+    scores: dict[str, float] = {}
+    meta: dict[str, dict[str, Any]] = {}
+    for h in history:
+        rk = str(h.get("grandparentRatingKey") or h.get("ratingKey") or "")
+        if not rk:
+            continue
+        viewed = _safe_int(h.get("viewedAt"))
+        age_days = (max(0.0, (now - viewed) / 86400.0) if viewed
+                   else _DISCOVER_HALF_LIFE_DAYS * 4)
+        scores[rk] = scores.get(rk, 0.0) + 0.5 ** (age_days / _DISCOVER_HALF_LIFE_DAYS)
+        if rk not in meta:
+            is_episode = str(h.get("type") or "").casefold() == "episode"
+            meta[rk] = {
+                "rating_key": rk,
+                "title": str(h.get("grandparentTitle") or h.get("title") or ""),
+                "item_type": "show" if is_episode else "movie",
+            }
+    ranked = sorted(scores.items(), key=lambda kv: -kv[1])[:limit]
+    out = []
+    for rk, score in ranked:
+        row = dict(meta[rk])
+        row["score"] = score
+        out.append(row)
+    return out
+
+
+def _seed_provider_id(rating_key: str) -> tuple[str, str] | None:
+    """(provider, id) for a watched item, read off its Plex metadata Guid —
+    the same GUID data used everywhere else in this module."""
+    try:
+        payload = _request_json(f"/library/metadata/{rating_key}")
+    except Exception:
+        return None
+    for meta in _as_list(_media_container(payload).get("Metadata")):
+        if not isinstance(meta, dict):
+            continue
+        guids = _parse_plex_guids(meta)
+        if guids.get("tmdb"):
+            return ("tmdb", guids["tmdb"])
+        if guids.get("tvdb"):
+            return ("tvdb", guids["tvdb"])
+    return None
+
+
+def _tmdb_get_json(path: str) -> dict[str, Any]:
+    import json as _json
+    import urllib.request as _rq
+    req = _rq.Request(
+        f"https://api.themoviedb.org/3/{path}?api_key={config.TMDB_API_KEY}",
+        headers={"Accept": "application/json"})
+    with _rq.urlopen(req, timeout=15) as resp:
+        return _json.loads(resp.read().decode("utf-8", errors="replace"))
+
+
+def _tmdb_related(media_kind: str, tmdb_id: str) -> list[dict[str, Any]]:
+    """TMDB 'recommendations' + 'similar' candidates for one seed, merged and
+    de-duplicated by TMDB id. Both endpoints run — recommendations is TMDB's
+    own model, similar is genre/keyword based — either alone misses picks."""
+    if not config.TMDB_API_KEY:
+        return []
+    kind = "movie" if media_kind == "movie" else "tv"
+    seen: dict[str, dict[str, Any]] = {}
+    for endpoint in ("recommendations", "similar"):
+        try:
+            data = _tmdb_get_json(f"{kind}/{tmdb_id}/{endpoint}")
+        except Exception:
+            logger.debug("TMDB %s/%s failed for %s.", kind, endpoint, tmdb_id,
+                        exc_info=True)
+            continue
+        results = data.get("results") if isinstance(data, dict) else None
+        for item in (results or []):
+            if not isinstance(item, dict):
+                continue
+            cid = str(item.get("id") or "")
+            if cid and cid not in seen:
+                seen[cid] = item
+    return list(seen.values())
+
+
+def _tmdb_quality_score(vote_average: Any, vote_count: Any) -> float:
+    """Blend TMDB's rating and its confidence (vote count) into one score —
+    a 9.0 average from 3 votes should not outrank a 7.5 from 5000 votes."""
+    va = float(vote_average) if vote_average else 0.0
+    vc = float(vote_count) if vote_count else 0.0
+    return va * math.log10(vc + 10.0)
+
+
+def _discover_candidate_to_recommendation(
+    item: dict[str, Any], media_kind: str, note: str,
+) -> Recommendation:
+    title = str(item.get("title") or item.get("name") or "")
+    date_field = item.get("release_date") or item.get("first_air_date")
+    year = (_safe_int(str(date_field)[:4]) or None) if date_field else None
+    is_anime = (str(item.get("original_language") or "") == "ja"
+               or 16 in (item.get("genre_ids") or []))
+    item_type = "anime" if is_anime else media_kind
+    return Recommendation(
+        title=title, year=year, item_type=item_type, genres=(),
+        note=note, in_library=False, tmdb_id=str(item.get("id") or "") or None)
+
+
+def _discover_from_history(
+    mine_history: list[dict[str, Any]], *, watched_titles: set[str],
+    provider_index: LibraryProviderIndex, requested_keys: set[tuple[str, str]],
+    limit: int, now: float | None = None,
+) -> list[Recommendation]:
+    """Discover candidates seeded from this account's recency-weighted most-
+    watched titles, blended with TMDB vote_average/vote_count. Excludes
+    watched, owned, and already-requested/queued titles. Returns an empty
+    list when history is too thin to seed (caller falls back to
+    popular-in-genre in that case)."""
+    seeds = _history_seed_weights(mine_history, now=now)
+    if len(seeds) < _DISCOVER_MIN_SEEDS:
+        return []
+
+    # tmdb_id -> [running score, TMDB item payload, media_kind, {seed titles}]
+    scored: dict[str, list] = {}
+    seeded_any = False
+    for seed in seeds:
+        ident = _seed_provider_id(seed["rating_key"])
+        if not ident or ident[0] != "tmdb":
+            continue
+        candidates = _tmdb_related(seed["item_type"], ident[1])
+        if not candidates:
+            continue
+        seeded_any = True
+        for item in candidates:
+            cid = str(item.get("id") or "")
+            title = str(item.get("title") or item.get("name") or "")
+            if not cid or not title:
+                continue
+            if title.casefold() in watched_titles:
+                continue
+            if ("tmdb", cid) in requested_keys:
+                continue
+            quality = _tmdb_quality_score(item.get("vote_average"), item.get("vote_count"))
+            contribution = seed["score"] * quality
+            if cid in scored:
+                scored[cid][0] += contribution
+                scored[cid][3].add(seed["title"])
+            else:
+                scored[cid] = [contribution, item, seed["item_type"], {seed["title"]}]
+
+    if not seeded_any:
+        return []
+
+    ranked = sorted(scored.items(), key=lambda kv: -kv[1][0])
+    out: list[Recommendation] = []
+    for _cid, (_score, item, media_kind, sources) in ranked:
+        rec = _discover_candidate_to_recommendation(
+            item, media_kind, "similar to " + ", ".join(sorted(sources)[:2]))
+        if not rec.title:
+            continue
+        if check_item_in_library(
+            rec.title, "movie" if rec.item_type == "movie" else "show",
+            tmdb_id=rec.tmdb_id, provider_index=provider_index,
+        ):
+            continue
+        out.append(rec)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _requested_provider_keys() -> set[tuple[str, str]]:
+    """(identity_source, external_id) of every request ever queued — Discover
+    must never re-suggest something already requested/queued, whether or not
+    it was ever fulfilled."""
+    try:
+        import queue_store as qs
+        return {
+            (req.identity_source, str(req.external_id))
+            for req in qs.list_requests(status="all", limit=2000)
+            if req.identity_source and req.external_id
+        }
+    except Exception:
+        logger.debug("Request-history lookup failed for Discover exclusion.",
+                    exc_info=True)
+        return set()
 
 
 def get_recommendations(
-    account_name: str | None, *, in_library_only: bool = True,
-    genre_filter: str | None = None, limit: int = 40,
-) -> tuple[list[str], list[Recommendation]]:
-    """(top_genres, recommendations) for one Plex user.
-
-    Tallies genres from the user's recent watch history, then surfaces
-    UNWATCHED library items in those genres. With in_library_only=False,
-    TMDB discover adds popular titles you don't have yet (TMDB key needed).
+    account_name: str | None, *, genre_filter: str | None = None,
+    limit: int = 40,
+) -> RecommendationsResult:
+    """Two honest sections for one Plex user: 'library' (owned, unwatched,
+    genre-matched — including anime-tagged Plex sections) and 'discover'
+    (not owned, seeded from recency-weighted watch history + TMDB similar/
+    recommendations, falling back to popular-in-genre when history is too
+    thin). Never mixed — a title appears in exactly one of the two lists.
 
     Caveat: per-item viewCount comes from the admin token's perspective;
     Plex doesn't expose other users' watched flags through this API, so
@@ -456,7 +846,7 @@ def get_recommendations(
         (i for i, n in names.items() if n.casefold() == (account_name or "").casefold()),
         None,
     )
-    history = _history_entries(300)
+    history = _history_entries(_RECS_HISTORY_DEPTH)
     mine = ([h for h in history if _safe_int(h.get("accountID"), -1) == account_id]
             if account_id is not None else history)
     if not mine:
@@ -509,7 +899,16 @@ def get_recommendations(
     top_genres = [g for g, _n in sorted(genre_count.items(), key=lambda kv: -kv[1])][:8]
     wanted = ({genre_filter} if genre_filter else set(top_genres))
 
-    recs: list[tuple[int, Recommendation]] = []
+    # --- Library (owned, unwatched, genre-matched) + provider index in ONE
+    # walk of the sections — the provider index needs every item regardless
+    # of watched state (a watched item is still "owned" for Discover to
+    # exclude), the library-recs list only wants unwatched genre matches.
+    library_recs: list[tuple[int, Recommendation]] = []
+    movie_tmdb: set[str] = set()
+    movie_imdb: set[str] = set()
+    show_tmdb: set[str] = set()
+    show_tvdb: set[str] = set()
+    show_imdb: set[str] = set()
     for section in _library_sections():
         section_type = str(section.get("type") or "")
         if section_type not in ("movie", "show"):
@@ -517,6 +916,7 @@ def get_recommendations(
         key = str(section.get("key") or "")
         if not key:
             continue
+        media_kind = _section_media_kind(section, section_type)
         try:
             items = _section_items(key)
         except Exception:
@@ -524,6 +924,20 @@ def get_recommendations(
         for item in items:
             if not isinstance(item, dict):
                 continue
+            guids = _parse_plex_guids(item)
+            if section_type == "movie":
+                if guids.get("tmdb"):
+                    movie_tmdb.add(guids["tmdb"])
+                if guids.get("imdb"):
+                    movie_imdb.add(guids["imdb"])
+            else:
+                if guids.get("tmdb"):
+                    show_tmdb.add(guids["tmdb"])
+                if guids.get("tvdb"):
+                    show_tvdb.add(guids["tvdb"])
+                if guids.get("imdb"):
+                    show_imdb.add(guids["imdb"])
+
             if _safe_int(item.get("viewCount")) > 0:
                 continue
             title = str(item.get("title") or "")
@@ -536,42 +950,48 @@ def get_recommendations(
             overlap = [g for g in genres if g in wanted]
             if not overlap:
                 continue
-            recs.append((len(overlap), Recommendation(
+            library_recs.append((len(overlap), Recommendation(
                 title=title, year=_safe_int(item.get("year")) or None,
-                item_type=section_type, genres=genres,
+                item_type=media_kind, genres=genres,
                 note="because you watch " + ", ".join(overlap[:3]),
-                in_library=True,
-            )))
-    recs.sort(key=lambda pair: -pair[0])
-    results = [r for _score, r in recs[:limit]]
+                in_library=True, tmdb_id=guids.get("tmdb"))))
+    library_recs.sort(key=lambda pair: -pair[0])
+    library = [r for _score, r in library_recs[:limit]]
 
-    if not in_library_only and config.TMDB_API_KEY and (genre_filter or top_genres):
-        tmdb_recs = _tmdb_discover_recs(
-            genre_filter or top_genres[0],
-            exclude_titles=watched_titles | {r.title.casefold() for r in results},
-            limit=max(5, limit // 3),
-        )
-        # Truth in labelling: TMDB doesn't know what's on disk — verify each
-        # suggestion against the local file index before claiming "not in
-        # library". Owned ones get relabelled instead of lying.
-        try:
-            from library_index import list_all_files
-            library_names = " || ".join(
-                e.name.casefold() for e in list_all_files())
-        except Exception:
-            library_names = ""
-        for rec in tmdb_recs:
-            owned = bool(library_names) and rec.title.casefold() in library_names
-            if owned:
-                results.append(Recommendation(
-                    title=rec.title, year=rec.year, item_type=rec.item_type,
-                    genres=rec.genres,
-                    note=rec.note.replace("(not in library)", "— already in your library"),
-                    in_library=True,
-                ))
-            else:
-                results.append(rec)
-    return top_genres, results
+    provider_index = LibraryProviderIndex(
+        movie_tmdb_ids=frozenset(movie_tmdb), movie_imdb_ids=frozenset(movie_imdb),
+        show_tmdb_ids=frozenset(show_tmdb), show_tvdb_ids=frozenset(show_tvdb),
+        show_imdb_ids=frozenset(show_imdb))
+
+    # --- Discover (not owned) ---
+    discover: list[Recommendation] = []
+    if config.TMDB_API_KEY:
+        requested_keys = _requested_provider_keys()
+        discover = _discover_from_history(
+            mine, watched_titles=watched_titles, provider_index=provider_index,
+            requested_keys=requested_keys, limit=limit)
+        if len(discover) < _DISCOVER_MIN_SEEDS and (genre_filter or top_genres):
+            fallback = _tmdb_discover_recs(
+                genre_filter or top_genres[0],
+                exclude_titles=watched_titles | {r.title.casefold() for r in discover},
+                limit=max(5, limit // 3),
+            )
+            seen_ids = {r.tmdb_id for r in discover if r.tmdb_id}
+            for rec in fallback:
+                if rec.tmdb_id and rec.tmdb_id in seen_ids:
+                    continue
+                if ("tmdb", rec.tmdb_id) in requested_keys if rec.tmdb_id else False:
+                    continue
+                if check_item_in_library(
+                    rec.title, "movie" if rec.item_type == "movie" else "show",
+                    tmdb_id=rec.tmdb_id, provider_index=provider_index,
+                ):
+                    continue
+                discover.append(rec)
+
+    return RecommendationsResult(
+        top_genres=top_genres, library=library, discover=discover,
+        generated_at=time.time())
 
 
 # TMDB genre-name → id. Movies and TV use DIFFERENT id sets for several
@@ -637,8 +1057,9 @@ def _tmdb_discover_recs(genre_name: str, *, exclude_titles: set[str],
             out.append(Recommendation(
                 title=title, year=year, item_type=item_type,
                 genres=(genre_name,),
-                note=f"popular {genre_name} (not in library)",
+                note=f"popular {genre_name}",
                 in_library=False,
+                tmdb_id=str(item.get("id") or "") or None,
             ))
             added += 1
             if added >= per_type:

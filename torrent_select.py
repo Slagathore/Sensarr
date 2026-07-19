@@ -222,6 +222,10 @@ class SelectWant:
     fallback_minutes: float = 24.0      # used when runtime is unknown
     allow_cam: bool = False
     mode: str = MODE_AUTOMATIC_SINGLE
+    # Minimum seeders a release must carry to survive the gates. 0 disables the
+    # gate (the pure module stays policy-free; the wiring layer sets
+    # config.MIN_SEEDERS for routine grabs and 0 for the zero-seeder race).
+    min_seeders: int = 0
 
     @property
     def effective_minutes(self) -> float:
@@ -523,6 +527,14 @@ def _run_gates(candidate: Candidate, want: SelectWant, parsed,
             return False, "oversize", (
                 f"{candidate.size_bytes} > cap {int(cap)} "
                 f"({want.size_max_rate} MB/min x {want.effective_minutes:.0f}m)")
+
+    # Gate 9: seeders. A release nobody is seeding never finishes (the "stuck at
+    # 0%" plague). Reject below the want's floor. min_seeders defaults to 0 (gate
+    # disabled) so the pure module imposes no policy of its own, and the
+    # zero-seeder race can still deliberately gamble on unseeded candidates.
+    if want.min_seeders > 0 and candidate.seeders < want.min_seeders:
+        return False, "insufficient_seeders", (
+            f"{candidate.seeders} seeders < floor {want.min_seeders}")
 
     return True, "ok", ""
 

@@ -687,6 +687,57 @@ def set_status(download_id: int, status: str, *, error: str | None = None,
                 (status, error, download_id),
             )
         conn.commit()
+    # A terminal download outcome (error OR cancel) must resolve its request
+    # deterministically, never leave it silently stuck at 'grabbing' (which
+    # auto-grab never scans): re-open for a different release below the attempt
+    # cap, escalate to needs_attention once the cap is reached. Plain cancels
+    # still do NOT write failed_grabs (only 'error' does, above) — a user
+    # cancel is not evidence the release itself was bad.
+    if status in ("error", "cancelled"):
+        row = get_download(download_id)
+        if row is not None and row.request_id is not None:
+            resolve_request_after_failed_grab(row.request_id)
+
+
+def request_grab_attempts(request_id: int) -> int:
+    """How many grabs for this request have reached a terminal failure — a
+    download that errored/cancelled, or one whose verify quarantined it. Drives
+    the per-request attempt cap that stops the auto-grab retry loop."""
+    with _DL_LOCK, db.connect() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM downloads WHERE request_id = ?"
+            " AND (status IN ('error', 'cancelled')"
+            "      OR removed_reason LIKE 'quarantine:%')",
+            (request_id,),
+        ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def resolve_request_after_failed_grab(request_id: int | None) -> str | None:
+    """Deterministic request lifecycle after a grab fails (error/cancel or a
+    quarantined verify). Only touches a request still in the grab loop
+    (open/grabbing/deferred) — placed/fulfilled/needs_attention/cancelled rows
+    are left alone. Past config.GRAB_ATTEMPT_CAP terminal failures the request
+    goes to needs_attention; otherwise it re-opens so the next auto-grab pass
+    can pick a DIFFERENT release (the failed magnet is already penalised via
+    failed_grabs). Returns the new status when it changed, else None."""
+    if request_id is None:
+        return None
+    import config
+    import queue_store
+    req = queue_store.get_request(request_id)
+    if req is None or req.status not in (
+            queue_store.STATUS_OPEN, queue_store.STATUS_GRABBING,
+            queue_store.STATUS_DEFERRED):
+        return None
+    cap = getattr(config, "GRAB_ATTEMPT_CAP", 5)
+    if request_grab_attempts(request_id) >= cap:
+        queue_store.set_status(request_id, queue_store.STATUS_NEEDS_ATTENTION)
+        return queue_store.STATUS_NEEDS_ATTENTION
+    if req.status != queue_store.STATUS_OPEN:
+        queue_store.set_status(request_id, queue_store.STATUS_OPEN)
+        return queue_store.STATUS_OPEN
+    return None
 
 
 def _remember_failure(download_id: int) -> None:
@@ -707,6 +758,28 @@ def _remember_failure(download_id: int) -> None:
             key = f"req:{row.request_id}"
     if key:
         record_failed_grab(key, m.group(1))
+
+
+def display_status(status: str, progress: float, *, error: str | None = None,
+                   phase: str | None = None) -> str:
+    """The honest queue label for a download instead of a bare status + 0%
+    (Task D item 4). Transient runner phases (fetching_metadata / no_peers /
+    probing) are supplied by the live download thread; durable ones (stalled,
+    waiting for slot) are read straight off the row. Unknown states fall back to
+    the raw status, so this can never hide what is really happening."""
+    if phase == "probing" and status in ("queued", "downloading"):
+        return "probing"
+    if status == "queued":
+        return "waiting for slot"
+    if status == "error" and (error or "").lower().startswith("stalled"):
+        return "stalled"
+    if status == "downloading":
+        if phase == "fetching_metadata":
+            return "fetching metadata"
+        if phase == "no_peers":
+            return "no peers"
+        return "downloading"
+    return status
 
 
 def set_progress(download_id: int, progress: float) -> None:

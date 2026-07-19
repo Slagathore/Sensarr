@@ -18,7 +18,10 @@
 #                 expendable scan caches, downloaded metadata dumps
 #   RUNTIME_DIR = $XDG_RUNTIME_DIR/sensarr   (fallback: CACHE_DIR/runtime)
 #                 pid/lock files
-#   DOWNLOAD_DIR default = DATA_DIR/downloads (TORRENT_DOWNLOAD_DIR overrides)
+#   DOWNLOAD_DIR default = DATA_DIR/torrent_staging (TORRENT_DOWNLOAD_DIR wins).
+#                 Deliberately NOT "downloads": that name is the repo's routing
+#                 test-fixture folder, and staging into it caused permission
+#                 collisions with read-only fixtures / a locked indexed path.
 #
 # Explicit environment overrides always win, on every platform:
 #   SENSARR_CONFIG_DIR / SENSARR_DATA_DIR / SENSARR_CACHE_DIR /
@@ -115,9 +118,14 @@ def compute_paths(platform: str | None = None,
     if tdd:
         download_dir = Path(tdd).expanduser()
     elif platform == "win32":
-        download_dir = install / "downloads"
+        # A dedicated staging folder, NOT install/"downloads": in a source
+        # checkout that name doubles as the routing/matching test fixtures, and
+        # staging torrents into it produced the "permission denied" plague
+        # (name collisions with read-only fixture folders / an indexed, locked
+        # library path). Keep staging on its own.
+        download_dir = install / "torrent_staging"
     else:
-        download_dir = data_dir / "downloads"
+        download_dir = data_dir / "torrent_staging"
 
     return AppPaths(
         bundle_dir=bundle, install_dir=install, config_dir=config_dir,

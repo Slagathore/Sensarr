@@ -191,6 +191,13 @@ PLEX_LIBRARY_PATHS: list[str] = [p.path for p in MEDIA_LIBRARY_PATHS]
 UPDATE_NOTIFY: bool = _env_bool("UPDATE_NOTIFY", True)
 UPDATE_SKIPPED_VERSION: str = os.getenv("UPDATE_SKIPPED_VERSION", "").strip()
 
+# Anime metadata DB (Task I): pull the weekly-published manami-only artifact
+# from GitHub Releases instead of building from all three upstream sources
+# locally. On by default — turn off for self-hosters who distrust the
+# published artifact and would rather build from upstream themselves (the
+# full local build is the unconditional fallback either way).
+ANIME_DB_MANIFEST_ENABLED: bool = _env_bool("ANIME_DB_MANIFEST_ENABLED", True)
+
 # Hentai (xanime) support is an opt-in pickup: hidden from the UI unless
 # turned on here — or a library folder is already tagged xanime, so existing
 # installs keep working after an upgrade. Toggled from Settings/the wizard.
@@ -324,6 +331,11 @@ SUBTITLE_SUBFOLDER: bool = _env_bool("SUBTITLE_SUBFOLDER", False)
 # Which Plex account is YOU — used by the Watchlist/Recs tab.
 PLEX_ACCOUNT_NAME: str = os.getenv("PLEX_ACCOUNT_NAME", "").strip()
 
+# Watchlist/Recs tab: the cached recommendations payload auto-refreshes once
+# it's older than this (the manual "Get Recommendations" button always forces
+# a refresh regardless of age).
+RECS_CACHE_TTL_HOURS: float = float(os.getenv("RECS_CACHE_TTL_HOURS", "12"))
+
 # ---------------------------------------------------------------------------
 # External media database API keys
 # Get TMDB key free at: https://www.themoviedb.org/settings/api
@@ -410,8 +422,37 @@ TORRENT_STALL_TIMEOUT_SECONDS: int = int(
 # mode uses qBit's own queueing instead.
 MAX_ACTIVE_DOWNLOADS: int = int(os.getenv("MAX_ACTIVE_DOWNLOADS", "4"))
 # A running download that makes NO progress for this many minutes gets
-# rotated back to the queue when something else is waiting.
+# rotated back to the queue when something else is waiting. The effective
+# window is never shorter than TORRENT_STALL_TIMEOUT_SECONDS (+ slack) so the
+# Node runner's own stall error fires first for a truly dead swarm.
 DOWNLOAD_SLOW_ROTATE_MINUTES: int = int(os.getenv("DOWNLOAD_SLOW_ROTATE_MINUTES", "10"))
+# A download rotated for no-progress this many times is declared stalled: the
+# row goes to 'error' (recording the failure so the request re-grabs a DIFFERENT
+# release) instead of cycling queued -> downloading -> 0% -> queued forever.
+DOWNLOAD_MAX_ROTATIONS: int = int(os.getenv("DOWNLOAD_MAX_ROTATIONS", "2"))
+# Reject any release seeded below this floor before it is ever grabbed — a
+# 0-seed torrent never finishes. The zero-seeder race (below) is the ONLY path
+# allowed to gamble on unseeded candidates, and only when explicitly enabled.
+MIN_SEEDERS: int = int(os.getenv("MIN_SEEDERS", "1"))
+# The zero-seeder race is OFF by default: when nothing seeded survives the gates
+# the request is deferred and rechecked later instead of grabbing dead torrents.
+# Turn it on to gamble on a bounded set of unseeded candidates at once.
+TORRENT_ZERO_SEEDER_RACE: bool = _env_bool("TORRENT_ZERO_SEEDER_RACE", False)
+# When the race IS enabled: at most this many unseeded candidates run at once
+# (kept small — more just splits the trickle and stalls everything).
+ZERO_SEEDER_RACE_MAX_CANDIDATES: int = int(
+    os.getenv("ZERO_SEEDER_RACE_MAX_CANDIDATES", "3"))
+# ...and the race is culled after this many minutes, kept short so a live
+# release elsewhere is found on the next auto-grab pass instead of waiting an hour.
+ZERO_SEEDER_RACE_WINDOW_MINUTES: int = int(
+    os.getenv("ZERO_SEEDER_RACE_WINDOW_MINUTES", "15"))
+# How long a "no seeded release available" deferral holds a request before the
+# open scan rechecks it (seeders can appear within hours).
+ZERO_SEEDER_DEFER_HOURS: float = float(os.getenv("ZERO_SEEDER_DEFER_HOURS", "6"))
+# How many grabs for one request may reach a terminal failure (download
+# error/cancelled or a quarantined verify) before the request stops looping
+# through auto-grab and lands in needs_attention for a human to decide.
+GRAB_ATTEMPT_CAP: int = int(os.getenv("GRAB_ATTEMPT_CAP", "5"))
 # Path to the Node.js executable used to run the webtorrent downloader.
 NODE_PATH: str = os.getenv("NODE_PATH_EXE", "node")
 

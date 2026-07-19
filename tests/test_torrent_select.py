@@ -227,6 +227,43 @@ def test_optional_cam_check_hook_participates():
 
 
 # ---------------------------------------------------------------------------
+# Task D: the minimum-seeder gate. A release nobody seeds never finishes, so it
+# is rejected before it is ever grabbed — but only when the want asks for it
+# (min_seeders defaults to 0, so the pure module stays policy-free and the
+# zero-seeder race can still gamble on unseeded candidates).
+# ---------------------------------------------------------------------------
+
+def test_min_seeders_gate_rejects_unseeded_release():
+    dead = _cand("Tremors.1990.1080p.BluRay.x265-RARBG", seeders=0,
+                 size=1600 * _MB)
+    decision = select_torrent([dead], _movie_want("Tremors", 1990, min_seeders=1))
+    assert not decision.chosen
+    assert decision.verdicts[0].reason_code == "insufficient_seeders"
+
+
+def test_min_seeders_gate_disabled_by_default_passes_unseeded():
+    dead = _cand("Tremors.1990.1080p.BluRay.x265-RARBG", seeders=0,
+                 size=1600 * _MB)
+    # Default want has min_seeders=0 → the gate is off and the 0-seed release
+    # survives (the zero-seeder race path relies on exactly this).
+    decision = select_torrent([dead], _movie_want("Tremors", 1990))
+    assert decision.chosen
+    assert decision.verdicts[0].reason_code == "ok"
+
+
+def test_min_seeders_gate_prefers_seeded_over_dead():
+    dead = _cand("Tremors.1990.1080p.WEB.x264-DEAD", seeders=0, size=1400 * _MB)
+    alive = _cand("Tremors.1990.1080p.BluRay.x264-LIVE", seeders=12,
+                  size=1400 * _MB)
+    decision = select_torrent([dead, alive],
+                              _movie_want("Tremors", 1990, min_seeders=1))
+    assert decision.chosen_title == alive.title
+    reasons = {v.title: v.reason_code for v in decision.verdicts}
+    assert reasons[dead.title] == "insufficient_seeders"
+    assert reasons[alive.title] == "ok"
+
+
+# ---------------------------------------------------------------------------
 # Determinism: shuffled candidate order -> identical decision.
 # ---------------------------------------------------------------------------
 

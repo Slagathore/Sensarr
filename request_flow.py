@@ -39,14 +39,17 @@ from telegram.ext import (
 import config
 from llm_service import categorize_other_request, fuzzy_correct_title, llm_available
 from media_lookup import (
-    LookupResult, MediaResult, ParsedRequest,
+    LookupResult, MediaResult, ParsedRequest, ShowSeasons,
     check_library_for_title, clean_library_name, get_show_seasons, lookup_media,
     parse_request_list, title_similarity,
     search_tmdb_movies, search_tmdb_shows, search_tvdb_shows,
     search_jikan_anime, search_anidb, search_omdb_movies,
+    get_tmdb_tv_status, get_tvdb_series_status, get_tmdb_next_air,
+    get_anime_airing, get_jikan_status,
 )
 import request_intake
-from queue_store import add_request, format_requests_message_user
+import shows_store
+from queue_store import add_request, format_requests_message_user, get_request
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +73,7 @@ _UD_CORRECTION_PAGE  = "req_correction_page"   # int: current result page (0-bas
 _UD_REMOVED          = "req_removed"           # set[int]: 0-based indices dropped by the user
 _UD_SEASON_QUEUE     = "req_season_queue"      # list[int]: 0-based TV indices still needing a season pick
 _UD_SEASON_ADDED     = "req_season_added"      # list[str]: human summary of rows added so far
+_UD_SEASON_ALREADY_HAVE = "req_season_already_have"  # list[str]: summaries of dedupe-skipped items
 
 _CORRECTION_PAGE_SIZE = 5
 _CORRECTION_FETCH_LIMIT = 15  # fetch this many results upfront so paging works without extra calls
@@ -558,35 +562,47 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
             if i not in removed and not lr.in_library
         ]
 
-        # TV goes through the per-item season picker (Task A item 4) so each
-        # submitted show becomes explicit season rows, never a whole-show row.
-        # Anime is intentionally excluded from the season grid (RESOLVED
-        # DECISION 11): its qualifier/provider flow is untouched and it is added
-        # by _add_non_season_items below.
-        # note: deferred - anime seasons return with provider-aware cour mappings.
+        # TV goes through the per-item season picker (Task A item 4, enriched
+        # in Task F) so each submitted show becomes explicit season rows,
+        # never a whole-show row. Anime/xanime get the Task F picker too
+        # (RESOLVED DECISION 11 unfrozen for this sprint): TMDB/TVDB season
+        # enumeration doesn't apply to Jikan/AniList/AniDB entries, so they
+        # take the simpler add/keep-updated prompt in _prompt_next_anime
+        # instead of a season grid.
         if media_type == "tv" and submittable:
             context.user_data[_UD_SEASON_QUEUE] = submittable
             context.user_data[_UD_SEASON_ADDED] = []
             return await _prompt_next_season(update, context)
 
-        # Everything else (movie / anime / xanime) is added now, carrying its
-        # full provider-qualified identity.
+        if media_type in ("anime", "xanime") and submittable:
+            context.user_data[_UD_SEASON_QUEUE] = submittable
+            context.user_data[_UD_SEASON_ADDED] = []
+            return await _prompt_next_anime(update, context)
+
+        # Everything else (movie, or anime/xanime with nothing submittable)
+        # is added now, carrying its full provider-qualified identity.
         requester = _requester_name(update)
         loop = asyncio.get_running_loop()
-        added = await loop.run_in_executor(
+        added, already_have = await loop.run_in_executor(
             None,
             lambda: _add_non_season_items(results, submittable, media_type, requester),
         )
 
+        reply_parts: list[str] = []
         if added:
             bullet_list = "\n".join(f"• {t}" for t in added)
-            await message.reply_html(
-                f"✅ <b>Added {len(added)} request(s) to the queue:</b>\n{bullet_list}\n\n"
-                f"Use the <b>📝 Requests</b> button anytime to see the full queue."
+            reply_parts.append(f"✅ <b>Added {len(added)} request(s) to the queue:</b>\n{bullet_list}")
+        if already_have:
+            bullet_list = "\n".join(f"• {t}" for t in already_have)
+            reply_parts.append(
+                f"📚 <b>Already in your library, nothing new queued ({len(already_have)}):</b>\n{bullet_list}"
             )
+        if reply_parts:
+            reply_parts.append("Use the <b>📝 Requests</b> button anytime to see the full queue.")
+            await message.reply_html("\n\n".join(reply_parts))
         else:
             await message.reply_text(
-                "Nothing new to add — everything was already in your library!"
+                "Nothing new to add. Everything was already in your library."
             )
 
         _clear_flow_state(context)
@@ -601,48 +617,94 @@ def _add_non_season_items(
     submittable: list[int],
     media_type: str,
     requester: str,
-) -> list[str]:
-    """Add movie/anime/xanime rows with their full identity (blocking)."""
+) -> tuple[list[str], list[str]]:
+    """Add movie/anime/xanime rows with their full identity (blocking).
+
+    Returns (added, already_have): already_have is populated when the intake
+    dedupe path reused an existing row instead of inserting one, so the
+    caller can say honestly that nothing new was queued for that item
+    (Task F item 1).
+    """
     added: list[str] = []
+    already_have: list[str] = []
     for i in submittable:
         lr = results[i]
         display = lr.request.display()
         match = lr.best_match
         candidate_titles = [m.title for m in lr.external_matches]
         if match is not None:
-            request_intake.add_matched_request(
+            _row, reused = request_intake.add_matched_request_reporting(
                 display, requester, media_type=media_type, match=match,
                 candidate_titles=candidate_titles,
             )
+            if reused:
+                already_have.append(f"{display} is already in your library.")
+                continue
         else:
             # No external match at all — visible needs_identity, not grabbed.
             request_intake.add_needs_identity(
                 display, requester, media_type=media_type)
         added.append(display)
-    return added
+    return added, already_have
 
 
 def _clear_flow_state(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.user_data:
         return
     for key in (_UD_RESULTS, _UD_MEDIA_TYPE, _UD_REMOVED,
-                _UD_SEASON_QUEUE, _UD_SEASON_ADDED,
+                _UD_SEASON_QUEUE, _UD_SEASON_ADDED, _UD_SEASON_ALREADY_HAVE,
                 _UD_SEASON_CURRENT, _UD_SEASON_DATA):
         context.user_data.pop(key, None)
 
 
 # ---------------------------------------------------------------------------
-# SELECTING_SEASONS state — TV season picker (Task A item 4)
+# SELECTING_SEASONS state — TV season picker (Task A item 4, enriched by
+# Task F) + the anime/xanime add-or-follow prompt (Task F item 4)
 # ---------------------------------------------------------------------------
-# tv only (anime is frozen for the new grid — RESOLVED DECISION 11). "All
-# currently available" expands into one request row per aired regular season
-# under one batch_id; a single pick makes one row; Specials (S00) is an
-# explicit opt-in button, never folded into "All".
+# "Grab everything missing" expands into one request row per aired regular
+# season that isn't already owned, under one batch_id; a single pick makes
+# one row; Specials (S00) is an explicit opt-in button, never folded into the
+# missing-seasons grab. Anime/xanime have no per-season provider data (a
+# Jikan/AniList/AniDB entry is one cour, not a season list), so they take the
+# simpler prompt in _prompt_next_anime instead of a season grid.
 
 _UD_SEASON_CURRENT = "req_season_current"   # int: 0-based index being seasoned
-_UD_SEASON_DATA    = "req_season_data"      # dict: {"regular":[...], "specials":bool, "resolved":bool}
+_UD_SEASON_DATA    = "req_season_data"      # dict: {"regular","missing","have","specials","resolved"}
 
 _SEASON_BUTTONS_PER_ROW = 4
+
+# TMDB/TVDB status strings -> a short friendly label for the context line.
+_STATUS_LABELS: dict[str, str] = {
+    "Returning Series": "airing",
+    "Continuing":       "airing",
+    "Ended":            "ended",
+    "Canceled":         "cancelled",
+    "Cancelled":        "cancelled",
+    "In Production":    "upcoming",
+    "Planned":          "upcoming",
+    "Pilot":            "upcoming",
+    "Upcoming":         "upcoming",
+}
+
+_JIKAN_STATUS_LABELS: dict[str, str] = {
+    "Currently Airing": "airing",
+    "Finished Airing":  "ended",
+    "Not yet aired":    "upcoming",
+}
+
+
+async def _safe_fetch(loop, fn, default):
+    """Run a blocking metadata fetch in the executor; any exception (not just
+    the ones the fetcher already catches internally) degrades to `default`
+    rather than blocking the season/anime picker. Defense in depth on top of
+    the try/except already inside each _tv_status/_owned_seasons/etc.
+    helper — Task F requires the picker to survive a metadata failure no
+    matter which layer it happens at."""
+    try:
+        return await loop.run_in_executor(None, fn)
+    except Exception:
+        logger.debug("Metadata fetch failed — degrading to default.", exc_info=True)
+        return default
 
 
 async def _reply_html(update: Update, text: str,
@@ -655,16 +717,138 @@ async def _reply_html(update: Update, text: str,
         await update.message.reply_html(text, reply_markup=keyboard)
 
 
-def _season_keyboard(seasons: list[int], *, has_specials: bool,
-                     has_all: bool) -> InlineKeyboardMarkup:
+def _format_season_ranges(seasons: list[int] | set[int]) -> str:
+    """[1,2,3,5] -> 'S01-S03, S05' — used for the have/missing context clause."""
+    ordered = sorted(set(seasons))
+    if not ordered:
+        return ""
+    ranges: list[tuple[int, int]] = []
+    start = prev = ordered[0]
+    for s in ordered[1:]:
+        if s == prev + 1:
+            prev = s
+            continue
+        ranges.append((start, prev))
+        start = prev = s
+    ranges.append((start, prev))
+    return ", ".join(
+        f"S{a:02d}" if a == b else f"S{a:02d}-S{b:02d}" for a, b in ranges)
+
+
+def _friendly_date(iso: str | None) -> str:
+    """'2026-08-02' -> 'Aug 2'. Empty/unparseable input -> ''."""
+    if not iso:
+        return ""
+    try:
+        from datetime import date as _date
+        y, m, d = (int(x) for x in str(iso)[:10].split("-"))
+        return f"{_date(y, m, d).strftime('%b')} {d}"
+    except Exception:
+        return ""
+
+
+def _tv_status(match: MediaResult) -> tuple[str, str]:
+    """(status_label, next_air_display) for a TV match, best-effort.
+
+    Never raises — a metadata hiccup must not block the season picker. Only
+    fetches next-air for TMDB-sourced shows (the only source with a reliable
+    next_episode_to_air field); TVDB-sourced shows still get a status label,
+    just without a specific next-episode date.
+    """
+    try:
+        source = getattr(match, "source", None)
+        ext = str(getattr(match, "external_id", "") or "")
+        if not ext:
+            return "", ""
+        raw = ""
+        next_air = ""
+        if source == "tmdb":
+            raw = get_tmdb_tv_status(ext)
+            status_label = _STATUS_LABELS.get(raw, "")
+            if status_label == "airing":
+                nxt = get_tmdb_next_air(ext)
+                if nxt is not None:
+                    next_air = _friendly_date(nxt.air_date)
+        elif source == "tvdb":
+            raw = get_tvdb_series_status(ext)
+            status_label = _STATUS_LABELS.get(raw, "")
+        else:
+            status_label = ""
+        return status_label, next_air
+    except Exception:
+        logger.debug("TV status/airing fetch failed for %r", getattr(match, "title", "?"),
+                    exc_info=True)
+        return "", ""
+
+
+def _owned_seasons(match: MediaResult) -> set[int]:
+    """Regular seasons already on disk for this show's tracked-show row, or
+    an empty set when untracked or on any lookup failure."""
+    try:
+        source = getattr(match, "source", None)
+        ext = str(getattr(match, "external_id", "") or "")
+        if not (source and ext):
+            return set()
+        show = shows_store.get_show_by_identity(source, ext)
+        if show is None:
+            return set()
+        return shows_store.have_seasons(show.show_id)
+    except Exception:
+        logger.debug("Owned-season lookup failed for %r", getattr(match, "title", "?"),
+                    exc_info=True)
+        return set()
+
+
+def _season_context_line(*, total: int | None, status_label: str, next_air: str,
+                         have: list[int], missing: list[int]) -> str:
+    """One context line: total seasons + airing status always when known,
+    plus whichever of have/missing is the shorter list to state."""
+    parts: list[str] = []
+    if total is not None and total > 0:
+        parts.append(f"{total} season{'s' if total != 1 else ''}")
+    if status_label:
+        if status_label == "airing" and next_air:
+            parts.append(f"airing, next episode {next_air}")
+        else:
+            parts.append(status_label)
+    line = ", ".join(parts)
+
+    have_missing = ""
+    if have and missing:
+        if len(have) <= len(missing):
+            have_missing = f"You have {_format_season_ranges(have)}."
+        else:
+            have_missing = f"Missing {_format_season_ranges(missing)}."
+    elif have and not missing:
+        have_missing = f"You have all of it ({_format_season_ranges(have)})."
+
+    if line and have_missing:
+        line = f"{line}. {have_missing}"
+    elif have_missing:
+        line = have_missing
+    elif line:
+        line = f"{line}."
+    if line:
+        line = line[0].upper() + line[1:]
+    return line
+
+
+def _season_keyboard(regular: list[int], have: list[int], *, show_grab_all: bool,
+                     has_specials: bool, airing: bool) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
-    if has_all:
+    have_set = set(have)
+    if show_grab_all:
         rows.append([InlineKeyboardButton(
-            "📚 All currently available", callback_data="req_season_all")])
+            "📥 Grab everything missing", callback_data="req_season_all")])
     btn_row: list[InlineKeyboardButton] = []
-    for s in seasons:
-        btn_row.append(InlineKeyboardButton(
-            f"S{s:02d}", callback_data=f"req_season_pick_{s}"))
+    for s in regular:
+        if s in have_set:
+            # Owned — shown as a marked, non-actionable label, never omitted.
+            btn_row.append(InlineKeyboardButton(
+                f"✅ S{s:02d}", callback_data=f"req_season_owned_{s}"))
+        else:
+            btn_row.append(InlineKeyboardButton(
+                f"S{s:02d}", callback_data=f"req_season_pick_{s}"))
         if len(btn_row) == _SEASON_BUTTONS_PER_ROW:
             rows.append(btn_row)
             btn_row = []
@@ -673,10 +857,22 @@ def _season_keyboard(seasons: list[int], *, has_specials: bool,
     if has_specials:
         rows.append([InlineKeyboardButton(
             "🎞️ S00 Specials", callback_data="req_season_specials")])
+    if airing:
+        rows.append([InlineKeyboardButton(
+            "🔔 Keep it updated", callback_data="req_season_keep_updated")])
     rows.append([InlineKeyboardButton(
         "⏭️ Skip this show", callback_data="req_season_skip")])
     rows.append([InlineKeyboardButton("❌ Cancel", callback_data="req_cancel")])
     return InlineKeyboardMarkup(rows)
+
+
+def _all_owned_keyboard() -> InlineKeyboardMarkup:
+    """Nothing missing — only offer to follow new seasons, plus skip/cancel."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔔 Keep it updated", callback_data="req_season_keep_updated")],
+        [InlineKeyboardButton("⏭️ Skip this show", callback_data="req_season_skip")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="req_cancel")],
+    ])
 
 
 async def _prompt_next_season(update: Update,
@@ -706,30 +902,62 @@ async def _prompt_next_season(update: Update,
 
         context.user_data[_UD_SEASON_CURRENT] = idx
         loop = asyncio.get_running_loop()
-        seasons_data = await loop.run_in_executor(
-            None,
-            lambda m=match: get_show_seasons(m.source, m.external_id))
+        seasons_data = await _safe_fetch(
+            loop, lambda m=match: get_show_seasons(m.source, m.external_id),
+            ShowSeasons(resolved=False))
 
         regular = list(seasons_data.regular_seasons)
-        has_all = bool(seasons_data.resolved and regular)
+        show_grab_all = bool(seasons_data.resolved and regular)
         if seasons_data.resolved and not regular:
             regular = [1]  # resolved but nothing aired yet — offer S01
         if not seasons_data.resolved:
             regular = list(range(1, 11))  # provider unavailable — manual range
+
+        # Status/airing and owned-seasons are independent, best-effort fetches
+        # — either failing must never block the picker (Task F).
+        status_label, next_air = await _safe_fetch(
+            loop, lambda m=match: _tv_status(m), ("", ""))
+        if seasons_data.resolved:
+            have_raw = await _safe_fetch(loop, lambda m=match: _owned_seasons(m), set())
+            have = sorted(s for s in have_raw if s in regular)
+        else:
+            have = []
+        missing = sorted(set(regular) - set(have))
+
         context.user_data[_UD_SEASON_DATA] = {
             "regular": regular,
+            "missing": missing,
+            "have": have,
             "specials": seasons_data.has_specials,
             "resolved": seasons_data.resolved,
         }
+
         note = ("" if seasons_data.resolved else
                 "\n<i>(couldn't fetch the season list — pick a season number "
                 "or type one, e.g. <code>3</code>)</i>")
+
+        if seasons_data.resolved and regular and not missing:
+            # Fully owned — nothing to grab, only the follow-new option.
+            await _reply_html(
+                update,
+                f"📺 <b>{match.title}</b>: you already have all of it "
+                f"({_format_season_ranges(regular)}).",
+                _all_owned_keyboard())
+            return SELECTING_SEASONS
+
+        context_line = _season_context_line(
+            total=(len(regular) if seasons_data.resolved else None),
+            status_label=status_label, next_air=next_air,
+            have=have, missing=missing)
+        header = f"📺 <b>{match.title}</b>"
+        if context_line:
+            header += f": {context_line}"
         keyboard = _season_keyboard(
-            regular, has_specials=seasons_data.has_specials, has_all=has_all)
+            regular, have, show_grab_all=show_grab_all,
+            has_specials=seasons_data.has_specials, airing=(status_label == "airing"))
         await _reply_html(
             update,
-            f"📺 <b>{match.title}</b> — which season(s) would you like?"
-            f"\nTap <b>All currently available</b> or a single season.{note}",
+            f"{header}\nTap <b>Grab everything missing</b> or a single season.{note}",
             keyboard)
         return SELECTING_SEASONS
 
@@ -743,9 +971,27 @@ def _record_season_added(context: ContextTypes.DEFAULT_TYPE, summary: str) -> No
     context.user_data[_UD_SEASON_ADDED] = added
 
 
+def _record_already_have(context: ContextTypes.DEFAULT_TYPE, summary: str) -> None:
+    """Record an item the dedupe path reused instead of inserting — shown to
+    the user as a separate "already have" bucket, never folded into "added"
+    (Task F item 1: a dedupe hit is not a new request)."""
+    assert context.user_data is not None
+    already_have: list[str] = context.user_data.get(_UD_SEASON_ALREADY_HAVE, [])
+    already_have.append(summary)
+    context.user_data[_UD_SEASON_ALREADY_HAVE] = already_have
+
+
 async def _apply_season_choice(update: Update, context: ContextTypes.DEFAULT_TYPE,
                                *, seasons: list[int], label: str) -> None:
-    """Add the chosen season rows for the current TV item."""
+    """Add the chosen season rows for the current TV item.
+
+    Some of the requested seasons may already be owned — the season-picker's
+    own escape hatch (typing/tapping a specific season number) can reach a
+    season that's marked owned, and "Grab everything missing" can still
+    dedupe-hit if ownership changed since the prompt was built. Those seasons
+    are reported honestly as "already have", never claimed as added
+    (Task F item 1).
+    """
     assert context.user_data is not None
     results: list[LookupResult] = context.user_data.get(_UD_RESULTS, [])
     idx: int = context.user_data.get(_UD_SEASON_CURRENT, -1)
@@ -753,6 +999,8 @@ async def _apply_season_choice(update: Update, context: ContextTypes.DEFAULT_TYP
     lr = results[idx]
     match = lr.best_match
     if match is None:  # guarded upstream in _prompt_next_season; defensive
+        return
+    if not seasons:
         return
     candidate_titles = [m.title for m in lr.external_matches]
     display = lr.request.display()
@@ -764,27 +1012,116 @@ async def _apply_season_choice(update: Update, context: ContextTypes.DEFAULT_TYP
             display, requester, match=match, seasons=seasons,
             candidate_titles=candidate_titles),
     )
-    tag = "" if outcome.status != "needs_identity" else " (needs identity)"
-    _record_season_added(context, f"{match.title} — {label}{tag}")
+    reused_ids = set(outcome.reused_ids)
+    new_ids = [i for i in outcome.request_ids if i not in reused_ids]
+    if new_ids:
+        tag = "" if outcome.status != "needs_identity" else " (needs identity)"
+        _record_season_added(context, f"{match.title}: {label}{tag}")
+    if reused_ids:
+        reused_seasons = await loop.run_in_executor(
+            None, lambda: _seasons_for_ids(reused_ids))
+        season_txt = _format_season_ranges(reused_seasons) if reused_seasons else "that season"
+        _record_already_have(
+            context, f"{match.title} {season_txt} is already in your library.")
+
+
+def _seasons_for_ids(request_ids: set[int]) -> list[int]:
+    """Season numbers for a set of request ids — best-effort, for the
+    'already have' message. Never raises."""
+    seasons: list[int] = []
+    for rid in request_ids:
+        try:
+            row = get_request(rid)
+        except Exception:
+            row = None
+        if row is not None and row.season is not None:
+            seasons.append(row.season)
+    return seasons
+
+
+def _ensure_tracked_show(match: MediaResult, media_type: str) -> int | None:
+    """Upsert (idempotent) the tracked_shows row for this identity and return
+    its show_id, or None on failure. Used by 'Keep it updated' for both TV
+    and anime/xanime — matches what _maybe_track_show does for a TV
+    confirmation, just callable ahead of any season row being added."""
+    try:
+        source = getattr(match, "source", None)
+        ext = str(getattr(match, "external_id", "") or "")
+        if not (source and ext):
+            return None
+        return shows_store.upsert_show(
+            title=getattr(match, "title", "") or "unknown",
+            media_type=media_type, source=source, external_id=ext,
+            external_url=getattr(match, "external_url", None) or None,
+            year=getattr(match, "year", None))
+    except Exception:
+        logger.debug("Show tracking failed for %r", getattr(match, "title", "?"), exc_info=True)
+        return None
+
+
+async def _apply_keep_updated(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """'Keep it updated' for the current TV item: track the show (if not
+    already) and turn on auto_grab so newly-aired seasons get picked up
+    automatically. Adds no request rows of its own."""
+    assert context.user_data is not None
+    results: list[LookupResult] = context.user_data.get(_UD_RESULTS, [])
+    idx: int = context.user_data.get(_UD_SEASON_CURRENT, -1)
+    if not (0 <= idx < len(results)):
+        return
+    match = results[idx].best_match
+    if match is None:
+        return
+    loop = asyncio.get_running_loop()
+    show_id = await loop.run_in_executor(None, lambda: _ensure_tracked_show(match, "tv"))
+    if show_id is None:
+        _record_season_added(
+            context, f"{match.title}: couldn't set up auto-follow, try again later.")
+        return
+    await loop.run_in_executor(None, lambda: shows_store.set_show_auto_grab(show_id, True))
+    _record_season_added(
+        context,
+        f"{match.title}: keeping it updated. New seasons will be grabbed "
+        "automatically as they air.")
 
 
 async def handle_season_selection(update: Update,
                                   context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Callback handler for the season keyboard."""
+    """Callback handler for the season keyboard and the anime add/keep-updated
+    keyboard (both live in the SELECTING_SEASONS state)."""
     query = update.callback_query
     if query is None:
         return SELECTING_SEASONS
-    await query.answer()
     assert context.user_data is not None
     data = query.data or ""
+
+    if data.startswith("req_season_owned_"):
+        # Tapping a marked/owned season is a no-op — nothing to grab there.
+        await query.answer("You already have that season.")
+        return SELECTING_SEASONS
+
+    await query.answer()
+    media_type: str = context.user_data.get(_UD_MEDIA_TYPE, "tv")
+
+    if media_type in ("anime", "xanime"):
+        if data == "req_season_anime_add":
+            await _apply_anime_add(update, context)
+        elif data == "req_season_anime_keep_updated":
+            await _apply_anime_keep_updated(update, context)
+        elif data == "req_season_skip":
+            pass
+        else:
+            return SELECTING_SEASONS
+        return await _prompt_next_anime(update, context)
+
     season_data: dict = context.user_data.get(_UD_SEASON_DATA, {})
     regular: list[int] = list(season_data.get("regular", []))
+    missing: list[int] = list(season_data.get("missing", regular))
 
     if data == "req_season_skip":
         pass  # add nothing for this item
     elif data == "req_season_all":
         await _apply_season_choice(
-            update, context, seasons=regular, label="all currently available")
+            update, context, seasons=(missing or regular), label="everything missing")
     elif data == "req_season_specials":
         await _apply_season_choice(update, context, seasons=[0], label="Specials")
     elif data.startswith("req_season_pick_"):
@@ -794,6 +1131,8 @@ async def handle_season_selection(update: Update,
             return SELECTING_SEASONS
         await _apply_season_choice(
             update, context, seasons=[season], label=f"S{season:02d}")
+    elif data == "req_season_keep_updated":
+        await _apply_keep_updated(update, context)
     else:
         return SELECTING_SEASONS
 
@@ -802,14 +1141,32 @@ async def handle_season_selection(update: Update,
 
 async def handle_season_text(update: Update,
                              context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Text fallback in SELECTING_SEASONS: 'all', a season number, 'specials',
-    'skip'. Lets the picker work even when the provider list couldn't load."""
+    """Text fallback in SELECTING_SEASONS: 'all'/'missing', a season number,
+    'specials', 'keep updated', 'skip' for TV; 'add'/'keep updated'/'skip'
+    for anime/xanime. Lets the picker work even when the provider list
+    couldn't load, or the user prefers typing."""
     if update.message is None or update.message.text is None:
         return SELECTING_SEASONS
     assert context.user_data is not None
     text = update.message.text.strip().lower()
+    media_type: str = context.user_data.get(_UD_MEDIA_TYPE, "tv")
+
+    if media_type in ("anime", "xanime"):
+        if text in {"skip", "next"}:
+            return await _prompt_next_anime(update, context)
+        if text in {"add", "yes", "grab", "missing", "queue"}:
+            await _apply_anime_add(update, context)
+            return await _prompt_next_anime(update, context)
+        if text in {"keep", "keep updated", "keep it updated", "follow", "update"}:
+            await _apply_anime_keep_updated(update, context)
+            return await _prompt_next_anime(update, context)
+        await update.message.reply_text(
+            "Type 'add' to queue it, 'keep updated' to follow new episodes, or 'skip'.")
+        return SELECTING_SEASONS
+
     season_data: dict = context.user_data.get(_UD_SEASON_DATA, {})
     regular: list[int] = list(season_data.get("regular", []))
+    missing: list[int] = list(season_data.get("missing", regular))
 
     if text in {"skip", "next"}:
         return await _prompt_next_season(update, context)
@@ -817,8 +1174,15 @@ async def handle_season_text(update: Update,
         await _apply_season_choice(
             update, context, seasons=regular, label="all currently available")
         return await _prompt_next_season(update, context)
+    if text == "missing":
+        await _apply_season_choice(
+            update, context, seasons=(missing or regular), label="everything missing")
+        return await _prompt_next_season(update, context)
     if text in {"specials", "s0", "s00", "0"}:
         await _apply_season_choice(update, context, seasons=[0], label="Specials")
+        return await _prompt_next_season(update, context)
+    if text in {"keep updated", "keep it updated", "follow"}:
+        await _apply_keep_updated(update, context)
         return await _prompt_next_season(update, context)
     m = re.search(r"\d+", text)
     if m:
@@ -828,22 +1192,217 @@ async def handle_season_text(update: Update,
         return await _prompt_next_season(update, context)
 
     await update.message.reply_text(
-        "Type a season number (e.g. 3), 'all', 'specials', or 'skip'.")
+        "Type a season number (e.g. 3), 'all', 'missing', 'specials', "
+        "'keep updated', or 'skip'.")
     return SELECTING_SEASONS
+
+
+# ---------------------------------------------------------------------------
+# Anime/xAnime add-or-follow prompt (Task F item 4) — no season grid: a
+# Jikan/AniList/AniDB entry is one cour, not a season list, so this degrades
+# to the simpler prompt the per-provider metadata can actually support.
+# ---------------------------------------------------------------------------
+
+def _anime_status(match: MediaResult, *, explicit: bool) -> tuple[str, str]:
+    """(status_label, next_air_display) for an anime/xanime match, best-effort.
+
+    AniList (by title) is the primary source; Jikan's own status field is a
+    fallback for MAL-identified entries when AniList has nothing. Never
+    raises — a metadata hiccup must not block the picker.
+    """
+    try:
+        title = getattr(match, "title", "") or ""
+        if not title:
+            return "", ""
+        nxt, raw_status = get_anime_airing(title, explicit=explicit)
+        status_label = raw_status.lower() if raw_status else ""
+        next_air = _friendly_date(nxt.air_date) if nxt is not None else ""
+        if not status_label and getattr(match, "source", None) == "jikan":
+            raw = get_jikan_status(str(getattr(match, "external_id", "") or ""))
+            status_label = _JIKAN_STATUS_LABELS.get(raw, "")
+        return status_label, next_air
+    except Exception:
+        logger.debug("Anime status fetch failed for %r", getattr(match, "title", "?"),
+                    exc_info=True)
+        return "", ""
+
+
+def _anime_owned_counts(match: MediaResult) -> tuple[int, int]:
+    """(have_count, episode_count) from the tracked show, or (0, 0) when
+    untracked or on any lookup failure."""
+    try:
+        source = getattr(match, "source", None)
+        ext = str(getattr(match, "external_id", "") or "")
+        if not (source and ext):
+            return 0, 0
+        show = shows_store.get_show_by_identity(source, ext)
+        if show is None:
+            return 0, 0
+        return show.have_count, show.episode_count
+    except Exception:
+        logger.debug("Anime owned-count lookup failed for %r", getattr(match, "title", "?"),
+                    exc_info=True)
+        return 0, 0
+
+
+def _anime_context_line(status_label: str, next_air: str, have: int, total: int) -> str:
+    parts: list[str] = []
+    if status_label:
+        if status_label == "airing" and next_air:
+            parts.append(f"airing, next episode {next_air}")
+        else:
+            parts.append(status_label)
+    line = ", ".join(parts)
+    if total > 0:
+        owned = (f"You have {have} of {total} episodes." if have
+                else f"You don't have any of the {total} episodes yet.")
+        line = f"{line}. {owned}" if line else owned
+    elif line:
+        line = f"{line}."
+    if line:
+        line = line[0].upper() + line[1:]
+    return line
+
+
+def _anime_keyboard(*, airing: bool) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton("➕ Add to queue", callback_data="req_season_anime_add")]]
+    if airing:
+        rows.append([InlineKeyboardButton(
+            "🔔 Keep it updated", callback_data="req_season_anime_keep_updated")])
+    rows.append([InlineKeyboardButton("⏭️ Skip this title", callback_data="req_season_skip")])
+    rows.append([InlineKeyboardButton("❌ Cancel", callback_data="req_cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _prompt_next_anime(update: Update,
+                             context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Show the add/keep-updated prompt for the next queued anime/xanime
+    item, or finish. Mirrors _prompt_next_season's queue-draining shape."""
+    assert context.user_data is not None
+    queue: list[int] = context.user_data.get(_UD_SEASON_QUEUE, [])
+    results: list[LookupResult] = context.user_data.get(_UD_RESULTS, [])
+    media_type: str = context.user_data.get(_UD_MEDIA_TYPE, "anime")
+    requester = _requester_name(update)
+
+    while queue:
+        idx = queue[0]
+        queue = queue[1:]
+        context.user_data[_UD_SEASON_QUEUE] = queue
+        lr = results[idx]
+        match = lr.best_match
+        if match is None or not (match.source and str(match.external_id or "").strip()):
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None,
+                lambda d=lr.request.display(): request_intake.add_needs_identity(
+                    d, requester, media_type=media_type))
+            _record_season_added(context, f"{lr.request.display()} (needs identity)")
+            continue
+
+        context.user_data[_UD_SEASON_CURRENT] = idx
+        loop = asyncio.get_running_loop()
+        status_label, next_air = await _safe_fetch(
+            loop, lambda m=match: _anime_status(m, explicit=(media_type == "xanime")),
+            ("", ""))
+        have, total = await _safe_fetch(
+            loop, lambda m=match: _anime_owned_counts(m), (0, 0))
+
+        context_line = _anime_context_line(status_label, next_air, have, total)
+        emoji = "🔞" if media_type == "xanime" else "🍜"
+        header = f"{emoji} <b>{match.title}</b>"
+        if context_line:
+            header += f": {context_line}"
+        keyboard = _anime_keyboard(airing=(status_label == "airing"))
+        await _reply_html(update, header, keyboard)
+        return SELECTING_SEASONS
+
+    return await _finish_season_flow(update, context)
+
+
+async def _apply_anime_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Add the current anime/xanime item to the queue (its full identity, no
+    season split, matches how anime rows have always been added). Reports
+    honestly when the item was already in the queue/library instead of
+    claiming it was added (Task F item 1)."""
+    assert context.user_data is not None
+    results: list[LookupResult] = context.user_data.get(_UD_RESULTS, [])
+    idx: int = context.user_data.get(_UD_SEASON_CURRENT, -1)
+    media_type: str = context.user_data.get(_UD_MEDIA_TYPE, "anime")
+    requester = _requester_name(update)
+    if not (0 <= idx < len(results)):
+        return
+    lr = results[idx]
+    match = lr.best_match
+    if match is None:
+        return
+    candidate_titles = [m.title for m in lr.external_matches]
+    display = lr.request.display()
+    loop = asyncio.get_running_loop()
+    _row, reused = await loop.run_in_executor(
+        None,
+        lambda: request_intake.add_matched_request_reporting(
+            display, requester, media_type=media_type, match=match,
+            candidate_titles=candidate_titles),
+    )
+    if reused:
+        _record_already_have(context, f"{display} is already in your library.")
+    else:
+        _record_season_added(context, display)
+
+
+async def _apply_anime_keep_updated(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """'Keep it updated' for the current anime/xanime item: track the show
+    and turn on auto_grab. Adds no request row of its own."""
+    assert context.user_data is not None
+    results: list[LookupResult] = context.user_data.get(_UD_RESULTS, [])
+    idx: int = context.user_data.get(_UD_SEASON_CURRENT, -1)
+    media_type: str = context.user_data.get(_UD_MEDIA_TYPE, "anime")
+    if not (0 <= idx < len(results)):
+        return
+    match = results[idx].best_match
+    if match is None:
+        return
+    loop = asyncio.get_running_loop()
+    show_id = await loop.run_in_executor(
+        None, lambda: _ensure_tracked_show(match, media_type))
+    if show_id is None:
+        _record_season_added(
+            context, f"{match.title}: couldn't set up auto-follow, try again later.")
+        return
+    await loop.run_in_executor(None, lambda: shows_store.set_show_auto_grab(show_id, True))
+    _record_season_added(
+        context,
+        f"{match.title}: keeping it updated. New episodes will be grabbed "
+        "automatically as they air.")
 
 
 async def _finish_season_flow(update: Update,
                               context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Wrap up the season/anime picker: report what was actually queued and,
+    separately, what was skipped because it's already owned (Task F items 1
+    and 3, plain counted wording instead of a vague 'updated' header)."""
     assert context.user_data is not None
     added: list[str] = context.user_data.get(_UD_SEASON_ADDED, [])
+    already_have: list[str] = context.user_data.get(_UD_SEASON_ALREADY_HAVE, [])
+    media_type: str = context.user_data.get(_UD_MEDIA_TYPE, "tv")
+    unit = "season" if media_type == "tv" else "item"
+
+    reply_parts: list[str] = []
     if added:
         bullet_list = "\n".join(f"• {t}" for t in added)
-        await _reply_html(
-            update,
-            f"✅ <b>Added {len(added)} TV request(s) to the queue:</b>\n{bullet_list}"
-            f"\n\nUse the <b>📝 Requests</b> button anytime to see the full queue.")
+        noun = unit + ("s" if len(added) != 1 else "")
+        reply_parts.append(f"✅ <b>Queued {len(added)} {noun}:</b>\n{bullet_list}")
+    if already_have:
+        bullet_list = "\n".join(f"• {t}" for t in already_have)
+        noun = unit + ("s" if len(already_have) != 1 else "")
+        reply_parts.append(
+            f"📚 <b>Already had {len(already_have)} {noun}, nothing new queued:</b>\n{bullet_list}")
+
+    if reply_parts:
+        reply_parts.append("Use the <b>📝 Requests</b> button anytime to see the full queue.")
+        await _reply_html(update, "\n\n".join(reply_parts))
     else:
-        await _reply_html(update, "Nothing added — no seasons were selected.")
+        await _reply_html(update, "Nothing added. No items were selected.")
     _clear_flow_state(context)
     return ConversationHandler.END
 

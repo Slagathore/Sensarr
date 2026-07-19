@@ -32,6 +32,8 @@ class ReindexResult:
     indexed_files: int
     scanned_roots: list[str]
     missing_roots: list[str]
+    preserved_files: int = 0    # rows kept because their root is unavailable
+    aborted_reason: str = ""    # non-empty = index left untouched, here's why
 
 
 @dataclass(frozen=True)
@@ -219,7 +221,7 @@ def _diff_and_log_events(conn, old: dict[str, tuple[str, int]],
             (p, f"size {_format_bytes(old[p][1])} → {_format_bytes(new[p][1])}"))
 
 
-def rebuild_library_index() -> ReindexResult:
+def rebuild_library_index(force: bool = False) -> ReindexResult:
     initialize_library_index_db()
     valid_paths, missing_paths = _configured_library_paths()
     extensions = set(config.LIBRARY_INDEX_EXTENSIONS)
@@ -229,6 +231,16 @@ def rebuild_library_index() -> ReindexResult:
             row[0]: (row[1], int(row[2])) for row in conn.execute(
                 "SELECT path, name, size_bytes FROM library_files")
         }
+        # Rows under a configured-but-unavailable root (drive unplugged, NAS
+        # offline) are preserved verbatim instead of being wiped by the walk
+        # below, which can't see them.
+        preserved_rows: list[tuple] = []
+        if missing_paths:
+            marks = ",".join("?" for _ in missing_paths)
+            preserved_rows = conn.execute(
+                "SELECT path, name, root_path, search_name, size_bytes,"
+                f" modified_at FROM library_files WHERE root_path IN ({marks})",
+                missing_paths).fetchall()
         conn.execute("DELETE FROM library_files")
 
         batch: list[tuple[str, str, str, str, int, float]] = []
@@ -280,10 +292,38 @@ def rebuild_library_index() -> ReindexResult:
                 batch,
             )
 
+        if preserved_rows:
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO library_files
+                (path, name, root_path, search_name, size_bytes, modified_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                preserved_rows,
+            )
+
         new_snapshot = {
             row[0]: (row[1], int(row[2])) for row in conn.execute(
                 "SELECT path, name, size_bytes FROM library_files")
         }
+        # Collapse guard: a rebuild that would drop >90% of a substantial
+        # index almost always means the media roots weren't really there
+        # (unmounted drive, wrong config, stray test run), not that the
+        # library shrank. Refuse and keep the existing index; force=True
+        # is the deliberate override.
+        if (not force and len(old_snapshot) >= 100
+                and len(new_snapshot) < len(old_snapshot) // 10):
+            conn.rollback()
+            return ReindexResult(
+                indexed_files=len(old_snapshot),
+                scanned_roots=[str(path) for path in valid_paths],
+                missing_roots=missing_paths,
+                aborted_reason=(
+                    f"refused: rescan found {len(new_snapshot)} file(s) but the"
+                    f" index holds {len(old_snapshot)}. Check that the media"
+                    " drives are connected, or rerun with force to accept the"
+                    " shrink."),
+            )
         if old_snapshot:  # first-ever build isn't 35k "added" rows of noise
             _diff_and_log_events(conn, old_snapshot, new_snapshot)
         conn.commit()
@@ -292,6 +332,7 @@ def rebuild_library_index() -> ReindexResult:
         indexed_files=indexed_count,
         scanned_roots=[str(path) for path in valid_paths],
         missing_roots=missing_paths,
+        preserved_files=len(preserved_rows),
     )
 
 
@@ -318,14 +359,16 @@ class RefreshResult:
     removed: int
     updated: int
     total: int
+    aborted_reason: str = ""    # non-empty = index left untouched, here's why
 
 
-def refresh_library_index() -> RefreshResult:
+def refresh_library_index(force: bool = False) -> RefreshResult:
     """Delta pass: reconcile the persisted index against the filesystem
     without a full rebuild — adds new files, drops vanished ones, updates
     changed sizes. Much faster than rebuild on large libraries."""
     initialize_library_index_db()
-    valid_paths, _missing = _configured_library_paths()
+    valid_paths, missing_paths = _configured_library_paths()
+    missing_set = set(missing_paths)
     extensions = set(config.LIBRARY_INDEX_EXTENSIONS)
 
     on_disk: dict[str, tuple[str, str, int, float]] = {}
@@ -345,15 +388,35 @@ def refresh_library_index() -> RefreshResult:
     with _DB_LOCK, db.connect(_db_path()) as conn:
         indexed = {row[0]: (int(row[1]), float(row[2])) for row in
                    conn.execute("SELECT path, size_bytes, modified_at FROM library_files")}
+        roots_by_path = {row[0]: row[1] for row in
+                         conn.execute("SELECT path, root_path FROM library_files")}
         old_snapshot = {
             row[0]: (row[1], int(row[2])) for row in conn.execute(
                 "SELECT path, name, size_bytes FROM library_files")
         }
 
-        removed = [p for p in indexed if p not in on_disk]
+        # Files under an unavailable root aren't "removed", they're just
+        # unreachable right now (drive unplugged, NAS offline). Keep them.
+        removed = [p for p in indexed
+                   if p not in on_disk and roots_by_path.get(p) not in missing_set]
         added = [p for p in on_disk if p not in indexed]
         updated = [p for p, (name, root, size, mtime) in on_disk.items()
                    if p in indexed and indexed[p] != (size, mtime)]
+
+        # Collapse guard: same rule as rebuild_library_index — a delta pass
+        # that would drop >90% of a substantial index means the roots weren't
+        # really scanned, not that the library vanished.
+        surviving = len(indexed) - len(removed) + len(added)
+        if (not force and len(indexed) >= 100
+                and surviving < len(indexed) // 10):
+            conn.rollback()
+            return RefreshResult(
+                added=0, removed=0, updated=0, total=len(indexed),
+                aborted_reason=(
+                    f"refused: rescan would leave {surviving} file(s) of"
+                    f" {len(indexed)} indexed. Check that the media drives are"
+                    " connected, or rerun with force to accept the shrink."),
+            )
 
         conn.executemany("DELETE FROM library_files WHERE path = ?",
                          [(p,) for p in removed])
@@ -366,13 +429,18 @@ def refresh_library_index() -> RefreshResult:
             [(p, on_disk[p][0], on_disk[p][1], on_disk[p][0].casefold(),
               on_disk[p][2], on_disk[p][3]) for p in added + updated],
         )
-        new_snapshot = {p: (v[0], v[2]) for p, v in on_disk.items()}
+        # Snapshot from the DB, not from on_disk, so files preserved under an
+        # unavailable root don't get logged as "removed".
+        new_snapshot = {
+            row[0]: (row[1], int(row[2])) for row in conn.execute(
+                "SELECT path, name, size_bytes FROM library_files")
+        }
         if old_snapshot:
             _diff_and_log_events(conn, old_snapshot, new_snapshot)
         conn.commit()
 
     return RefreshResult(added=len(added), removed=len(removed),
-                         updated=len(updated), total=len(on_disk))
+                         updated=len(updated), total=len(new_snapshot))
 
 
 def remove_from_index(paths: list[str]) -> None:
@@ -611,9 +679,15 @@ def _format_no_results_diagnostic(query: str) -> str:
 
 
 def format_reindex_result_message(result: ReindexResult) -> str:
+    if result.aborted_reason:
+        return f"Library reindex NOT applied. {result.aborted_reason}"
     lines = [
         f"Library reindex complete. Indexed {result.indexed_files} file(s).",
     ]
+    if result.preserved_files:
+        lines.append(
+            f"Kept {result.preserved_files} indexed file(s) whose drive/root"
+            " is currently unavailable.")
     if result.scanned_roots:
         lines.append("Scanned paths:")
         lines.extend(f"- {path}" for path in result.scanned_roots)

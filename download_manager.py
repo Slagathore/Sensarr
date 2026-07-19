@@ -356,6 +356,29 @@ def _auto_grab_query(req, *, season: int | None = None) -> str:
     return alias
 
 
+def _request_identity_key(req) -> str:
+    """Durable per-pass dedupe key for a request. Qualified rows key on the
+    provider identity + season (so two rows resolved to the same tmdb id collapse
+    but S01/S02 stay distinct); unqualified rows fall back to the normalised
+    title. Used by the grab gate so two duplicate open requests never both
+    grab in one pass."""
+    if getattr(req, "is_qualified", False):
+        return (f"{req.media_type}:{req.identity_source}:"
+                f"{req.external_id}:{req.season}")
+    import media_identity
+    title = getattr(req, "resolved_title", None) or getattr(req, "content", "")
+    return f"{req.media_type}:{media_identity.normalize_title(title)}"
+
+
+def _min_seeders_for(mode: str) -> int:
+    """The seeder floor a want should enforce. Every routine mode uses
+    config.MIN_SEEDERS; the zero-seeder race disables the gate (0) because
+    gambling on unseeded releases is its entire purpose."""
+    if mode == torrent_select.MODE_ZERO_SEEDER_RACE:
+        return 0
+    return config.MIN_SEEDERS
+
+
 class _AdoptResult:
     """Minimal TorrentResult stand-in for re-freezing a want from an existing
     download row during quarantine adoption (Task C item 8)."""
@@ -710,6 +733,14 @@ class DownloadManager:
         # and when a slow download was last rotated (sorts it to the back).
         self._progress_seen: dict[int, tuple[float, float]] = {}
         self._rotate_cooldown: dict[int, float] = {}
+        # Consecutive no-progress rotations per download; at DOWNLOAD_MAX_ROTATIONS
+        # the row is declared stalled ('error') instead of looping forever.
+        self._rotation_count: dict[int, int] = {}
+        # Transient live phase for the queue UI (fetching_metadata / no_peers),
+        # fed from the runner's own events; lost on restart by design.
+        self._phase: dict[int, str] = {}
+        # Downloads currently in a zero-seeder race, shown as 'probing'.
+        self._probing_ids: set[int] = set()
         # Task G: one derived SizePick per show PER PASS (the library sample is
         # re-read at the start of each auto-grab pass, not on every candidate).
         self._size_pick_cache: dict[int, size_match.SizePick] = {}
@@ -818,6 +849,13 @@ class DownloadManager:
             role = ("episode" if episode is not None
                     else "season_pack" if season is not None else "movie")
             downloads_store.link_request_download(request_id, download_id, role)
+            # The request now has a grab in flight — mark it so, so it drops out
+            # of the auto-grab 'open' pool and the UI shows it as grabbing rather
+            # than idle-open. Only advance from a grabbable state; never yank a
+            # request that is already placed/fulfilled/needs_attention.
+            if req is not None and req.status in (
+                    queue_store.STATUS_OPEN, queue_store.STATUS_DEFERRED):
+                queue_store.set_status(request_id, queue_store.STATUS_GRABBING)
 
         if config.QBITTORRENT_ENABLED:
             # qBittorrent has its own queue/active limits — hand over directly.
@@ -1034,39 +1072,100 @@ class DownloadManager:
         while True:
             time.sleep(60)
             try:
-                if config.QBITTORRENT_ENABLED:
-                    continue
-                rows = downloads_store.list_downloads(limit=300)
-                queued_waiting = any(r.status == "queued" for r in rows)
-                now = time.time()
-                for row in rows:
-                    if row.status != "downloading":
-                        self._progress_seen.pop(row.download_id, None)
-                        continue
-                    seen = self._progress_seen.get(row.download_id)
-                    if seen is None or seen[0] != row.progress:
-                        self._progress_seen[row.download_id] = (row.progress, now)
-                        continue
-                    stale_s = now - seen[1]
-                    window = config.DOWNLOAD_SLOW_ROTATE_MINUTES * 60
-                    if stale_s > (window if queued_waiting else window * 3):
-                        logger.info(
-                            "Download #%s made no progress for %.0f min — rotating "
-                            "it back to the queue.", row.download_id, stale_s / 60)
-                        with self._lock:
-                            proc = self._processes.get(row.download_id)
-                        if proc is not None and proc.poll() is None:
-                            proc.kill()
-                        downloads_store.set_status(row.download_id, "queued")
-                        downloads_store.add_history(
-                            row.download_id, "rotated", before=None,
-                            after=f"no progress for {stale_s / 60:.0f} min — requeued")
-                        self._rotate_cooldown[row.download_id] = now
-                        self._progress_seen.pop(row.download_id, None)
-                        self._notify(row.download_id)
-                self._maybe_start_next()
+                self._queue_monitor_pass()
             except Exception:
                 logger.exception("Download queue monitor pass failed.")
+
+    def _queue_monitor_pass(self) -> None:
+        """One monitor tick: find no-progress downloads and rotate them, or —
+        after DOWNLOAD_MAX_ROTATIONS — declare them stalled. Extracted from the
+        sleep loop so the stall/rotate decision is unit-testable."""
+        if config.QBITTORRENT_ENABLED:
+            return
+        rows = downloads_store.list_downloads(limit=300)
+        queued_waiting = any(r.status == "queued" for r in rows)
+        now = time.time()
+        for row in rows:
+            if row.status != "downloading":
+                self._progress_seen.pop(row.download_id, None)
+                self._rotation_count.pop(row.download_id, None)
+                continue
+            seen = self._progress_seen.get(row.download_id)
+            if seen is None or seen[0] != row.progress:
+                # Real progress since last look — reset the stall bookkeeping.
+                self._progress_seen[row.download_id] = (row.progress, now)
+                self._rotation_count.pop(row.download_id, None)
+                continue
+            stale_s = now - seen[1]
+            # Never rotate before the Node runner's own stall timeout could have
+            # fired: for a truly dead swarm the runner errors first (at
+            # TORRENT_STALL_TIMEOUT_SECONDS), and only a download the runner has
+            # NOT already killed reaches a monitor rotation.
+            window = max(config.DOWNLOAD_SLOW_ROTATE_MINUTES * 60,
+                         config.TORRENT_STALL_TIMEOUT_SECONDS + 60)
+            if stale_s > (window if queued_waiting else window * 3):
+                self._rotate_or_stall(row, stale_s, now)
+        self._maybe_start_next()
+
+    def _rotate_or_stall(self, row: downloads_store.DownloadRow,
+                         stale_s: float, now: float) -> None:
+        """A download made no progress for a full window. Requeue it, or — once
+        it has burned through DOWNLOAD_MAX_ROTATIONS — mark it 'error' with a
+        stalled reason. The 'error' status flows into downloads_store.set_status,
+        which records the failure and (workstream A) resolves the request so the
+        next auto-grab pass picks a DIFFERENT release instead of the dead one."""
+        count = self._rotation_count.get(row.download_id, 0) + 1
+        with self._lock:
+            proc = self._processes.get(row.download_id)
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+        if count >= config.DOWNLOAD_MAX_ROTATIONS:
+            reason = (f"stalled: no progress after {count} rotations "
+                      f"({stale_s / 60:.0f} min idle)")
+            logger.info("Download #%s %s — marking error.", row.download_id, reason)
+            downloads_store.set_status(
+                row.download_id, "error", error=reason, completed=True)
+            downloads_store.add_history(
+                row.download_id, "error", before=None, after=reason)
+            self._rotation_count.pop(row.download_id, None)
+            self._rotate_cooldown.pop(row.download_id, None)
+        else:
+            logger.info(
+                "Download #%s made no progress for %.0f min — rotating back to "
+                "the queue (rotation %d/%d).", row.download_id, stale_s / 60,
+                count, config.DOWNLOAD_MAX_ROTATIONS)
+            downloads_store.set_status(row.download_id, "queued")
+            downloads_store.add_history(
+                row.download_id, "rotated", before=None,
+                after=f"no progress for {stale_s / 60:.0f} min — "
+                      f"requeued (rotation {count})")
+            self._rotation_count[row.download_id] = count
+            self._rotate_cooldown[row.download_id] = now
+        self._progress_seen.pop(row.download_id, None)
+        self._phase.pop(row.download_id, None)
+        self._notify(row.download_id)
+
+    def _update_phase(self, download_id: int, progress: float, peers: int,
+                      metadata_seen: bool) -> None:
+        """Translate a runner progress event into the queue-UI phase: real
+        progress clears it, no metadata yet keeps 'fetching_metadata', and a
+        connected-but-peerless swarm shows 'no peers'."""
+        if progress > 0:
+            self._phase.pop(download_id, None)
+        elif not metadata_seen:
+            self._phase[download_id] = "fetching_metadata"
+        elif peers <= 0:
+            self._phase[download_id] = "no_peers"
+        else:
+            self._phase.pop(download_id, None)
+
+    def phase_for(self, download_id: int) -> str | None:
+        """The transient queue phase for a download, for the UI's honest status
+        label. A racing candidate reads 'probing'; otherwise the live
+        metadata/peers phase (or None when nothing special is happening)."""
+        if download_id in self._probing_ids:
+            return "probing"
+        return self._phase.get(download_id)
 
     def cancel(self, download_id: int) -> bool:
         with self._lock:
@@ -1468,7 +1567,10 @@ class DownloadManager:
         # and possible later adoption by a compatible request (item 8).
         downloads_store.tombstone_download(did, reason=f"quarantine:{reason_code}")
         if row.request_id is not None:
-            queue_store.set_status(row.request_id, queue_store.STATUS_OPEN)
+            # Reopen for a different release, or escalate to needs_attention once
+            # this request has burned through the attempt cap (deterministic
+            # lifecycle — never silently back to an unbounded open loop).
+            downloads_store.resolve_request_after_failed_grab(row.request_id)
         self._notify(did)
         return (f"quarantined (verify failed: {reason_code}) — blocked for "
                 f"{subject_key}, request reopened")
@@ -1734,7 +1836,8 @@ class DownloadManager:
         return SelectWant(
             identity=identity, size_pref_mb_min=pref, size_max_rate=max_rate,
             runtime_minutes=rt, fallback_minutes=default_minutes,
-            allow_cam=not config.BLOCK_CAMS, mode=mode)
+            allow_cam=not config.BLOCK_CAMS, mode=mode,
+            min_seeders=_min_seeders_for(mode))
 
     def _want_for_show_episode(self, show: shows_store.TrackedShow,
                                season: int | None, episode: int | None,
@@ -1756,7 +1859,8 @@ class DownloadManager:
         want = SelectWant(
             identity=identity, size_pref_mb_min=pref, size_max_rate=max_rate,
             runtime_minutes=minutes, fallback_minutes=default_minutes,
-            allow_cam=not config.BLOCK_CAMS, mode=mode)
+            allow_cam=not config.BLOCK_CAMS, mode=mode,
+            min_seeders=_min_seeders_for(mode))
         want, _meta = self._apply_size_override(want, show)
         return want
 
@@ -1872,7 +1976,16 @@ class DownloadManager:
             viable, want, failure_key=key, pool_stats=pool_stats)
         chosen = by_hash.get(decision.chosen_infohash) if decision.chosen else None
         if chosen is None:
-            downloads_store.record_selection_run(decision, request_id=request_id)
+            run_id = downloads_store.record_selection_run(
+                decision, request_id=request_id)
+            if self._dead_swarm(decision):
+                # Packs never race; record a deferral so the grab queue shows
+                # why it is held instead of hammering every pass.
+                downloads_store.check_grab_deferral(
+                    key, wait_hours=config.ZERO_SEEDER_DEFER_HOURS,
+                    reason="no seeded season pack available",
+                    candidate_stats=decision.verdict_histogram(),
+                    selection_run_id=run_id)
             return []
         survivors = [by_hash[s.infohash] for s in decision.scores
                      if s.infohash in by_hash]
@@ -2015,21 +2128,30 @@ class DownloadManager:
             viable, want, failure_key=key, pool_stats=pool_stats)
         chosen = by_hash.get(decision.chosen_infohash) if decision.chosen else None
         if chosen is None:
-            downloads_store.record_selection_run(decision, request_id=request_id)
+            run_id = downloads_store.record_selection_run(
+                decision, request_id=request_id)
+            if self._dead_swarm(decision):
+                # Every gate-clean release for this episode is unseeded — race it
+                # only when explicitly enabled, else defer/recheck.
+                return self._race_or_defer(
+                    key, viable, show.media_type, minutes=minutes,
+                    request_id=request_id,
+                    episode_context=(show.show_id, ep.season, ep.episode),
+                    run_id=run_id, candidate_stats=decision.verdict_histogram())
             return []
         survivors = [by_hash[s.infohash] for s in decision.scores
                      if s.infohash in by_hash]
         if chosen.seeders <= 0:
-            # The engine's TOP pick has no seeders. A guaranteed copy beats a
-            # gamble: if ANY gated survivor has seeders, grab the best-scored
-            # seeded one normally and skip the race entirely (Phase 3 verifier
-            # note). Only when EVERY survivor is 0-seed do we race.
+            # Reachable only when the seeder gate is disabled (MIN_SEEDERS=0): the
+            # engine's TOP pick has no seeders. A guaranteed copy beats a gamble,
+            # so grab the best-scored seeded survivor when one exists; otherwise
+            # race-or-defer.
             seeded = next((r for r in survivors if r.seeders > 0), None)
             if seeded is not None:
                 chosen = seeded
             else:
-                return self.start_zero_seeder_race(
-                    survivors, show.media_type, minutes=minutes,
+                return self._race_or_defer(
+                    key, survivors, show.media_type, minutes=minutes,
                     request_id=request_id,
                     episode_context=(show.show_id, ep.season, ep.episode))
         if not self._oversize_gate(survivors, show.media_type, key,
@@ -2076,8 +2198,17 @@ class DownloadManager:
                 [r.request_id for r in pending_identity])
 
         already = downloads_store.request_ids_with_downloads()
+        grabbed_identities: set[str] = set()
         for req in list_requests(status="open", limit=100):
             if req.request_id in already or req.found_in_library:
+                continue
+            # Grab-gate dedupe: if an identical identity was already handled in
+            # this pass, don't grab a second copy of the same thing.
+            ident_key = _request_identity_key(req)
+            if ident_key and ident_key in grabbed_identities:
+                logger.info(
+                    "Auto-grab: request #%s duplicates an identity already "
+                    "handled this pass — skipping.", req.request_id)
                 continue
             # An 'open' movie/tv/anime row must carry a provider-qualified
             # identity to be auto-grabbable. 'other' is exempt by design; an
@@ -2089,6 +2220,25 @@ class DownloadManager:
                     "identity — skipping (needs_identity).",
                     req.request_id, req.media_type)
                 continue
+            # At-grab-time library gate, independent of the daily found flag: if
+            # the exact identity is already on disk NOW, mark it found and skip.
+            # This is the backstop the stale daily flag can't provide.
+            try:
+                import maintenance
+                if maintenance.request_present_in_library(req):
+                    queue_store.update_library_status(req.request_id, found=True)
+                    logger.info(
+                        "Auto-grab: request #%s (%s) is already in the library "
+                        "at grab time — skipping.",
+                        req.request_id, req.media_type)
+                    continue
+            except Exception:
+                logger.exception(
+                    "At-grab library gate failed for request #%s", req.request_id)
+            # Mark this identity handled for the pass (before search): a duplicate
+            # open row later in the list is skipped even if this one grabs nothing.
+            if ident_key:
+                grabbed_identities.add(ident_key)
             # Query from the stored identity (search alias + canonical year for
             # movies), never raw user text or a native-script canonical title.
             query = _auto_grab_query(req)
@@ -2130,6 +2280,14 @@ class DownloadManager:
                         key, reason="last viable candidate blocked",
                         candidate_stats=decision.verdict_histogram(),
                         selection_run_id=run_id)
+                elif self._dead_swarm(decision):
+                    # Task D: the only gate-clean releases are unseeded. Race them
+                    # (if enabled) or defer/recheck — never grab a dead torrent.
+                    started.extend(self._race_or_defer(
+                        key, list(pool.results), media_type, minutes=minutes,
+                        request_id=req.request_id, request_title=query,
+                        run_id=run_id,
+                        candidate_stats=decision.verdict_histogram()))
                 logger.info("Request #%s (%s): no acceptable result this pass — "
                             "will retry on the next auto-grab cycle.",
                             req.request_id, query)
@@ -2137,16 +2295,16 @@ class DownloadManager:
             survivors = [by_hash[s.infohash] for s in decision.scores
                          if s.infohash in by_hash]
             if chosen.seeders <= 0:
-                # Prefer a seeded survivor over a 0-seed gamble; race only when
-                # every survivor is 0-seed (Phase 3 verifier note).
+                # Reachable only with the seeder gate disabled (MIN_SEEDERS=0):
+                # prefer a seeded survivor over a 0-seed gamble; race-or-defer
+                # only when every survivor is 0-seed.
                 seeded = next((r for r in survivors if r.seeders > 0), None)
                 if seeded is not None:
                     chosen = seeded
                 else:
-                    started.extend(self.start_zero_seeder_race(
-                        survivors, media_type, minutes=minutes,
-                        request_id=req.request_id, request_title=query,
-                    ))
+                    started.extend(self._race_or_defer(
+                        key, survivors, media_type, minutes=minutes,
+                        request_id=req.request_id, request_title=query))
                     continue
             if not self._oversize_gate(survivors, media_type, key, minutes=minutes):
                 downloads_store.record_selection_run(decision, request_id=req.request_id)
@@ -2241,6 +2399,47 @@ class DownloadManager:
     # Zero-seeder race — when nothing has seeders, try several at once
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _dead_swarm(decision) -> bool:
+        """True when nothing was chosen and at least one candidate was clean on
+        every axis EXCEPT seeders — a dead-swarm pool (defer/recheck or race),
+        as opposed to a wrong-identity pool (genuinely nothing to grab)."""
+        return (not decision.chosen and any(
+            v.reason_code == "insufficient_seeders" for v in decision.verdicts))
+
+    def _race_or_defer(self, key: str, results, media_type: str, *,
+                       minutes: float | None,
+                       request_id: int | None = None,
+                       request_title: str | None = None,
+                       episode_context: tuple[int, int, int] | None = None,
+                       run_id: int | None = None,
+                       candidate_stats: dict | None = None) -> list[int]:
+        """A pool whose only gate-clean releases are unseeded. Gamble on a
+        bounded zero-seeder race when it is explicitly enabled; otherwise write
+        a deferral and recheck later rather than grabbing dead torrents
+        (Task D items 1-2)."""
+        if config.TORRENT_ZERO_SEEDER_RACE:
+            return self.start_zero_seeder_race(
+                results, media_type, minutes=minutes, request_id=request_id,
+                request_title=request_title, episode_context=episode_context)
+        downloads_store.check_grab_deferral(
+            key, wait_hours=config.ZERO_SEEDER_DEFER_HOURS,
+            reason="no seeded release available",
+            candidate_stats=candidate_stats, selection_run_id=run_id)
+        # A request-level single grab is genuinely held: flip it to 'deferred' so
+        # the open scan skips it until reopen_expired_deferrals brings it back.
+        # Episode/pack keys are not request-status-driven, so they only record
+        # the row (matching the existing chosen-None behaviour there).
+        if (request_id is not None and episode_context is None
+                and key == f"req:{request_id}"):
+            req_now = get_request(request_id)
+            if req_now is not None and req_now.status in (
+                    queue_store.STATUS_OPEN, queue_store.STATUS_GRABBING):
+                queue_store.set_status(request_id, queue_store.STATUS_DEFERRED)
+        logger.info("%s: only unseeded candidates this pass — deferred "
+                    "(zero-seeder race disabled).", key)
+        return []
+
     def start_zero_seeder_race(
         self, results: list[TorrentResult], media_type: str, *,
         request_id: int | None = None, request_title: str | None = None,
@@ -2286,8 +2485,11 @@ class DownloadManager:
         # ONE shared selection_run_id across every race download (item 6.2); the
         # pre-race decision is persisted on handoff (Phase 3 verifier note).
         run_id = downloads_store.record_selection_run(decision, request_id=request_id)
+        # Bounded: at most ZERO_SEEDER_RACE_MAX_CANDIDATES run at once (was a
+        # hardcoded 5) — more just splits the trickle and stalls everything.
         picks = [by_hash[s.infohash] for s in decision.scores
-                 if s.infohash in by_hash][:5]
+                 if s.infohash in by_hash][
+                     :max(1, config.ZERO_SEEDER_RACE_MAX_CANDIDATES)]
         if not picks:
             logger.info("Zero-seeder race: no candidate survived the gates "
                         "(run #%s)", run_id)
@@ -2302,11 +2504,14 @@ class DownloadManager:
                             quality_label=self._quality_label_for(decision, r))
             downloads_store.link_download_to_run(did, run_id)
             ids.append(did)
-        logger.info("Zero-seeder race started (run #%s): %d candidate(s) %s",
-                    run_id, len(ids), ids)
+        # Show these as 'probing' in the queue UI until the race resolves.
+        self._probing_ids.update(ids)
+        window_s = max(1, int(config.ZERO_SEEDER_RACE_WINDOW_MINUTES)) * 60
+        logger.info("Zero-seeder race started (run #%s): %d candidate(s) %s, "
+                    "window %dm", run_id, len(ids), ids, window_s // 60)
         threading.Thread(
             target=self._race_monitor, args=(ids,),
-            kwargs={"request_title": request_title},
+            kwargs={"request_title": request_title, "duration_s": window_s},
             name="dl-zero-seeder-race", daemon=True).start()
         return ids
 
@@ -2320,7 +2525,8 @@ class DownloadManager:
             size_pref_mb_min=pref, size_max_rate=max_rate,
             runtime_minutes=minutes, fallback_minutes=default_minutes,
             allow_cam=not config.BLOCK_CAMS,
-            mode=torrent_select.MODE_ZERO_SEEDER_RACE)
+            mode=torrent_select.MODE_ZERO_SEEDER_RACE,
+            min_seeders=0)  # the race exists precisely to gamble on 0-seed
 
     def _staged_size(self, row: downloads_store.DownloadRow) -> int:
         """Total on-disk size of a download's staged media (race tie-break)."""
@@ -2357,37 +2563,41 @@ class DownloadManager:
         return after is not None and after.status == "moved"
 
     def _race_monitor(self, ids: list[int], *, request_title: str | None = None,
-                      duration_s: int = 3600, poll_s: int = 120) -> None:
+                      duration_s: int = 900, poll_s: int = 120) -> None:
         deadline = time.time() + duration_s
         remaining = list(ids)
+        try:
+            while time.time() < deadline and remaining:
+                time.sleep(poll_s)
+                rows = {d: downloads_store.get_download(d) for d in remaining}
+                finished = [(d, r) for d, r in rows.items()
+                            if r is not None and r.status == "downloaded"]
+                if finished:
+                    # Tie-break among simultaneously finished: size_bytes desc,
+                    # then infohash asc (the comment's real intent; item 6.6).
+                    finished.sort(key=lambda dr: (-self._staged_size(dr[1]),
+                                                  _magnet_hash(dr[1].magnet)))
+                    for did, _row in finished:
+                        if self._race_finish_winner(did):
+                            for other in remaining:
+                                if other != did:
+                                    self._cancel_race_loser(other)
+                            logger.info("Zero-seeder race won by download #%s", did)
+                            return
+                        # failed verify: already quarantined+blocked; drop it.
+                        remaining.remove(did)
+                remaining = [d for d in remaining
+                             if (r := downloads_store.get_download(d)) is not None
+                             and r.status in ("queued", "downloading", "downloaded")]
+                if not remaining:
+                    return
 
-        while time.time() < deadline and remaining:
-            time.sleep(poll_s)
-            rows = {d: downloads_store.get_download(d) for d in remaining}
-            finished = [(d, r) for d, r in rows.items()
-                        if r is not None and r.status == "downloaded"]
-            if finished:
-                # Tie-break among simultaneously finished: size_bytes desc, then
-                # infohash asc (the comment's real intent; item 6.6).
-                finished.sort(key=lambda dr: (-self._staged_size(dr[1]),
-                                              _magnet_hash(dr[1].magnet)))
-                for did, _row in finished:
-                    if self._race_finish_winner(did):
-                        for other in remaining:
-                            if other != did:
-                                self._cancel_race_loser(other)
-                        logger.info("Zero-seeder race won by download #%s", did)
-                        return
-                    # failed verify: already quarantined+blocked; drop it.
-                    remaining.remove(did)
-            remaining = [d for d in remaining
-                         if (r := downloads_store.get_download(d)) is not None
-                         and r.status in ("queued", "downloading", "downloaded")]
-            if not remaining:
-                return
-
-        for did in remaining:
-            self._cancel_race_loser(did)
+            for did in remaining:
+                self._cancel_race_loser(did)
+        finally:
+            # No candidate stays 'probing' once the race is over, whatever the
+            # exit path (winner, all dropped, or the window closed).
+            self._probing_ids.difference_update(ids)
 
     # ------------------------------------------------------------------
     # Quality replacement — swap a cam/low-bitrate movie for a proper one
@@ -2652,6 +2862,10 @@ class DownloadManager:
 
         torrent_files: list[dict[str, Any]] = []
         error_message: str | None = None
+        metadata_seen = False
+        # Until the first metadata/progress event lands, the UI shows "fetching
+        # metadata" instead of a bare 0%.
+        self._phase[download_id] = "fetching_metadata"
         try:
             assert proc.stdout is not None
             for line in proc.stdout:
@@ -2664,10 +2878,14 @@ class DownloadManager:
                     continue
                 kind = event.get("event")
                 if kind == "progress":
-                    downloads_store.set_progress(download_id, float(event.get("progress") or 0))
+                    prog = float(event.get("progress") or 0)
+                    downloads_store.set_progress(download_id, prog)
+                    self._update_phase(download_id, prog,
+                                       int(event.get("peers") or 0), metadata_seen)
                     self._notify(download_id)
                 elif kind == "metadata":
                     torrent_files = event.get("files") or []
+                    metadata_seen = True
                 elif kind == "done":
                     torrent_files = event.get("files") or torrent_files
                 elif kind == "error":
@@ -2678,12 +2896,16 @@ class DownloadManager:
         finally:
             with self._lock:
                 self._processes.pop(download_id, None)
+            self._phase.pop(download_id, None)
 
         row = downloads_store.get_download(download_id)
-        if row is not None and row.status in ("cancelled", "queued"):
-            # Someone else took ownership: user cancel, queue rotation, or
-            # app shutdown requeue. The kill-induced exit code must not
-            # overwrite that status or poison the failure memory.
+        if row is not None and row.status in (
+                "cancelled", "queued", "error", "stopped"):
+            # Someone else already took this row to a terminal/owned state — a
+            # user cancel, a queue rotation, a stall->error from the monitor, or
+            # an app-shutdown requeue. The kill-induced exit code must not
+            # overwrite that status, re-resolve the request, or double-count the
+            # failure (the stall path already recorded it).
             return
 
         if error_message or proc.returncode not in (0, None):

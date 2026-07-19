@@ -537,6 +537,24 @@ def missing_episodes(show_id: int) -> list[EpisodeRow]:
     return [EpisodeRow(r[0], r[1], r[2], r[3], r[4], r[5], bool(r[6]), r[7], r[8]) for r in rows]
 
 
+def have_seasons(show_id: int) -> set[int]:
+    """Regular-season numbers with at least one on-disk episode.
+
+    The "owned" signal for the Telegram season picker (Task F): a season
+    counts as had once any episode from it is on disk, so a request for a
+    partially-grabbed season isn't treated as untouched. Specials (season 0)
+    are excluded — they're never part of the "all seasons" picker either.
+    """
+    initialize_shows_db()
+    with _SHOWS_LOCK, db.connect() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT season FROM episodes "
+            "WHERE show_id = ? AND season > 0 AND has_file = 1",
+            (show_id,),
+        ).fetchall()
+    return {int(r[0]) for r in rows}
+
+
 def set_episode_grab(show_id: int, season: int, episode: int,
                      download_id: int | None) -> None:
     """Link (or clear) the download that is fetching this episode."""
