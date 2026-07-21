@@ -669,10 +669,20 @@ def format_library_summary_message() -> str:
     return "\n".join(lines)
 
 
-def search_library(query: str, *, limit: int | None = None) -> list[LibraryEntry]:
+def search_library(query: str, *, limit: int | None = None,
+                   local_only: bool = False) -> list[LibraryEntry]:
+    """Search the library. Plex's metadata search answers first for the
+    user-facing /search paths (nicer titles), falling back to the local file
+    index. local_only=True skips Plex entirely: presence decisions (at-grab
+    gating, request reconciliation) are about what is ON DISK RIGHT NOW, and
+    Plex both lags fresh files (a manual grab the watcher just indexed is
+    invisible until Plex rescans) and rewrites titles into metadata variants
+    ("12 Monkeys" for "Twelve Monkeys") that defeat identity matching."""
     clean_query = " ".join(query.split()).casefold()
     if not clean_query:
         return []
+    if local_only:
+        return _search_local_index(clean_query, limit)
 
     try:
         from plex_api import search_plex_library
@@ -693,6 +703,10 @@ def search_library(query: str, *, limit: int | None = None) -> list[LibraryEntry
             for result in plex_results
         ]
 
+    return _search_local_index(clean_query, limit)
+
+
+def _search_local_index(clean_query: str, limit: int | None) -> list[LibraryEntry]:
     initialize_library_index_db()
     max_results = limit or config.LIBRARY_SEARCH_RESULT_LIMIT
 

@@ -230,7 +230,13 @@ def request_present_in_library(req) -> bool:
                 return True
         if not media_identity.normalize_title(want.canonical_title):
             return False
-        entries = search_library(req.resolved_title or req.content, limit=8)
+        # local_only: presence means ON DISK NOW. Plex both lags fresh files
+        # (a manual grab the watcher just indexed is invisible until Plex
+        # rescans) and rewrites titles into metadata variants that defeat the
+        # identity eval — proven live when a watched-in Bigfoot file was
+        # shadowed by Plex answering "The Son of Bigfoot" for the query.
+        entries = search_library(req.resolved_title or req.content, limit=8,
+                                 local_only=True)
         matched, _ = _library_identity_eval(want, entries)
         return matched
     except Exception:
@@ -323,7 +329,8 @@ def daily_library_check() -> dict:
     for req in qs.get_requests_needing_library_check():
         try:
             want = _request_want_identity(req)
-            entries = search_library(req.resolved_title or req.content, limit=8)
+            entries = search_library(req.resolved_title or req.content, limit=8,
+                                     local_only=True)
             matched, contradicting = _library_identity_eval(want, entries)
             qs.update_library_status(req.request_id, found=matched)
             checked += 1
@@ -356,7 +363,7 @@ def daily_library_check() -> dict:
             if req.found_in_library:
                 want = _request_want_identity(req)
                 entries = search_library(req.resolved_title or req.content,
-                                         limit=8)
+                                         limit=8, local_only=True)
                 matched, contradicting = _library_identity_eval(want, entries)
                 if not matched:
                     qs.update_library_status(req.request_id, found=False)
