@@ -15,7 +15,9 @@
 #   - synchronous=NORMAL → the recommended pairing with WAL
 # =============================================================================
 
+import contextlib
 import sqlite3
+from collections.abc import Iterator
 from pathlib import Path
 
 import app_paths
@@ -34,14 +36,21 @@ def db_path() -> Path:
     return app_paths.PATHS.data_dir / path
 
 
-def connect(path: Path | str | None = None) -> sqlite3.Connection:
+@contextlib.contextmanager
+def connect(path: Path | str | None = None) -> Iterator[sqlite3.Connection]:
     """Open a connection with the app-standard pragmas applied.
 
     Connections are still short-lived and per-call (never shared across
-    threads); this helper only standardises the settings.
+    threads); this helper only standardises the settings. Used as a context
+    manager: the wrapped ``with conn`` commits on success and rolls back on
+    exception exactly as before, and the connection is always closed on exit.
     """
     conn = sqlite3.connect(str(path) if path is not None else str(db_path()), timeout=15)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=15000")
     conn.execute("PRAGMA synchronous=NORMAL")
-    return conn
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()

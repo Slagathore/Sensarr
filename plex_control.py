@@ -55,6 +55,32 @@ def _proc_info(proc: psutil.Process) -> _ProcessInfo:
     return {}
 
 
+# The desktop status tick calls is_plex_running() and get_status() back to back;
+# caching one process_iter sweep for a few seconds lets the pair share a single
+# enumeration instead of walking every process twice per tick.
+_STATUS_SWEEP_TTL_SECONDS = 5.0
+_status_sweep_lock = threading.Lock()
+_status_sweep_procs: list[psutil.Process] | None = None
+_status_sweep_at = 0.0
+
+
+def _status_process_sweep() -> list[psutil.Process]:
+    """Return a briefly cached process_iter sweep for the status checks.
+
+    Only pid/name/exe are fetched — the matcher never inspects cmdline — and the
+    snapshot is refreshed once its TTL lapses, so a burst of callers within one
+    tick reuses a single sweep.
+    """
+    global _status_sweep_procs, _status_sweep_at
+    with _status_sweep_lock:
+        now = time.monotonic()
+        if (_status_sweep_procs is None
+                or now - _status_sweep_at >= _STATUS_SWEEP_TTL_SECONDS):
+            _status_sweep_procs = list(psutil.process_iter(["pid", "name", "exe"]))
+            _status_sweep_at = now
+        return _status_sweep_procs
+
+
 def _is_plex_gone() -> bool:
     """Returns True when no real Plex server processes are running."""
     for proc in psutil.process_iter(["name", "exe", "cmdline"]):
@@ -438,7 +464,7 @@ def is_plex_running() -> bool:
     Used by the desktop UI status indicator; get_status() below returns the
     human-readable diagnostic text.
     """
-    for proc in psutil.process_iter(["pid", "name", "exe", "cmdline"]):
+    for proc in _status_process_sweep():
         try:
             if _is_plex_process(proc):
                 return True
@@ -455,7 +481,7 @@ def get_status() -> str:
     """
     # --- process check ---
     plex_procs: list[str] = []
-    for proc in psutil.process_iter(["pid", "name", "exe", "cmdline"]):
+    for proc in _status_process_sweep():
         info = _proc_info(proc)
         try:
             if _is_plex_process(proc):
