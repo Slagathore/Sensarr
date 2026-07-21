@@ -7,14 +7,40 @@
 #                          (click again to reverse). Numeric-aware.
 #   Spinner              — animated "working…" indicator label (braille
 #                          frames, no image asset needed).
+#   ellipsize /
+#   mirror_ellipsized    — Task L item 3: truncate a status line for a
+#                          full-width row, with the untruncated text still
+#                          reachable via add_tooltip.
+#   begin_busy           — Task L item 4: the one shared "disable this button
+#                          and show a working label until the job reports
+#                          back" helper, used by Shows scan/sync, watchlist
+#                          pulls, and the Maintenance tab's Apply Selected.
 # =============================================================================
 
 import datetime as _datetime
 import re
 import tkinter as tk
 from tkinter import ttk
+from typing import Callable, Iterable, Protocol, runtime_checkable
 
 import config
+
+
+@runtime_checkable
+class _StringVarLike(Protocol):
+    """Structural stand-in for tk.StringVar — get/set/trace_add is the
+    entire surface mirror_ellipsized touches. A real tk.StringVar satisfies
+    this trivially; so does a plain test double with no Tcl interpreter
+    behind it, which is the whole reason this is a Protocol instead of
+    requiring the concrete tk.StringVar class. (begin_busy below stays on
+    the concrete ttk.Button type instead of a matching Protocol — it
+    isinstance()-branches single-button vs. an iterable of them, which a
+    structural Protocol can't narrow cleanly; its tests silence the
+    resulting duck-typed-fake mismatch with a plain # type: ignore instead.)
+    """
+    def get(self) -> str: ...
+    def set(self, value: str) -> None: ...
+    def trace_add(self, mode: str, callback: Callable[..., None]) -> None: ...
 
 
 def local_ts(ts: str) -> str:
@@ -128,14 +154,26 @@ def bind_smooth_vscroll(canvas: tk.Canvas) -> None:
     canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"), add="+")
 
 
-def add_tooltip(widget: tk.Misc, text: str, *, delay_ms: int = 500) -> None:
+def add_tooltip(widget: tk.Misc, text: "str | Callable[[], str]", *,
+                delay_ms: int = 500) -> None:
     """Hover tooltip for any widget. Honours config.TOOLTIPS_ENABLED at
-    show time, so the Settings toggle applies without a restart."""
+    show time, so the Settings toggle applies without a restart.
+
+    `text` is normally a fixed string, but may also be a zero-arg callable
+    returning the current text — Task L item 3 uses this to tooltip a
+    StringVar-backed status label with its live, untruncated value (the
+    label itself shows an ellipsized copy so a long status can't blow out a
+    full-width row). A callable returning an empty/falsy string shows no
+    tooltip at all.
+    """
     state: dict = {"after_id": None, "tip": None}
 
     def show() -> None:
         state["after_id"] = None
         if not getattr(config, "TOOLTIPS_ENABLED", True) or state["tip"] is not None:
+            return
+        content = text() if callable(text) else text
+        if not content:
             return
         try:
             x = widget.winfo_rootx() + 12
@@ -145,7 +183,7 @@ def add_tooltip(widget: tk.Misc, text: str, *, delay_ms: int = 500) -> None:
             tip.wm_geometry(f"+{x}+{y}")
             tip.attributes("-topmost", True)
             tk.Label(
-                tip, text=text, justify=tk.LEFT, wraplength=340,
+                tip, text=content, justify=tk.LEFT, wraplength=340,
                 bg="#2b2b2b", fg="#e8e8e8", relief=tk.SOLID, borderwidth=1,
                 font=("Segoe UI", 9), padx=8, pady=4,
             ).pack()
@@ -218,3 +256,85 @@ class Spinner:
             self._label.after(120, self._tick)
         except tk.TclError:
             self._running = False
+
+
+def ellipsize(text: str | None, max_chars: int) -> str:
+    """Truncate `text` to max_chars, replacing the tail with a single "…"
+    when it doesn't fit (Task L item 3 — a full-width status row still
+    needs to stay one line; the untruncated text belongs in a tooltip, not
+    wrapped across rows). A short string passes through unchanged; None
+    (a StringVar that's never been set, say) is treated as empty."""
+    text = text or ""
+    if len(text) <= max_chars:
+        return text
+    if max_chars <= 1:
+        return "…"[:max_chars]
+    return text[:max_chars - 1].rstrip() + "…"
+
+
+def mirror_ellipsized(var: _StringVarLike, max_chars: int = 110) -> tk.StringVar:
+    """A StringVar that mirrors `var`, ellipsized to max_chars.
+
+    Pair with a Label bound to the RETURNED var (not the original) plus
+    add_tooltip(label, var.get) so the full untruncated text is still one
+    hover away — this is the exact shape Task L item 3 asks for: a
+    full-width status row, ellipsized, with a tooltip. `var` keeps being the
+    thing every caller already sets (self._status_var.set(...) is unchanged
+    anywhere in the tab modules); this just adds a derived display copy.
+    """
+    display = tk.StringVar(value=ellipsize(var.get(), max_chars))
+
+    def _sync(*_args: object) -> None:
+        display.set(ellipsize(var.get(), max_chars))
+
+    var.trace_add("write", _sync)
+    return display
+
+
+def begin_busy(buttons: "ttk.Button | Iterable[ttk.Button] | None", *,
+              working_text: str | None = None) -> Callable[[], None]:
+    """Task L item 4: the one shared "busy button" helper.
+
+    Disables every button in `buttons` (a single button or an iterable of
+    them; None is a harmless no-op) and, when `working_text` is given, swaps
+    each one's label to it. Returns a zero-arg restore() callable — call it
+    from the job's completion handler (already marshaled onto the UI thread,
+    same as every other cross-thread update in this app) to re-enable the
+    button(s) and put their original label back.
+
+    restore() is idempotent (safe to call more than once) and tolerates a
+    widget that no longer exists (e.g. its dialog was closed mid-run) by
+    swallowing TclError — the point is to never let a stuck 'disabled'
+    button block the UI, not to guarantee the label always resets.
+    """
+    if buttons is None:
+        widgets: list[ttk.Button] = []
+    elif isinstance(buttons, ttk.Button):
+        widgets = [buttons]
+    else:
+        widgets = list(buttons)
+
+    saved: list[tuple[ttk.Button, str]] = []
+    for btn in widgets:
+        try:
+            saved.append((btn, str(btn.cget("text"))))
+            btn.state(["disabled"])
+            if working_text is not None:
+                btn.configure(text=working_text)
+        except tk.TclError:
+            pass
+
+    restored = {"done": False}
+
+    def restore() -> None:
+        if restored["done"]:
+            return
+        restored["done"] = True
+        for btn, original_text in saved:
+            try:
+                btn.configure(text=original_text)
+                btn.state(["!disabled"])
+            except tk.TclError:
+                pass
+
+    return restore

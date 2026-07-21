@@ -13,7 +13,7 @@ import urllib.parse
 import webbrowser
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
-from typing import Any, cast
+from typing import Any, Callable, cast
 
 import config
 from app_logging import get_recent_logs
@@ -41,6 +41,7 @@ from settings_store import (load_current_settings, reload_config_from_env,
                              save_settings)
 from telegram_service import TelegramBotService
 
+import activity_strip
 import anime_db
 import auth_store
 import downloads_store
@@ -57,7 +58,7 @@ from health import format_health_report
 from shows_tab import ShowsTab
 from torrent_search import TorrentResult, format_size, search_torrents
 from watchlist_tab import WatchlistTab
-from ui_helpers import add_tooltip, make_sortable
+from ui_helpers import add_tooltip, begin_busy, ellipsize, make_sortable
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +103,20 @@ _DOT_AMBER = "#d29922"
 _DOT_GRAY = "#8b949e"
 # Muted helper-text color — depends on whether the dark theme is active.
 _MUTED_TEXT = "#9a9a9a" if sv_ttk is not None else "#444"
+
+# Task L: one color per activity_strip.ActivityEntry.level, all already
+# proven readable on sv-ttk dark (same dots used for the bot/Plex status
+# indicators above).
+_ACTIVITY_COLORS = {
+    "working": _DOT_AMBER,
+    "success": _DOT_GREEN,
+    "warning": _DOT_AMBER,
+    "error": _DOT_RED,
+}
+# How long the strip stays on a long combined "source: message" line before
+# it would wrap and break the single full-width row — the rest lives in the
+# label's tooltip (see _activity_render).
+_ACTIVITY_MAX_CHARS = 140
 
 # Tray stack (PIL + pystray) is lazy/optional now (Task H item 3): a missing
 # Linux backend leaves the main window usable with a visible "tray
@@ -233,6 +248,13 @@ class DesktopApp:
         # (so a tab switch never loses a run).
         self._maint_registry = maint_jobs.get_registry()
         self._maint_registry.subscribe(self._on_maint_job_event)
+        # Task L item 2: a SECOND listener, subscribed exactly once here —
+        # same dedup-guarded pattern as the line above (JobRegistry.subscribe
+        # is itself idempotent per listener). This mirrors registry activity
+        # (started/finished, any tool_key) into the header strip, so K's
+        # folder watcher and every other registry job show up there for
+        # free, with zero per-job wiring.
+        self._maint_registry.subscribe(self._on_maint_activity_mirror)
         self._maint_job_indicator_var = tk.StringVar(value="")
         self._maint_banner_var = tk.StringVar(value="")
         self._maint_phase_var = tk.StringVar(value="")
@@ -313,6 +335,26 @@ class DesktopApp:
             max_workers=2, thread_name_prefix="ui-refresh")
         self._refresh_lock = threading.Lock()
         self._refresh_futures: dict[str, concurrent.futures.Future] = {}
+
+        # Task L: header-wide activity strip. ActivityModel (activity_strip.py)
+        # is the pure, Tk-free brain (unit-tested directly, no display
+        # needed); everything here is just the Tk rendering state for it.
+        self._activity_model = activity_strip.ActivityModel()
+        self._activity_var = tk.StringVar(value="")
+        self._activity_full_text = ""
+        self._activity_label: ttk.Label | None = None
+        self._activity_recent_btn: ttk.Button | None = None
+        self._activity_tick_scheduled = False
+        # Task L item 4: "Apply Selected" on the Maintenance tab dispatches
+        # to one of several bare worker threads depending on which tool's
+        # grid is showing (sanitize/movie_migration/find_duplicates/
+        # clean_junk/custom_rename/missing_episodes) — none of those go
+        # through the job registry, so nothing previously stopped a second
+        # click from starting a second, overlapping apply. restore()
+        # defaults to a no-op so a completion handler can always call it
+        # unconditionally, even before the button is ever touched.
+        self._maint_apply_btn: ttk.Button | None = None
+        self._maint_apply_restore: Callable[[], None] = lambda: None
 
         self._build_ui()
         self._apply_dark_widget_styles(self.root)
@@ -526,7 +568,20 @@ class DesktopApp:
 
     def _build_ui(self) -> None:
         self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(3, weight=1)
+        # Root grid rows, top to bottom: 0 header block, 1 the Task L activity
+        # strip, 2 ko-fi row, 3 action buttons, 4 the tab notebook (the one
+        # that stretches), 5 the bottom summary bar. Cole's own placement:
+        # the strip sits "in between the overall app status action and right
+        # above the donate line" — i.e. below the header's status lines,
+        # above the ko-fi row. Being a sibling of the notebook rather than
+        # something inside it, it stays visible no matter which tab is
+        # selected. Every direct grid child of self.root gets its row number
+        # from this list — adding one here means adding it there too, or it
+        # silently lands on top of whatever already owns that row (the
+        # bug fixed by this comment: `summary`, added at the bottom of this
+        # method, used to collide with the notebook after the strip's rows
+        # were renumbered and `summary` wasn't).
+        self.root.rowconfigure(4, weight=1)
 
         header = ttk.Frame(self.root, padding=16)
         header.grid(row=0, column=0, sticky="ew")
@@ -568,9 +623,35 @@ class DesktopApp:
                             f"of hiding to the tray. ({_TRAY.reason})")
                       ).grid(row=7, column=0, sticky="w", pady=(4, 0))
 
+        # Task L: the global activity strip — its own full-width row right
+        # below the header's status lines and right above the ko-fi row
+        # (Cole's own placement: "in between the overall app status action
+        # and right above the donate line"), always visible regardless of
+        # the active tab. post_activity() is the one API every part of the
+        # app (Shows scan/sync, watchlist pulls, the maintenance registry
+        # mirror, …) posts a status through; see _activity_render for how
+        # it's drawn and activity_strip.ActivityModel for the
+        # fade/persist/level rules behind it.
+        activity_row = ttk.Frame(self.root, padding=(16, 0, 16, 4))
+        activity_row.grid(row=1, column=0, sticky="ew")
+        activity_row.columnconfigure(0, weight=1)
+        self._activity_label = ttk.Label(
+            activity_row, textvariable=self._activity_var, anchor="w",
+            foreground=_MUTED_TEXT, font=("Segoe UI", 9))
+        self._activity_label.grid(row=0, column=0, sticky="ew")
+        self._activity_label.bind("<Button-1>", self._activity_on_click)
+        add_tooltip(self._activity_label, lambda: self._activity_full_text)
+        self._activity_recent_btn = ttk.Button(
+            activity_row, text="Recent ▾", width=10,
+            command=self._activity_open_recent)
+        self._activity_recent_btn.grid(row=0, column=1, sticky="e", padx=(6, 0))
+        add_tooltip(self._activity_recent_btn,
+                    "The last activity entries: scans, syncs, pulls, "
+                    "maintenance jobs, in case you missed one go by.")
+
         # Ko-fi support link — sits above the action buttons.
         kofi_row = ttk.Frame(self.root, padding=(16, 0, 16, 4))
-        kofi_row.grid(row=1, column=0, sticky="ew")
+        kofi_row.grid(row=2, column=0, sticky="ew")
         kofi_label = ttk.Label(
             kofi_row,
             text=("😺 Like the app? You could help me get more catnip for my "
@@ -584,7 +665,7 @@ class DesktopApp:
                                 "Zero pressure — the cats are fine. Probably. 😼")
 
         actions = ttk.Frame(self.root, padding=(16, 0, 16, 12))
-        actions.grid(row=2, column=0, sticky="ew")
+        actions.grid(row=3, column=0, sticky="ew")
         for index in range(4):
             actions.columnconfigure(index, weight=1)
 
@@ -617,7 +698,7 @@ class DesktopApp:
             add_tooltip(btn, tip)
 
         notebook = ttk.Notebook(self.root)
-        notebook.grid(row=3, column=0, padx=16, pady=(0, 12), sticky="nsew")
+        notebook.grid(row=4, column=0, padx=16, pady=(0, 12), sticky="nsew")
 
         status_tab = ttk.Frame(notebook, padding=12)
         requests_tab = ttk.Frame(notebook, padding=12)
@@ -908,6 +989,12 @@ class DesktopApp:
             btn = ttk.Button(maint_toolbar, text=text, command=command)
             btn.grid(row=0, column=col, padx=2, sticky="ew")
             add_tooltip(btn, tip)
+            if text == "Apply Selected":
+                # Task L item 4: the one maintenance button whose async work
+                # (rename/delete/move, branching on _maint_tool_name) isn't
+                # already covered by the job-registry's own dedupe + progress
+                # strip — see _maint_apply_restore.
+                self._maint_apply_btn = btn
 
         ttk.Label(maintenance_tab, textvariable=self._maint_status_var,
                   font=("Segoe UI", 11, "bold")).grid(row=1, column=0, sticky="w", pady=(0, 6))
@@ -1103,7 +1190,7 @@ class DesktopApp:
                      lambda _e: self._refresh_file_ledger_views())
 
         summary = ttk.Frame(self.root, padding=(16, 0, 16, 16))
-        summary.grid(row=4, column=0, sticky="ew")
+        summary.grid(row=5, column=0, sticky="ew")
         ttk.Label(summary, textvariable=self.status_var).grid(row=0, column=0, sticky="w")
 
     # =====================================================================
@@ -1861,7 +1948,13 @@ class DesktopApp:
                 summary = f"Library summary unavailable: {exc}"
             self._post_to_ui(lambda: self._handle_library_summary_result(summary))
 
-        self._refresh_pool.submit(worker)
+        # Same guard as _submit_refresh: an off-thread shutdown_from_terminal
+        # can close the pool mid-call, and submit() on a shut pool raises.
+        with self._refresh_lock:
+            if self._quitting:
+                self._library_summary_refresh_running = False
+                return
+            self._refresh_pool.submit(worker)
 
     def _handle_library_summary_result(self, summary: str) -> None:
         self._library_summary_refresh_running = False
@@ -1892,7 +1985,11 @@ class DesktopApp:
                 metrics = f"Metrics unavailable: {exc}"
             self._post_to_ui(lambda: self._handle_library_metrics_result(metrics))
 
-        self._refresh_pool.submit(worker)
+        with self._refresh_lock:
+            if self._quitting:
+                self._library_metrics_refresh_running = False
+                return
+            self._refresh_pool.submit(worker)
 
     def _handle_library_metrics_result(self, metrics: str) -> None:
         self._library_metrics_refresh_running = False
@@ -3506,34 +3603,53 @@ class DesktopApp:
         ):
             return
         self._maint_status_var.set(f"Grabbing {len(gaps)} missing episode(s)…")
+        self.post_activity("Maintenance", f"Grabbing {len(gaps)} missing episode(s)…",
+                           level="working", tab="Maintenance")
+        # Task L item 4: this shares the "Apply Selected" button and its
+        # busy-guard slot — grabbing missing episodes IS an Apply Selected
+        # action (see _apply_maint_selection's missing_episodes branch), so
+        # the same restore() reaches this completion too.
+        self._maint_apply_restore = begin_busy(self._maint_apply_btn,
+                                               working_text="Applying…")
 
         def worker() -> None:
-            by_folder: dict[str, Any] = {}
-            for s in shows_store.list_shows():
-                for f in s.folders:
-                    by_folder[f.casefold()] = s
-            started = 0
-            skipped: list[str] = []
-            for _tag, title, season, episode, show_path in gaps:
-                label = f"{title} S{season:02d}E{episode:02d}"
-                show = by_folder.get(str(show_path).casefold())
-                if show is None:
-                    skipped.append(label + " (folder not tracked)")
-                    continue
-                ep_row = next(
-                    (e for e in shows_store.list_episodes(show.show_id)
-                     if e.season == season and e.episode == episode), None)
-                if ep_row is None:
-                    skipped.append(label + " (no tracker row — Sync the show)")
-                    continue
-                try:
-                    started += len(
-                        self.download_manager._grab_one_episode(show, ep_row))
-                except Exception:
-                    logger.exception("Missing-episode grab failed for %s", label)
-                    skipped.append(label + " (error — see log)")
+            try:
+                by_folder: dict[str, Any] = {}
+                for s in shows_store.list_shows():
+                    for f in s.folders:
+                        by_folder[f.casefold()] = s
+                started = 0
+                skipped: list[str] = []
+                for _tag, title, season, episode, show_path in gaps:
+                    label = f"{title} S{season:02d}E{episode:02d}"
+                    show = by_folder.get(str(show_path).casefold())
+                    if show is None:
+                        skipped.append(label + " (folder not tracked)")
+                        continue
+                    ep_row = next(
+                        (e for e in shows_store.list_episodes(show.show_id)
+                         if e.season == season and e.episode == episode), None)
+                    if ep_row is None:
+                        skipped.append(label + " (no tracker row — Sync the show)")
+                        continue
+                    try:
+                        started += len(
+                            self.download_manager._grab_one_episode(show, ep_row))
+                    except Exception:
+                        logger.exception("Missing-episode grab failed for %s", label)
+                        skipped.append(label + " (error — see log)")
+            except Exception as exc:
+                # Anything OUTSIDE the per-episode try above (e.g.
+                # shows_store.list_shows()/list_episodes() itself raising) —
+                # the per-episode try only ever turns single-episode
+                # failures into a "skipped" entry, it can't catch a blowup
+                # in the setup/lookup code around it.
+                logger.exception("Missing Episodes apply failed.")
+                self._maint_apply_failed("Missing Episodes", exc)
+                return
 
             def done() -> None:
+                self._maint_apply_restore()
                 msg = f"Missing Episodes: started {started} download(s)."
                 if skipped:
                     msg += f" Skipped {len(skipped)}."
@@ -3542,6 +3658,9 @@ class DesktopApp:
                         "Skipped:\n" + "\n".join(skipped[:12])
                         + ("\n…" if len(skipped) > 12 else ""))
                 self._maint_status_var.set(msg)
+                self.post_activity("Maintenance", msg,
+                                   level="warning" if skipped else "success",
+                                   tab="Maintenance")
             self._post_to_ui(done)
 
         threading.Thread(target=worker, name="maint-grab-missing",
@@ -3557,6 +3676,139 @@ class DesktopApp:
             vals = list(self._maint_tree.item(item, "values"))
             vals[0] = "[X]" if value else "[ ]"
             self._maint_tree.item(item, values=vals)
+
+    # =====================================================================
+    # Header activity strip (Task L)
+    # =====================================================================
+    # post_activity is the one API every part of the app posts a status
+    # through — Shows scan/sync, watchlist pulls/recs, the maintenance
+    # registry mirror below, and "Apply Selected"'s busy-guard completions.
+    # The model (fade/persist/level rules, history) lives in activity_strip
+    # .py and is plain Python; everything here is Tk rendering only.
+
+    def post_activity(self, source: str, message: str, level: str = "working",
+                      tab: str | None = None) -> None:
+        """Post one entry to the header strip. Safe to call from any thread
+        — marshals onto the UI thread via _post_to_ui like every other
+        cross-thread UI update in this class, so worker threads (Shows'
+        _run_guarded, watchlist pulls, maintenance job workers) can call it
+        directly with no extra plumbing."""
+        self._post_to_ui(lambda: self._activity_post_ui(source, message, level, tab))
+
+    def _activity_post_ui(self, source: str, message: str, level: str,
+                          tab: str | None) -> None:
+        self._activity_model.post(source, message, level=level, tab=tab)
+        self._activity_render()
+        self._activity_start_tick()
+
+    def _activity_render(self) -> None:
+        """Repaint the strip label from whatever ActivityModel.current()
+        says right now — called right after post() and on every tick so a
+        faded-out success actually clears the row instead of lingering."""
+        label = self._activity_label
+        if label is None:
+            return
+        entry = self._activity_model.current()
+        if entry is None:
+            self._activity_var.set("")
+            self._activity_full_text = ""
+            label.configure(foreground=_MUTED_TEXT, cursor="")
+            return
+        full = f"{entry.source}: {entry.message}"
+        self._activity_full_text = full
+        self._activity_var.set(ellipsize(full, _ACTIVITY_MAX_CHARS))
+        label.configure(foreground=_ACTIVITY_COLORS.get(entry.level, _DOT_GRAY),
+                        cursor="hand2" if entry.tab else "")
+
+    def _activity_start_tick(self) -> None:
+        if not self._activity_tick_scheduled:
+            self._activity_tick_scheduled = True
+            self._activity_tick()
+
+    def _activity_tick(self) -> None:
+        """Re-render on a short timer so a 'success' entry's ~10s fade
+        actually clears the strip on its own, with nothing else needing to
+        post again. Stops itself once nothing is showing; the next
+        post_activity restarts it."""
+        if self._quitting:
+            self._activity_tick_scheduled = False
+            return
+        self._activity_render()
+        if self._activity_model.current() is not None:
+            self.root.after(500, self._activity_tick)
+        else:
+            self._activity_tick_scheduled = False
+
+    def _activity_on_click(self, _event: Any = None) -> None:
+        """Clicking the strip acknowledges whatever is showing (this is what
+        makes a sticky error/warning go away) and jumps to the tab it came
+        from, if any."""
+        entry = self._activity_model.current()
+        if entry is None:
+            return
+        self._activity_model.dismiss_current()
+        self._activity_render()
+        if entry.tab:
+            self._activity_jump_to_tab(entry.tab)
+
+    def _activity_jump_to_tab(self, tab_name: str) -> None:
+        nb = self._notebook
+        if nb is None:
+            return
+        for tab_id in nb.tabs():
+            if nb.tab(tab_id, "text") == tab_name:
+                nb.select(tab_id)
+                return
+
+    def _activity_open_recent(self) -> None:
+        """Item 5: the last ~12 entries (registry journal mirror plus every
+        ad-hoc post_activity call), newest first, so a status that faded or
+        got overwritten before anyone saw it is still recoverable."""
+        entries = self._activity_model.history()
+        menu = tk.Menu(self.root, tearoff=0)
+        if not entries:
+            menu.add_command(label="No activity yet", state=tk.DISABLED)
+        for entry in entries:
+            text = ellipsize(f"[{entry.at}] {entry.source}: {entry.message}", 100)
+            if entry.tab:
+                menu.add_command(
+                    label=text,
+                    command=lambda t=entry.tab: self._activity_jump_to_tab(t))
+            else:
+                menu.add_command(label=text, state=tk.DISABLED)
+        btn = self._activity_recent_btn
+        try:
+            x = btn.winfo_rootx() if btn is not None else self.root.winfo_rootx()
+            y = ((btn.winfo_rooty() + btn.winfo_height())
+                 if btn is not None else self.root.winfo_rooty())
+            menu.tk_popup(x, y)
+        finally:
+            try:
+                menu.grab_release()
+            except tk.TclError:
+                pass
+
+    def _on_maint_activity_mirror(self, event: str, job) -> None:
+        """Task L item 2 — mirrors registry job events into the header strip
+        automatically. Fires on the registry worker thread (or the
+        submitting thread for 'queued'); marshal via post_activity exactly
+        like _on_maint_job_event marshals via _post_to_ui. Only 'started'
+        and 'finished' are strip-worthy — progress/queued/cancel_requested/
+        idle stay on the Maintenance tab's own progress bar so the strip
+        doesn't turn into a firehose. Any job submitted through the shared
+        registry (K's folder watcher included) surfaces here for free."""
+        if event == "started":
+            self.post_activity("Maintenance", f"{job.label} started",
+                               level="working", tab="Maintenance")
+        elif event == "finished":
+            if job.state == "done":
+                level, verb = "success", "finished"
+            elif job.state == "cancelled":
+                level, verb = "warning", "cancelled"
+            else:
+                level, verb = "error", "failed"
+            self.post_activity("Maintenance", f"{job.label} {verb}",
+                               level=level, tab="Maintenance")
 
     # =====================================================================
     # Maintenance tab — job registry plumbing (Task I)
@@ -4639,9 +4891,13 @@ class DesktopApp:
         )
 
     def _handle_movie_migration_result(self, summary: dict, run_id: str) -> None:
+        self._maint_apply_restore()
         moved, failed = summary.get("moved", 0), summary.get("failed", 0)
         self._maint_status_var.set(
             f"Organize Movies: {moved} moved, {failed} failed (run {run_id[:8]})")
+        self.post_activity(
+            "Maintenance", f"Organize Movies: {moved} moved, {failed} failed",
+            level="warning" if failed else "success", tab="Maintenance")
         detail = f"{moved} movie(s) moved into per-movie folders."
         if failed:
             detail += (f"\n{failed} move(s) FAILED (collision/permission) — "
@@ -4856,6 +5112,27 @@ class DesktopApp:
     # Maintenance tab — apply selected (sanitize renames)
     # =====================================================================
 
+    def _maint_apply_failed(self, name: str, exc: Exception) -> None:
+        """Shared failure path for every Apply Selected / grab-missing
+        worker thread (verification finding: an escaped exception from
+        apply_sanitization/delete_files_with_cleanup/movie_migration.*/etc.
+        used to leave the button permanently disabled — nothing ever called
+        _maint_apply_restore). Matches the try/except/else shape
+        shows_tab.ShowsTab._run_guarded uses: the caller has already logged
+        the real traceback synchronously on the worker thread (sys.exc_info()
+        is only valid there, not after marshaling); this posts the same
+        three things a normal completion does — restore the button, the
+        status line, and a sticky error entry on the strip — just via the
+        failure branch instead of the success one."""
+        msg = f"{name} failed: {exc}"
+
+        def fail() -> None:
+            self._maint_apply_restore()
+            self._maint_status_var.set(msg)
+            self.post_activity("Maintenance", msg, level="error", tab="Maintenance")
+
+        self._post_to_ui(fail)
+
     def _apply_maint_selection(self) -> None:
         # note: deferred — the APPLY phase (deletes/renames/moves after the
         # user ticks rows and confirms) still runs on short bare threads with
@@ -4906,9 +5183,16 @@ class DesktopApp:
             ):
                 return
             self._maint_status_var.set(f"Renaming {len(pairs)} file(s)...")
+            self._maint_apply_restore = begin_busy(self._maint_apply_btn,
+                                                   working_text="Applying…")
 
             def worker() -> None:
-                errors = apply_sanitization(pairs)
+                try:
+                    errors = apply_sanitization(pairs)
+                except Exception as exc:
+                    logger.exception("Sanitize Names apply failed.")
+                    self._maint_apply_failed("Sanitize Names", exc)
+                    return
                 self._post_to_ui(lambda: self._handle_apply_sanitize_result(len(pairs), errors))
 
             threading.Thread(target=worker, name="maint-apply-sanitize", daemon=True).start()
@@ -4942,16 +5226,22 @@ class DesktopApp:
             ):
                 return
             self._maint_status_var.set(f"Moving {len(items)} movie(s)...")
+            self._maint_apply_restore = begin_busy(self._maint_apply_btn,
+                                                   working_text="Applying…")
 
             def worker() -> None:
-                run_id = movie_migration.begin_run(items)
-
                 def progress(done: int, total: int, _op) -> None:
                     self._post_to_ui(lambda: self._maint_status_var.set(
                         f"Organize Movies: {done}/{total}"))
 
-                summary = movie_migration.execute_run(
-                    run_id, on_progress=progress)
+                try:
+                    run_id = movie_migration.begin_run(items)
+                    summary = movie_migration.execute_run(
+                        run_id, on_progress=progress)
+                except Exception as exc:
+                    logger.exception("Organize Movies apply failed.")
+                    self._maint_apply_failed("Organize Movies", exc)
+                    return
                 self._post_to_ui(lambda: self._handle_movie_migration_result(
                     summary, run_id))
 
@@ -5001,13 +5291,21 @@ class DesktopApp:
             ):
                 return
             self._maint_status_var.set("Cleaning junk…")
+            self._maint_apply_restore = begin_busy(self._maint_apply_btn,
+                                                   working_text="Applying…")
 
             def worker() -> None:
-                deleted, errors, empty_dirs = delete_files_with_cleanup(files)
-                removed_dirs, dir_errors = self._remove_empty_dirs(dirs + empty_dirs)
-                errors.extend(dir_errors)
+                try:
+                    deleted, errors, empty_dirs = delete_files_with_cleanup(files)
+                    removed_dirs, dir_errors = self._remove_empty_dirs(dirs + empty_dirs)
+                    errors.extend(dir_errors)
+                except Exception as exc:
+                    logger.exception("Clean Junk apply failed.")
+                    self._maint_apply_failed("Clean Junk", exc)
+                    return
 
                 def done() -> None:
+                    self._maint_apply_restore()
                     self._maint_status_var.set(
                         f"Removed {len(deleted)} file(s) + {removed_dirs} folder(s)"
                         + (f", {len(errors)} error(s)" if errors else "")
@@ -5040,9 +5338,16 @@ class DesktopApp:
             ):
                 return
             self._maint_status_var.set(f"Renaming {len(pairs)} file(s)...")
+            self._maint_apply_restore = begin_busy(self._maint_apply_btn,
+                                                   working_text="Applying…")
 
             def worker() -> None:
-                errors = apply_sanitization(pairs)
+                try:
+                    errors = apply_sanitization(pairs)
+                except Exception as exc:
+                    logger.exception("Custom Rename apply failed.")
+                    self._maint_apply_failed("Custom Rename", exc)
+                    return
                 self._post_to_ui(lambda: self._handle_apply_sanitize_result(len(pairs), errors))
 
             threading.Thread(target=worker, name="maint-apply-custom-rename", daemon=True).start()
@@ -5080,9 +5385,16 @@ class DesktopApp:
             return
 
         self._maint_status_var.set(f"Deleting {len(paths)} file(s)...")
+        self._maint_apply_restore = begin_busy(self._maint_apply_btn,
+                                               working_text="Applying…")
 
         def worker() -> None:
-            deleted, errors, empty_dirs = delete_files_with_cleanup(paths)
+            try:
+                deleted, errors, empty_dirs = delete_files_with_cleanup(paths)
+            except Exception as exc:
+                logger.exception("Find Duplicates delete failed.")
+                self._maint_apply_failed("Find Duplicates", exc)
+                return
             self._post_to_ui(
                 lambda: self._handle_duplicate_delete_result(deleted, errors, empty_dirs)
             )
@@ -5095,11 +5407,15 @@ class DesktopApp:
         errors: list[str],
         empty_dirs: list[str],
     ) -> None:
+        self._maint_apply_restore()
         success = len(deleted)
         if errors:
             self._maint_status_var.set(
                 f"Deleted {success} file(s); {len(errors)} error(s)"
             )
+            self.post_activity(
+                "Maintenance", f"Deleted {success} file(s); {len(errors)} error(s)",
+                level="warning", tab="Maintenance")
             err_preview = "\n".join(errors[:10])
             if len(errors) > 10:
                 err_preview += f"\n... and {len(errors) - 10} more"
@@ -5109,6 +5425,8 @@ class DesktopApp:
             )
         else:
             self._maint_status_var.set(f"Deleted {success} file(s).")
+            self.post_activity("Maintenance", f"Deleted {success} file(s)",
+                               level="success", tab="Maintenance")
 
         if empty_dirs:
             preview = "\n".join(f"  {d}" for d in empty_dirs[:10])
@@ -5576,13 +5894,19 @@ class DesktopApp:
         return removed, errors
 
     def _handle_apply_sanitize_result(self, attempted: int, errors: list[str]) -> None:
+        self._maint_apply_restore()
         success = attempted - len(errors)
         if errors:
             self._maint_status_var.set(f"Renamed {success}/{attempted} file(s) -- {len(errors)} error(s)")
+            self.post_activity(
+                "Maintenance", f"Renamed {success}/{attempted} file(s) -- {len(errors)} error(s)",
+                level="warning", tab="Maintenance")
             self._show_warning("Rename Results",
                 f"Renamed {success} of {attempted} file(s).\n\nErrors:\n" + "\n".join(errors[:10]))
         else:
             self._maint_status_var.set(f"{success} file(s) renamed successfully.")
+            self.post_activity("Maintenance", f"{success} file(s) renamed successfully",
+                               level="success", tab="Maintenance")
             self._show_info("Rename Complete", f"Successfully renamed {success} file(s).")
         # Pop cache + clear tool name FIRST (Task B item 4, same pattern as
         # Clean Junk) -- otherwise the re-run below sees a still-valid cache

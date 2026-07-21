@@ -19,7 +19,8 @@ from tkinter import scrolledtext, ttk
 
 import downloads_store
 import grab_queue
-from ui_helpers import add_tooltip, local_ts, make_sortable
+from ui_helpers import (add_tooltip, begin_busy, local_ts, make_sortable,
+                        mirror_ellipsized)
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +43,7 @@ class GrabQueueTab:
         self._status_var = tk.StringVar(value="Refresh to load the grab queue.")
 
         parent.columnconfigure(0, weight=1)
-        parent.rowconfigure(1, weight=1)
+        parent.rowconfigure(2, weight=1)
 
         toolbar = ttk.Frame(parent)
         toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
@@ -52,11 +53,28 @@ class GrabQueueTab:
                     "Rebuild the queue from the database: requests, deferrals, "
                     "keep-at-100 gaps, followed shows, active downloads, "
                     "needs-placement, and the scoped blocklist.")
-        ttk.Label(toolbar, textvariable=self._status_var,
-                  font=("Segoe UI", 9, "italic")).pack(side=tk.LEFT, padx=(6, 0))
+        # Task L item 4: the uniform busy affordance (ui_helpers.begin_busy).
+        # This subtab has no per-action toolbar button — grab/place/grab-
+        # missing all come off the right-click menu, which is gone before
+        # its command even runs — so Refresh is the one persistent button
+        # available; disabling it stops a refresh from racing a still-
+        # running grab/placement and repainting the tree out from under it.
+        self._refresh_btn = refresh_btn
+
+        # Task L item 3: full-width row under the toolbar, ellipsized with a
+        # tooltip for the untruncated text — replaces the old toolbar-packed
+        # far-right status label.
+        status_row = ttk.Frame(parent)
+        status_row.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        status_row.columnconfigure(0, weight=1)
+        self._status_display_var = mirror_ellipsized(self._status_var, 130)
+        status_label = ttk.Label(status_row, textvariable=self._status_display_var,
+                                 anchor="w", font=("Segoe UI", 9, "italic"))
+        status_label.grid(row=0, column=0, sticky="ew")
+        add_tooltip(status_label, self._status_var.get)
 
         panes = ttk.PanedWindow(parent, orient=tk.VERTICAL)
-        panes.grid(row=1, column=0, sticky="nsew")
+        panes.grid(row=2, column=0, sticky="nsew")
 
         tree_frame = ttk.Frame(panes)
         panes.add(tree_frame, weight=3)
@@ -102,7 +120,9 @@ class GrabQueueTab:
             self._rows = grab_queue.list_grab_queue_rows()
         except Exception:
             logger.exception("Grab queue refresh failed.")
-            self._status_var.set("Refresh failed — see the log.")
+            msg = "Refresh failed, see the log."
+            self._status_var.set(msg)
+            self.app.post_activity("Grab queue", msg, level="error", tab="Requests")
             return
         for item in self._tree.get_children():
             self._tree.delete(item)
@@ -247,18 +267,28 @@ class GrabQueueTab:
         if row.request_id is None:
             return
         grab_queue.grab_now_request(row.request_id)
-        self._status_var.set(f"Request #{row.request_id} reopened — grabbing…")
+        working_msg = f"Request #{row.request_id} reopened, grabbing…"
+        self._status_var.set(working_msg)
+        self.app.post_activity("Grab queue", working_msg, level="working", tab="Requests")
+        restore = begin_busy(self._refresh_btn, working_text="Grabbing…")
 
         def worker() -> None:
             try:
                 started = self.app.download_manager.auto_grab_open_requests()
                 msg = (f"Started {len(started)} download(s)."
                        if started else "No acceptable result this pass.")
+                level = "success" if started else "warning"
             except Exception as exc:
                 logger.exception("Grab-now pass failed.")
                 msg = f"Grab failed: {exc}"
-            self.app._post_to_ui(lambda: (self._status_var.set(msg),
-                                          self.refresh()))
+                level = "error"
+
+            def done() -> None:
+                restore()
+                self._status_var.set(msg)
+                self.app.post_activity("Grab queue", msg, level=level, tab="Requests")
+                self.refresh()
+            self.app._post_to_ui(done)
         threading.Thread(target=worker, name="grabqueue-grab-now",
                          daemon=True).start()
 
@@ -266,7 +296,9 @@ class GrabQueueTab:
         if row.request_id is None:
             return
         grab_queue.defer_request(row.request_id)
-        self._status_var.set(f"Request #{row.request_id} deferred 24 h.")
+        msg = f"Request #{row.request_id} deferred 24 h."
+        self._status_var.set(msg)
+        self.app.post_activity("Grab queue", msg, level="success", tab="Requests")
         self.refresh()
 
     def _resolve(self, row) -> None:
@@ -296,29 +328,43 @@ class GrabQueueTab:
         outcome = self.app.download_manager.mark_wrong_grab(
             download_id, recycle=recycle)
         self._status_var.set(outcome)
+        self.app.post_activity("Grab queue", outcome, level="warning", tab="Requests")
         self.refresh()
 
     def _create_placement(self, row) -> None:
         if row.download_id is None:
             return
-        self._status_var.set("Creating folder and placing…")
+        working_msg = "Creating folder and placing…"
+        self._status_var.set(working_msg)
+        self.app.post_activity("Grab queue", working_msg, level="working", tab="Requests")
+        restore = begin_busy(self._refresh_btn, working_text="Placing…")
 
         def worker() -> None:
             try:
                 msg = self.app.download_manager.create_placement_folder(
                     row.download_id)
+                level = "success"
             except Exception as exc:
                 logger.exception("Placement failed.")
                 msg = f"Placement failed: {exc}"
-            self.app._post_to_ui(lambda: (self._status_var.set(msg),
-                                          self.refresh()))
+                level = "error"
+
+            def done() -> None:
+                restore()
+                self._status_var.set(msg)
+                self.app.post_activity("Grab queue", msg, level=level, tab="Requests")
+                self.refresh()
+            self.app._post_to_ui(done)
         threading.Thread(target=worker, name="grabqueue-place",
                          daemon=True).start()
 
     def _grab_missing(self, row) -> None:
         if row.show_id is None:
             return
-        self._status_var.set("Searching missing episodes…")
+        working_msg = "Searching missing episodes…"
+        self._status_var.set(working_msg)
+        self.app.post_activity("Grab queue", working_msg, level="working", tab="Requests")
+        restore = begin_busy(self._refresh_btn, working_text="Searching…")
 
         def worker() -> None:
             try:
@@ -326,11 +372,18 @@ class GrabQueueTab:
                     show_ids=[row.show_id])
                 msg = (f"Started {len(started)} download(s)."
                        if started else "Nothing grabbable this pass.")
+                level = "success" if started else "warning"
             except Exception as exc:
                 logger.exception("Grab-missing pass failed.")
                 msg = f"Grab failed: {exc}"
-            self.app._post_to_ui(lambda: (self._status_var.set(msg),
-                                          self.refresh()))
+                level = "error"
+
+            def done() -> None:
+                restore()
+                self._status_var.set(msg)
+                self.app.post_activity("Grab queue", msg, level=level, tab="Requests")
+                self.refresh()
+            self.app._post_to_ui(done)
         threading.Thread(target=worker, name="grabqueue-grab-missing",
                          daemon=True).start()
 
@@ -343,15 +396,18 @@ class GrabQueueTab:
                 f"Allow '{row.display_title}' again for {row.subject_key}?"):
             return
         downloads_store.remove_blocklist_entry(int(blocklist_id))
-        self._status_var.set("Blocklist entry removed.")
+        msg = "Blocklist entry removed."
+        self._status_var.set(msg)
+        self.app.post_activity("Grab queue", msg, level="success", tab="Requests")
         self.refresh()
 
     def _keep_details(self, row) -> None:
         if row.selection_run_id is None:
             return
         downloads_store.set_keep_details(row.selection_run_id, True)
-        self._status_var.set(
-            f"Run #{row.selection_run_id}: loser details kept forever.")
+        msg = f"Run #{row.selection_run_id}: loser details kept forever."
+        self._status_var.set(msg)
+        self.app.post_activity("Grab queue", msg, level="success", tab="Requests")
 
     def _export_decision(self, row) -> None:
         if row.selection_run_id is None:
@@ -370,4 +426,6 @@ class GrabQueueTab:
             return
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(text)
-        self._status_var.set(f"Exported to {path}")
+        msg = f"Exported to {path}"
+        self._status_var.set(msg)
+        self.app.post_activity("Grab queue", msg, level="success", tab="Requests")

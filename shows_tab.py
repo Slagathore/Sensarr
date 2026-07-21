@@ -23,11 +23,13 @@ import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, ttk
+from typing import Callable
 
 import config
 import show_tracker
 import shows_store
-from ui_helpers import Spinner, add_tooltip, bind_smooth_vscroll, make_sortable
+from ui_helpers import (Spinner, add_tooltip, begin_busy, bind_smooth_vscroll,
+                        make_sortable, mirror_ellipsized)
 
 logger = logging.getLogger(__name__)
 
@@ -47,10 +49,14 @@ class ShowsTab:
         self._upcoming_boxes: list[tuple[tk.Listbox, list[tuple[int, str]]]] = []
 
         parent.columnconfigure(0, weight=1)
-        parent.rowconfigure(1, weight=1)
+        parent.rowconfigure(2, weight=1)
 
         toolbar = ttk.Frame(parent)
         toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        # Task L item 4: Scan/Sync/Grab Missing are the long-running actions
+        # here — kept by name so _run_guarded can disable + relabel whichever
+        # one is in flight (the uniform busy affordance, ui_helpers.begin_busy).
+        self._toolbar_buttons: dict[str, ttk.Button] = {}
         for text, command, tip in (
             ("Scan Folders", self.scan_folders,
              "Walk your tv/anime/xanime library folders and identify any new show folders against the trackers."),
@@ -78,6 +84,10 @@ class ShowsTab:
             btn = ttk.Button(toolbar, text=text, command=command)
             btn.pack(side=tk.LEFT, padx=(0, 6))
             add_tooltip(btn, tip)
+            self._toolbar_buttons[text] = btn
+        self._scan_btn = self._toolbar_buttons["Scan Folders"]
+        self._sync_btn = self._toolbar_buttons["Sync Episodes"]
+        self._grab_btn = self._toolbar_buttons["⬇ Grab Missing Now"]
         self._auto_grab_var = tk.BooleanVar(value=config.SHOWS_AUTO_GRAB)
         auto_cb = ttk.Checkbutton(
             toolbar, text="Auto-grab missing", variable=self._auto_grab_var,
@@ -90,15 +100,26 @@ class ShowsTab:
         spinner_label = ttk.Label(toolbar, text="", font=("Segoe UI", 9))
         spinner_label.pack(side=tk.LEFT, padx=(10, 0))
         self._spinner = Spinner(spinner_label)
-        ttk.Label(toolbar, textvariable=self._status_var,
-                  font=("Segoe UI", 9, "italic")).pack(side=tk.LEFT, padx=(10, 0))
+
+        # Task L item 3: this used to be packed at the toolbar's far right,
+        # where it went unseen once anything else shared the row. Now it's
+        # its own full-width row underneath, ellipsized with a tooltip
+        # carrying the untruncated text.
+        status_row = ttk.Frame(parent)
+        status_row.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        status_row.columnconfigure(0, weight=1)
+        self._status_display_var = mirror_ellipsized(self._status_var, 130)
+        status_label = ttk.Label(status_row, textvariable=self._status_display_var,
+                                 anchor="w", font=("Segoe UI", 9, "italic"))
+        status_label.grid(row=0, column=0, sticky="ew")
+        add_tooltip(status_label, self._status_var.get)
 
         # The whole body below the toolbar scrolls as one page, so the
         # tracked-shows and missing sections can both be tall.
         body_canvas = tk.Canvas(parent, highlightthickness=0)
-        body_canvas.grid(row=1, column=0, sticky="nsew")
+        body_canvas.grid(row=2, column=0, sticky="nsew")
         body_scroll = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=body_canvas.yview)
-        body_scroll.grid(row=1, column=1, sticky="ns")
+        body_scroll.grid(row=2, column=1, sticky="ns")
         body_canvas.configure(yscrollcommand=body_scroll.set)
         body = ttk.Frame(body_canvas)
         body_id = body_canvas.create_window((0, 0), window=body, anchor="nw")
@@ -767,13 +788,19 @@ class ShowsTab:
     # ------------------------------------------------------------------
 
     def _run_guarded(self, name: str, thread_name: str, running_msg: str,
-                     work, describe) -> None:
+                     work, describe, *, button: ttk.Button | None = None) -> None:
         """Run a scan/sync/grab in a worker thread, at most one at a time.
 
         Blocks a second click while one is in flight (the reported bug: 4
         clicks = 4 concurrent scans hammering Jikan). describe(result) -> str
         builds the done message; ShowsBusyError (from the module-level guard,
         e.g. the scheduler beat us to it) is reported plainly, not as a crash.
+
+        Task L: every run posts to the header activity strip, and when
+        `button` is given (Scan Folders / Sync Episodes / Grab Missing Now)
+        it's disabled with a working label for the duration — the uniform
+        busy affordance (ui_helpers.begin_busy), same helper watchlist_tab's
+        pulls use.
         """
         if self._busy:
             self._status_var.set(f"Already running — '{name}' skipped until it finishes.")
@@ -781,23 +808,33 @@ class ShowsTab:
         self._busy = True
         self._status_var.set("")
         self._spinner.start(running_msg)
+        self.app.post_activity("Shows", running_msg, level="working", tab="Shows")
+        restore = (begin_busy(button, working_text=f"{name}…")
+                  if button is not None else (lambda: None))
 
         def worker() -> None:
             try:
                 msg = describe(work())
+                level = "success"
             except show_tracker.ShowsBusyError as exc:
                 msg = str(exc)
+                level = "warning"
             except Exception as exc:
                 logger.exception("%s failed.", name)
                 msg = f"{name} failed: {exc}"
-            self.app._post_to_ui(lambda: self._finish_operation(msg))
+                level = "error"
+            self.app._post_to_ui(lambda: self._finish_operation(msg, level, restore))
 
         threading.Thread(target=worker, name=thread_name, daemon=True).start()
 
-    def _finish_operation(self, msg: str) -> None:
+    def _finish_operation(self, msg: str, level: str = "success",
+                          restore: "Callable[[], None] | None" = None) -> None:
         self._busy = False
         self._spinner.stop()
         self._status_var.set(msg)
+        if restore is not None:
+            restore()
+        self.app.post_activity("Shows", msg, level=level, tab="Shows")
         self.refresh()
 
     def scan_folders(self) -> None:
@@ -811,6 +848,7 @@ class ShowsTab:
             "Scan Folders", "shows-scan",
             "Scanning library folders and identifying shows…",
             show_tracker.scan_library_folders, describe,
+            button=self._scan_btn,
         )
 
     def sync_all(self) -> None:
@@ -833,6 +871,7 @@ class ShowsTab:
             "Syncing episode lists for all tracked shows…",
             lambda: show_tracker.sync_all(progress=progress),
             lambda summaries: f"Synced {len(summaries)} show(s)",
+            button=self._sync_btn,
         )
 
     def sync_selected(self) -> None:
@@ -908,6 +947,7 @@ class ShowsTab:
                 f"Started {len(started)} download(s) — see the Downloads tab"
                 if started else "No grabbable missing episodes found this pass"
             ),
+            button=self._grab_btn,
         )
 
     def set_season_target_for_selected(self) -> None:

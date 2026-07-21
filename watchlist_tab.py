@@ -24,7 +24,7 @@ from tkinter import ttk
 import config
 import queue_store
 import request_intake
-from ui_helpers import add_tooltip, make_sortable
+from ui_helpers import add_tooltip, begin_busy, make_sortable, mirror_ellipsized
 
 logger = logging.getLogger(__name__)
 
@@ -56,10 +56,11 @@ class WatchlistTab:
             value="Pull Watchlist to load your Plex watchlist (Plex token required).")
 
         parent.columnconfigure(0, weight=1)
-        parent.rowconfigure(1, weight=1)
+        parent.rowconfigure(2, weight=1)
 
         toolbar = ttk.Frame(parent)
         toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        self._toolbar_buttons: dict[str, ttk.Button] = {}
         for text, command, tip in (
             ("Pull Watchlist", self.pull_watchlist,
              "Fetch your Plex watchlist from plex.tv (the account that owns the token)."),
@@ -72,11 +73,26 @@ class WatchlistTab:
             btn = ttk.Button(toolbar, text=text, command=command)
             btn.pack(side=tk.LEFT, padx=(0, 6))
             add_tooltip(btn, tip)
-        ttk.Label(toolbar, textvariable=self._status_var,
-                  font=("Segoe UI", 9, "italic")).pack(side=tk.LEFT, padx=(10, 0))
+            self._toolbar_buttons[text] = btn
+        # Task L item 4: the uniform busy affordance (ui_helpers.begin_busy)
+        # disables this for the duration of pull_watchlist.
+        self._pull_btn = self._toolbar_buttons["Pull Watchlist"]
+
+        # Task L item 3: full-width row under the toolbar, ellipsized with a
+        # tooltip for the untruncated text — replaces the old toolbar-packed
+        # far-right status label (shared by watchlist pulls AND Get
+        # Recommendations below).
+        status_row = ttk.Frame(parent)
+        status_row.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        status_row.columnconfigure(0, weight=1)
+        self._status_display_var = mirror_ellipsized(self._status_var, 140)
+        status_label = ttk.Label(status_row, textvariable=self._status_display_var,
+                                 anchor="w", font=("Segoe UI", 9, "italic"))
+        status_label.grid(row=0, column=0, sticky="ew")
+        add_tooltip(status_label, self._status_var.get)
 
         panes = ttk.PanedWindow(parent, orient=tk.VERTICAL)
-        panes.grid(row=1, column=0, sticky="nsew")
+        panes.grid(row=2, column=0, sticky="nsew")
 
         # --- Watchlist ---------------------------------------------------
         wl_frame = ttk.LabelFrame(panes, text="Plex Watchlist", padding=6)
@@ -138,6 +154,8 @@ class WatchlistTab:
         add_tooltip(get_btn, "Analyse this user's Plex watch history, find their top "
                              "genres, and show two lists: what you already own but "
                              "haven't watched, and new titles to discover.")
+        # Task L item 4: same uniform busy affordance as Pull Watchlist.
+        self._recs_btn = get_btn
 
         recs_tree = ttk.Treeview(
             recs_frame, columns=("title", "year", "type", "note", "inlib"),
@@ -241,6 +259,9 @@ class WatchlistTab:
 
     def pull_watchlist(self) -> None:
         self._status_var.set("Pulling watchlist from plex.tv…")
+        self.app.post_activity("Watchlist", "Pulling watchlist from plex.tv…",
+                               level="working", tab="Watchlist")
+        restore = begin_busy(self._pull_btn, working_text="Pulling…")
 
         def worker() -> None:
             try:
@@ -279,8 +300,13 @@ class WatchlistTab:
                     except Exception:
                         in_lib[idx] = False
             except Exception as exc:
-                self.app._post_to_ui(
-                    lambda: self._status_var.set(f"Watchlist unavailable: {exc}"))
+                msg = f"Watchlist unavailable: {exc}"
+
+                def fail() -> None:
+                    restore()
+                    self._status_var.set(msg)
+                    self.app.post_activity("Watchlist", msg, level="error", tab="Watchlist")
+                self.app._post_to_ui(fail)
                 return
 
             def render() -> None:
@@ -293,7 +319,10 @@ class WatchlistTab:
                         values=(item.title, item.year or "", item.item_type,
                                 "✓" if in_lib.get(idx) else ""),
                     )
-                self._status_var.set(f"{len(items)} watchlist item(s)")
+                msg = f"{len(items)} watchlist item(s)"
+                self._status_var.set(msg)
+                restore()
+                self.app.post_activity("Watchlist", msg, level="success", tab="Watchlist")
             self.app._post_to_ui(render)
 
         threading.Thread(target=worker, name="wl-pull", daemon=True).start()
@@ -302,6 +331,10 @@ class WatchlistTab:
         user = self._user_var.get().strip()
         genre = self._genre_var.get().strip()
         self._status_var.set(f"Analysing {user or 'all users'}'s watch history…")
+        self.app.post_activity(
+            "Watchlist", f"Analysing {user or 'all users'}'s watch history…",
+            level="working", tab="Watchlist")
+        restore = begin_busy(self._recs_btn, working_text="Analysing…")
 
         def worker() -> None:
             try:
@@ -310,8 +343,13 @@ class WatchlistTab:
                     user or None,
                     genre_filter=None if genre in ("", "All") else genre)
             except Exception as exc:
-                self.app._post_to_ui(
-                    lambda: self._status_var.set(f"Recommendations unavailable: {exc}"))
+                msg = f"Recommendations unavailable: {exc}"
+
+                def fail() -> None:
+                    restore()
+                    self._status_var.set(msg)
+                    self.app.post_activity("Watchlist", msg, level="error", tab="Watchlist")
+                self.app._post_to_ui(fail)
                 return
 
             def render() -> None:
@@ -325,6 +363,12 @@ class WatchlistTab:
                     self._genre_combo.configure(values=["All"] + merged)
                 self._render_recs()
                 self._persist_recs()
+                restore()
+                self.app.post_activity(
+                    "Watchlist",
+                    f"{len(self._library_recs)} in library, "
+                    f"{len(self._discover_recs)} to discover",
+                    level="success", tab="Watchlist")
             self.app._post_to_ui(render)
 
         threading.Thread(target=worker, name="wl-recs", daemon=True).start()

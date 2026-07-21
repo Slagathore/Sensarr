@@ -508,6 +508,12 @@ class _FakeTree:
 
 
 class _FakeApp:
+    def __init__(self):
+        # Task L: recorded rather than no-op'd so a future test can assert
+        # on strip posts; existing tests here only care that pull_watchlist
+        # doesn't crash calling it against a fake with no real Tk strip.
+        self.activity_posts: list[tuple] = []
+
     def _post_to_ui(self, fn) -> None:
         # The real app marshals onto the Tk main loop; tests just run it
         # inline since _SyncThread already made the worker synchronous.
@@ -515,6 +521,9 @@ class _FakeApp:
 
     def _show_warning(self, *_a, **_k) -> None:
         raise AssertionError("pull_watchlist must not warn-dialog")
+
+    def post_activity(self, source, message, level="working", tab=None) -> None:
+        self.activity_posts.append((source, message, level, tab))
 
 
 class _FakeWatchlistTab:
@@ -525,6 +534,9 @@ class _FakeWatchlistTab:
         self._status_var = _FakeVar()
         self._wl_tree = _FakeTree()
         self._watchlist: list = []
+        # Task L item 4: begin_busy(None, ...) is a documented no-op, so the
+        # busy-guard in pull_watchlist is exercised without a real ttk.Button.
+        self._pull_btn = None
 
 
 def test_pull_watchlist_degrades_gracefully_token_only_no_server_url(monkeypatch):
