@@ -93,3 +93,21 @@ def test_low_quality_scan_sorts_cams_first_and_flags_redundant(tmp_path, monkeyp
     cam_copy = flagged[0]
     assert cam_copy.redundant_with == "/lib/Good Movie (2020) 1080p.mkv"
     assert flagged[2].redundant_with is None
+
+
+def test_cam_marker_in_the_last_dot_segment_is_seen():
+    """A dotted scene name has no file extension; Path().stem used to cut the
+    last segment off and hide the marker (2026-10-09)."""
+    import video_quality
+    assert video_quality.is_cam_release("Movie.2024.HDCAM-XYZ")
+    assert video_quality.is_cam_release("Movie.2024.TS-XYZ")
+    assert video_quality.is_cam_release("Movie.2024.HDCAM-XYZ.mkv")
+    assert not video_quality.is_cam_release("Movie 2024 1080p WEB-DL.mkv")
+    assert not video_quality.is_cam_release("clip.ts")
+    assert video_quality.cam_markers("Movie.2024.HDCAM-XYZ") == ["HDCAM"]
+
+
+def test_uppercase_trailing_ts_is_the_telesync_tag():
+    import video_quality
+    assert video_quality.is_cam_release("Movie.2024.720p.TS")
+    assert not video_quality.is_cam_release("Movie.2024.720p.ts")

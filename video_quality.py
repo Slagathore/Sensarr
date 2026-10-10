@@ -46,9 +46,28 @@ CAM_RE = re.compile(
 )
 
 
+# Only a real media extension is stripped before the marker search. A dotted
+# scene name has no extension: Path("Movie.2024.HDCAM-XYZ").stem is
+# "Movie.2024", which hid the marker whenever it was the last dot-segment
+# (found 2026-10-09).
+_MEDIA_EXTENSIONS = frozenset({
+    ".mkv", ".mp4", ".avi", ".m4v", ".mov", ".wmv", ".ts", ".m2ts", ".webm",
+    ".mpg", ".mpeg", ".flv", ".srt", ".ass", ".ssa", ".sub", ".vtt", ".idx",
+    ".smi", ".nfo", ".txt"})
+
+
+def _name_for_markers(name: str) -> str:
+    path = Path(name)
+    # ".ts" is a real video extension, but scene names end in an uppercase
+    # ".TS" telesync tag ("Movie.2024.720p.TS"); only lowercase is a file type.
+    if path.suffix == ".TS":
+        return path.name
+    return path.stem if path.suffix.lower() in _MEDIA_EXTENSIONS else path.name
+
+
 def is_cam_release(name: str) -> bool:
     """True when a release/file name carries a cam/telesync/screener marker."""
-    return CAM_RE.search(Path(name).stem) is not None
+    return CAM_RE.search(_name_for_markers(name)) is not None
 
 
 # Task F: stored quality labels (media_quality / downloads.quality_label, the
@@ -77,7 +96,8 @@ def label_says_cam(label: str | None) -> bool | None:
 
 def cam_markers(name: str) -> list[str]:
     """The matched cam markers in a name, cleaned up ("CAM", "TS", …)."""
-    return [m.strip(" ._-[]()").upper() for m in CAM_RE.findall(Path(name).stem)]
+    return [m.strip(" ._-[]()").upper()
+            for m in CAM_RE.findall(_name_for_markers(name))]
 
 
 # ---------------------------------------------------------------------------

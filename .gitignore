@@ -83,3 +83,6 @@ plexxarr.pid
 
 # Local backup snapshots, never commit
 backups/
+
+# Editor/tool auto-snapshots, never commit
+.snapshots/

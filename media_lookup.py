@@ -1580,6 +1580,66 @@ def get_tmdb_movie_runtime(movie_id: str) -> float | None:
     return minutes
 
 
+# ---------------------------------------------------------------------------
+# IMDb ids (Torrentio is keyed by them). Cached in the app database because
+# they never change: one TMDB call per title, ever. A miss is retried after a
+# week in case TMDB gains the link.
+# ---------------------------------------------------------------------------
+
+_IMDB_MISS_RETRY_S = 7 * 24 * 3600
+_IMDB_RE = re.compile(r"^tt\d{5,10}$")
+
+
+def _imdb_cache_get(key: str) -> tuple[bool, str | None]:
+    import db
+    with db.connect() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS imdb_id_cache (key TEXT PRIMARY"
+                     " KEY, imdb_id TEXT, fetched_at REAL NOT NULL)")
+        row = conn.execute("SELECT imdb_id, fetched_at FROM imdb_id_cache"
+                           " WHERE key = ?", (key,)).fetchone()
+    if row is None:
+        return False, None
+    if row[0]:
+        return True, str(row[0])
+    return (time.time() - float(row[1]) < _IMDB_MISS_RETRY_S), None
+
+
+def _imdb_cache_put(key: str, imdb_id: str | None) -> None:
+    import db
+    with db.connect() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS imdb_id_cache (key TEXT PRIMARY"
+                     " KEY, imdb_id TEXT, fetched_at REAL NOT NULL)")
+        conn.execute("INSERT OR REPLACE INTO imdb_id_cache (key, imdb_id,"
+                     " fetched_at) VALUES (?, ?, ?)", (key, imdb_id, time.time()))
+        conn.commit()
+
+
+def get_imdb_id(kind: str, tmdb_id: str | int | None) -> str | None:
+    """IMDb id ("tt0149460") for a TMDB movie (`kind="movie"`) or show
+    (`kind="tv"`), or None. Network only on a cache miss."""
+    if not tmdb_id or kind not in ("movie", "tv"):
+        return None
+    key = f"tmdb:{kind}:{tmdb_id}"
+    known, cached = _imdb_cache_get(key)
+    if known:
+        return cached
+    if not _tmdb_enabled():
+        return None
+    url = (f"{_TMDB_BASE}/movie/{tmdb_id}?api_key={config.TMDB_API_KEY}"
+           if kind == "movie" else
+           f"{_TMDB_BASE}/tv/{tmdb_id}/external_ids?api_key={config.TMDB_API_KEY}")
+    try:
+        data = _get_json(url)
+    except RuntimeError as exc:
+        logger.debug("TMDB imdb_id fetch failed for %s: %s", key,
+                     str(exc).replace(config.TMDB_API_KEY, "***"))
+        return None  # transient: not cached, asked again next time
+    imdb = str(data.get("imdb_id") or "").strip()
+    imdb = imdb if _IMDB_RE.match(imdb) else None
+    _imdb_cache_put(key, imdb)
+    return imdb
+
+
 _release_date_cache: dict[str, str | None] = {}
 
 

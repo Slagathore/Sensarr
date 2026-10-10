@@ -455,6 +455,16 @@ def infohash_of(magnet: str) -> str:
     return match.group(1).lower() if match else ""
 
 
+def live_downloads_for(magnet: str) -> list:
+    """Every live download fetching this info-hash (a pack can be fetched as
+    several single-file downloads at once)."""
+    wanted = infohash_of(magnet)
+    if not wanted:
+        return []
+    return [c for c in downloads_store.list_downloads_by_status(IN_FLIGHT)
+            if c.removed_at is None and infohash_of(c.magnet) == wanted]
+
+
 def live_download_for(magnet: str, *, exclude: Optional[int] = None):
     """A download already fetching these exact bytes, or None.
 

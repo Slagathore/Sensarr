@@ -17,9 +17,34 @@
 // (https://github.com/baairon/torlink, MIT). See README Acknowledgements.
 // =============================================================================
 
+import dgram from "node:dgram";
+import net from "node:net";
 import WebTorrent from "webtorrent";
 
 const [magnet, destDir, stallTimeoutArg, selectionArg] = process.argv.slice(2);
+
+// webtorrent listens for TCP on a random port, then binds uTP (UDP) to the SAME
+// number. Windows reserves whole UDP ranges for Hyper-V/WinNAT (55056-56006 and
+// 61887-63014 on Cole's machine, 2026-10-09), so a random pick sometimes lands
+// in one, utp-native's bind throws EACCES and the runner dies with "permission
+// denied" (65 downloads before this fix). Pick ports that are known to bind.
+const udpFree = (port) => new Promise((resolve) => {
+  const sock = dgram.createSocket("udp4");
+  sock.once("error", () => { try { sock.close(); } catch {} resolve(false); });
+  sock.bind(port, () => sock.close(() => resolve(true)));
+});
+const tcpFree = (port) => new Promise((resolve) => {
+  const server = net.createServer();
+  server.once("error", () => resolve(false));
+  server.listen(port, () => server.close(() => resolve(true)));
+});
+const pickPort = async (needTcp) => {
+  for (let attempt = 0; attempt < 50; attempt++) {
+    const port = 20000 + Math.floor(Math.random() * 30000);
+    if (await udpFree(port) && (!needTcp || await tcpFree(port))) return port;
+  }
+  return 0; // let webtorrent choose, as before
+};
 
 // Deterministic no-network smoke mode (Task H item 9): prove the runner's
 // dependency tree loads and a client constructs/destroys cleanly, with every
@@ -54,7 +79,12 @@ try {
 
 const emit = (obj) => console.log(JSON.stringify(obj));
 
-const client = new WebTorrent();
+const torrentPort = await pickPort(true);
+const dhtPort = await pickPort(false);
+const client = new WebTorrent({
+  ...(torrentPort ? { torrentPort } : {}),
+  ...(dhtPort && dhtPort !== torrentPort ? { dhtPort } : {}),
+});
 let finished = false;
 
 const die = (code) => {
@@ -74,7 +104,24 @@ let lastActivity = Date.now();
 const startedAt = Date.now();
 let wantedFiles = [];
 
-const torrent = client.add(magnet, { path: destDir });
+// Start with NOTHING selected. By default webtorrent selects the whole torrent
+// the moment metadata arrives, peers start on random 16 MB pieces of every
+// file, and those finish even after chooseFiles() narrows the selection: a
+// single pinned episode of a Futurama pack also wrote 113 MB of S07E26.
+const torrent = client.add(magnet, { path: destDir, deselect: true });
+
+// Piece ranges of the files we want (filled by chooseFiles at "ready").
+let wantedPieceRanges = [];
+const pieceWanted = (index) => wantedPieceRanges.some(([a, b]) => index >= a && index <= b);
+
+// BEP 6 "allowed fast": a peer that is choking us may offer a few pieces for
+// free, and webtorrent requests them WITHOUT checking the selection. Give each
+// wire a list that only keeps offers inside the wanted files.
+torrent.on("wire", (wire) => {
+  const offered = [];
+  offered.push = (...indexes) => Array.prototype.push.apply(offered, indexes.filter(pieceWanted));
+  wire.peerAllowedFastSet = offered;
+});
 
 torrent.on("error", (err) => {
   emit({ event: "error", message: String(err.message || err) });
@@ -109,15 +156,37 @@ const subtitleLanguageOk = (filePath) => {
   return found.length === 0 || found.some((token) => wanted.has(token));
 };
 
+const baseName = (filePath) => String(filePath || "").split(/[\\/]/).pop();
+const stemOf = (filePath) => baseName(filePath).replace(/\.[^.]+$/, "").toLowerCase();
+
+// Torrentio names the exact file a result is about inside a pack (fileName,
+// with fileIdx as the fallback). Taking that one file is what keeps a single
+// episode from pulling a whole 30 GB season pack whose files carry no SxxEyy.
+const pinnedVideo = (videos, videoExts) => {
+  if (selection.fileName) {
+    const wanted = String(selection.fileName).toLowerCase();
+    const byName = videos.filter((file) => baseName(file.path).toLowerCase() === wanted);
+    if (byName.length === 1) return byName[0];
+  }
+  if (Number.isInteger(selection.fileIdx)) {
+    const file = torrent.files[selection.fileIdx];
+    if (file && videoExts.has(extension(file.path))) return file;
+  }
+  return null;
+};
+
 const chooseFiles = () => {
   const videoExts = new Set(selection.videoExtensions || []);
   const subtitleExts = new Set(selection.subtitleExtensions || []);
   const videos = torrent.files.filter((file) => videoExts.has(extension(file.path)));
   const wantedSeason = Number.isInteger(selection.season) ? selection.season : null;
   const wantedEpisode = Number.isInteger(selection.episode) ? selection.episode : null;
+  const pinned = pinnedVideo(videos, videoExts);
 
   let selectedVideos = videos;
-  if (wantedEpisode !== null) {
+  if (pinned) {
+    selectedVideos = [pinned];
+  } else if (wantedEpisode !== null) {
     const exact = videos.filter((file) => {
       const marker = episodeMarker(file.path);
       return marker && marker.episode === wantedEpisode
@@ -136,6 +205,8 @@ const chooseFiles = () => {
   const selected = new Set(selectedVideos);
   for (const file of torrent.files) {
     if (!subtitleExts.has(extension(file.path)) || !subtitleLanguageOk(file.path)) continue;
+    // A pinned file only brings the subtitles named after it.
+    if (pinned && !stemOf(file.path).startsWith(stemOf(pinned.path))) continue;
     const marker = episodeMarker(file.path);
     if (wantedEpisode !== null && marker
         && (marker.episode !== wantedEpisode
@@ -154,18 +225,36 @@ torrent.on("ready", () => {
   lastActivity = Date.now();
   const selectedFiles = chooseFiles();
   wantedFiles = selectedFiles;
+  wantedPieceRanges = selectedFiles
+    .filter((f) => f.length > 0)
+    .map((f) => [Math.floor(f.offset / torrent.pieceLength),
+      Math.floor((f.offset + f.length - 1) / torrent.pieceLength)]);
   const videoExts = new Set(selection.videoExtensions || []);
   if (!selectedFiles.some((file) => videoExts.has(extension(file.path)))) {
     emit({ event: "error", message: "torrent metadata contains no selectable video file" });
     die(1);
     return;
   }
+  // Unselected files that share a piece with a selected one: webtorrent
+  // writes those pieces into both files, so these get partially written too.
+  // Reported exactly so the app can clean them up without guessing.
+  const chosen = new Set(selectedFiles);
+  const neighbours = torrent.files.filter((f) => !chosen.has(f) && f.length > 0 && (() => {
+    const first = Math.floor(f.offset / torrent.pieceLength);
+    const last = Math.floor((f.offset + f.length - 1) / torrent.pieceLength);
+    return wantedPieceRanges.some(([a, b]) => first <= b && last >= a);
+  })());
   emit({
     event: "metadata",
     name: torrent.name,
     files: selectedFiles.map((f) => ({ path: f.path, size: f.length })),
     skippedFiles: torrent.files.length - selectedFiles.length,
+    neighbours: neighbours.map((f) => f.path),
   });
+  // Finish when OUR files are done (see finish()). Resumed data may already
+  // complete them.
+  selectedFiles.forEach((file) => file.on("done", () => { if (wantedDone()) finish(); }));
+  if (wantedDone()) finish();
 });
 
 const progressTimer = setInterval(() => {
@@ -191,13 +280,32 @@ const progressTimer = setInterval(() => {
   }
   emit({
     event: "progress",
-    progress: Number(torrent.progress.toFixed(4)),
+    progress: Number(selectedProgress().toFixed(4)),
     downloadSpeed: Math.round(torrent.downloadSpeed),
     peers: torrent.numPeers,
   });
 }, 2000);
 
-torrent.on("done", () => {
+// Progress of the files we actually want. torrent.progress covers the whole
+// torrent, so one pinned episode of a 30 GB pack read ~3% when nearly done,
+// and the app's "50%+ is worth resuming" rules never fired for it.
+function selectedProgress() {
+  const total = wantedFiles.reduce((sum, f) => sum + (f.length || 0), 0);
+  if (!total) return torrent.progress;
+  const done = wantedFiles.reduce(
+    (sum, f) => sum + Math.min(f.length || 0, f.downloaded || 0), 0);
+  return Math.max(0, Math.min(1, done / total));
+}
+
+// webtorrent's own torrent "done" waits for EVERY file in the torrent, so a
+// pack pruned to the files we want never raised it: the episode finished and
+// then sat until the stall timer killed it. Done = all wanted files done.
+function wantedDone() {
+  return wantedFiles.length > 0 && wantedFiles.every((f) => f.done);
+}
+
+function finish() {
+  if (finished) return;
   clearInterval(progressTimer);
   emit({
     event: "done",
@@ -205,4 +313,6 @@ torrent.on("done", () => {
     files: wantedFiles.map((f) => ({ path: f.path, size: f.length })),
   });
   die(0); // destroy immediately — stops seeding
-});
+}
+
+torrent.on("done", finish);

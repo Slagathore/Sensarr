@@ -1,4 +1,5 @@
 import concurrent.futures
+import dataclasses
 import datetime
 import logging
 import os
@@ -2808,10 +2809,7 @@ class DesktopApp:
         media_type = self._dl_type_var.get()
         # The search result rows carry the source's media type, but the combo
         # box is authoritative — the admin may have overridden it.
-        result = TorrentResult(
-            title=result.title, magnet=result.magnet, size_bytes=result.size_bytes,
-            seeders=result.seeders, source=result.source, media_type=media_type,
-        )
+        result = dataclasses.replace(result, media_type=media_type)
         request_id, request_title = (self._dl_request_context or (None, None))
         grab_kwargs = dict(
             request_id=request_id,
@@ -6245,6 +6243,15 @@ class DesktopApp:
         ("MAX_ACTIVE_DOWNLOADS", "Max simultaneous downloads (rest queue)", "int"),
         ("DOWNLOAD_SLOW_ROTATE_MINUTES", "Rotate a no-progress download after (minutes)", "int"),
         ("DOWNLOAD_ROOT_OVERRIDE", "Force new downloads to folder/drive (blank = most free space)", "path"),
+        ("MIN_SEEDERS", "Skip releases with fewer seeders than", "int"),
+        ("STAGING_SWEEP_ENABLED", "Daily cleanup of partial files from stalled downloads", "bool"),
+        ("TORRENTIO_ENABLED", "Also search Torrentio (needs the TMDB key)", "bool"),
+        ("TORRENTIO_BASE_URL", "Torrentio address", "text"),
+        ("TORRENTIO_OPTIONS", "Torrentio options (blank = Sensarr defaults)", "text"),
+        # Real-Debrid (optional download service)
+        ("REALDEBRID_API_TOKEN", "Real-Debrid API token (real-debrid.com/apitoken; blank = off)", "secret"),
+        ("REALDEBRID_CACHE_CHECK", "Prefer releases already cached on Real-Debrid", "bool"),
+        ("REALDEBRID_FALLBACK_TO_P2P", "If Real-Debrid itself fails, use the torrent client", "bool"),
         # qBittorrent (optional download engine)
         ("QBITTORRENT_ENABLED", "Use qBittorrent instead of the built-in downloader", "bool"),
         ("QBITTORRENT_URL", "qBittorrent Web UI URL", "text"),

@@ -320,6 +320,58 @@ CREATE TABLE IF NOT EXISTS needs_placement (
 """
 
 
+# --- runner PID registry ------------------------------------------------------
+# The node runners outlive the app (they are detached), so the next launch must
+# find and stop them. Listing every process to look for them took over five
+# minutes on a machine with ~900 processes (psutil re-snapshots the whole
+# process table for each one it cannot open), which hung startup. Recording
+# our own runner PIDs makes recovery O(our runners).
+
+def _init_runner_pids(conn) -> None:
+    conn.execute("CREATE TABLE IF NOT EXISTS runner_pids ("
+                 " download_id INTEGER PRIMARY KEY, pid INTEGER NOT NULL,"
+                 " started_at REAL NOT NULL)")
+
+
+def register_runner(download_id: int, pid: int) -> None:
+    import time as _time
+    with _DL_LOCK, db.connect() as conn:
+        _init_runner_pids(conn)
+        conn.execute("INSERT OR REPLACE INTO runner_pids (download_id, pid,"
+                     " started_at) VALUES (?, ?, ?)",
+                     (download_id, int(pid), _time.time()))
+        conn.commit()
+
+
+def unregister_runner(download_id: int, pid: int | None = None) -> None:
+    """Forget a runner. With `pid`, only that runner's entry: a restart of the
+    same download may already have recorded its new process."""
+    with _DL_LOCK, db.connect() as conn:
+        _init_runner_pids(conn)
+        if pid is None:
+            conn.execute("DELETE FROM runner_pids WHERE download_id = ?",
+                         (download_id,))
+        else:
+            conn.execute("DELETE FROM runner_pids WHERE download_id = ?"
+                         " AND pid = ?", (download_id, int(pid)))
+        conn.commit()
+
+
+def registered_runners() -> list[tuple[int, int]]:
+    """(download_id, pid) for every runner the last session left recorded."""
+    with _DL_LOCK, db.connect() as conn:
+        _init_runner_pids(conn)
+        rows = conn.execute("SELECT download_id, pid FROM runner_pids").fetchall()
+    return [(int(r[0]), int(r[1])) for r in rows]
+
+
+def clear_runner_registry() -> None:
+    with _DL_LOCK, db.connect() as conn:
+        _init_runner_pids(conn)
+        conn.execute("DELETE FROM runner_pids")
+        conn.commit()
+
+
 def _init_failed_grabs(conn) -> None:
     conn.execute("""
         CREATE TABLE IF NOT EXISTS failed_grabs (
@@ -329,34 +381,139 @@ def _init_failed_grabs(conn) -> None:
             PRIMARY KEY (context_key, magnet_hash)
         )
     """)
+    existing = {r[1] for r in conn.execute(
+        "PRAGMA table_info(failed_grabs)").fetchall()}
+    if "last_progress" not in existing:
+        conn.execute("ALTER TABLE failed_grabs ADD COLUMN last_progress REAL")
+    if "fail_count" not in existing:
+        conn.execute("ALTER TABLE failed_grabs ADD COLUMN"
+                     " fail_count INTEGER NOT NULL DEFAULT 1")
+        _backfill_fail_counts(conn)
 
 
-def record_failed_grab(context_key: str, magnet_hash: str) -> None:
+# Failures that are Sensarr's own fault (or the debrid service's), not the
+# release's. They must not push a good release onto a long cooldown: the
+# webtorrent port bug alone ("permission denied", 65 rows to 2026-10-09)
+# would otherwise have benched dozens of healthy torrents for 30-90 days.
+_APP_FAULT_MARKERS = (
+    "permission denied", "address already in use",
+    "couldn't start node runner", "dependencies are missing",
+    "real-debrid refused", "real-debrid failed", "deployment transition",
+    # ensure_runner_ready / engine setup, and qBittorrent client trouble
+    "npm was not found", "npm install", "couldn't run npm",
+    "runner script is missing", "qbittorrent",
+)
+
+
+def is_release_fault(error: str | None) -> bool:
+    """True when a download error says something about the RELEASE (stalled,
+    timed out, no usable files), False when it was the app or the service."""
+    text = (error or "").lower()
+    return not any(marker in text for marker in _APP_FAULT_MARKERS)
+
+
+def _failure_context_key(failure_key, show_id, season, episode,
+                         request_id) -> str | None:
+    """The context a failed release is remembered under (same rule as
+    _remember_failure, kept in one place so the backfill agrees with it)."""
+    if failure_key:
+        return failure_key
+    if show_id is not None and season is not None and episode is not None:
+        return f"ep:{show_id}:{season}:{episode}"
+    if request_id is not None:
+        return f"req:{request_id}"
+    return None
+
+
+def _backfill_fail_counts(conn, *, rebuild: bool = False) -> None:
+    """One-time: seed fail_count from the download history the moment the
+    column appears. Without it every release that already stalled three or
+    four times (Futurama S06, Re ZERO S04E04, Petals on the Wind weekly since
+    09-17) would start the escalation over at one."""
+    import calendar
+    import re as _re
+    import time as _time
+    import sqlite3 as _sqlite3
+    counts: dict[tuple[str, str], list] = {}
+    try:
+        history = conn.execute(
+            "SELECT magnet, failure_key, show_id, season, episode, request_id,"
+            " created_at, progress, error FROM downloads WHERE status = 'error'"
+            " ORDER BY id").fetchall()
+    except _sqlite3.OperationalError:
+        return  # no downloads table yet (fresh install): nothing to seed
+    for (magnet, failure_key, show_id, season, episode, request_id,
+         created_at, progress, error) in history:
+        if not is_release_fault(error):
+            continue
+        m = _re.search(r"btih:([A-Za-z0-9]{32,40})", magnet or "")
+        key = _failure_context_key(failure_key, show_id, season, episode,
+                                   request_id)
+        if not m or not key:
+            continue
+        try:
+            at = float(calendar.timegm(_time.strptime(
+                str(created_at)[:19], "%Y-%m-%d %H:%M:%S")))
+        except (TypeError, ValueError):
+            at = _time.time()
+        entry = counts.setdefault((key, m.group(1).lower()), [0, 0.0, None])
+        entry[0] += 1
+        entry[1] = max(entry[1], at)
+        entry[2] = progress
+    if rebuild:
+        # Repair mode: the history is the whole truth, replace what is there.
+        conn.execute("DELETE FROM failed_grabs")
+    for (key, ih), (n, at, progress) in counts.items():
+        conn.execute(
+            "INSERT INTO failed_grabs (context_key, magnet_hash, failed_at,"
+            " fail_count, last_progress) VALUES (?, ?, ?, ?, ?)"
+            " ON CONFLICT(context_key, magnet_hash) DO UPDATE SET"
+            " fail_count = MAX(fail_count, excluded.fail_count),"
+            " failed_at = MAX(failed_at, excluded.failed_at),"
+            " last_progress = excluded.last_progress",
+            (key, ih, at, n, progress))
+
+
+def record_failed_grab(context_key: str, magnet_hash: str,
+                       progress: float | None = None) -> None:
     """Remember that this release failed for this episode/request, so the
-    next retry prefers a different copy."""
+    next retry prefers a different copy. Repeat failures count up; the count
+    stretches the cooldown (see download_manager.failure_cooldown_seconds)."""
     import time as _time
     if not context_key or not magnet_hash:
         return
     with _DL_LOCK, db.connect() as conn:
         _init_failed_grabs(conn)
         conn.execute(
-            "INSERT INTO failed_grabs (context_key, magnet_hash, failed_at)"
-            " VALUES (?, ?, ?)"
+            "INSERT INTO failed_grabs (context_key, magnet_hash, failed_at,"
+            " fail_count, last_progress) VALUES (?, ?, ?, 1, ?)"
             " ON CONFLICT(context_key, magnet_hash)"
-            " DO UPDATE SET failed_at = excluded.failed_at",
-            (context_key, magnet_hash.lower(), _time.time()),
+            " DO UPDATE SET failed_at = excluded.failed_at,"
+            " fail_count = fail_count + 1,"
+            " last_progress = excluded.last_progress",
+            (context_key, magnet_hash.lower(), _time.time(), progress),
         )
         conn.commit()
 
 
 def failed_grab_times(context_key: str) -> dict[str, float]:
     """magnet_hash -> last failure timestamp for one episode/request key."""
+    return {h: info[0] for h, info in failed_grab_info(context_key).items()}
+
+
+def failed_grab_info(context_key: str
+                     ) -> dict[str, tuple[float, int, float | None]]:
+    """magnet_hash -> (last failure timestamp, failure count, progress at the
+    last failure) for one episode/request key."""
     with _DL_LOCK, db.connect() as conn:
         _init_failed_grabs(conn)
         rows = conn.execute(
-            "SELECT magnet_hash, failed_at FROM failed_grabs WHERE context_key = ?",
+            "SELECT magnet_hash, failed_at, fail_count, last_progress"
+            " FROM failed_grabs WHERE context_key = ?",
             (context_key,)).fetchall()
-    return {str(r[0]): float(r[1]) for r in rows}
+    return {str(r[0]): (float(r[1]), int(r[2] or 1),
+                        None if r[3] is None else float(r[3]))
+            for r in rows}
 
 
 def _ensure_deferral_columns(conn) -> None:
@@ -386,7 +543,16 @@ def check_grab_deferral(key: str, *, wait_hours: float = 24.0,
     with _DL_LOCK, db.connect() as conn:
         _ensure_deferral_columns(conn)
         row = conn.execute(
-            "SELECT first_seen FROM grab_deferrals WHERE key = ?", (key,)).fetchone()
+            "SELECT first_seen, reason FROM grab_deferrals WHERE key = ?",
+            (key,)).fetchone()
+        if (row is not None and reason and row[1] == OVERSIZE_DEFER_REASON
+                and reason != OVERSIZE_DEFER_REASON):
+            # A kept (aged) oversize hold must not swallow a different hold:
+            # when the oversized copies then turn out unseeded or gone, the
+            # new reason needs its own fresh clock, or reopen keeps the old
+            # row and the key is searched on every pass instead of every 6h.
+            conn.execute("DELETE FROM grab_deferrals WHERE key = ?", (key,))
+            row = None
         if row is None:
             next_at = (now + _dt.timedelta(hours=wait_hours)).isoformat()
             conn.execute(
@@ -500,6 +666,14 @@ def deferral_expired(detail: dict | None,
     except ValueError:
         return True
     return now >= when
+
+
+# Reason recorded on the routine-grab oversize cooldown. Two readers key off it:
+# DownloadManager._deferral_active and grab_queue.reopen_expired_deferrals. An
+# expired hold with THIS reason must survive both, because _oversize_gate reads
+# its age to decide "the day has passed, take the oversized release". Deleting
+# it hands the gate a blank slate and it starts a fresh day, forever.
+OVERSIZE_DEFER_REASON = "oversize: every result is >120% of the preferred size"
 
 
 def clear_grab_deferral(key: str) -> None:
@@ -696,7 +870,7 @@ def set_files(download_id: int, relative_paths: list[str]) -> None:
 def set_status(download_id: int, status: str, *, error: str | None = None,
                completed: bool = False) -> None:
     if status == "error":
-        _remember_failure(download_id)
+        _remember_failure(download_id, error)
     with _DL_LOCK, db.connect() as conn:
         if completed:
             conn.execute(
@@ -725,6 +899,10 @@ def request_grab_attempts(request_id: int) -> int:
     """How many grabs for this request have reached a terminal failure — a
     download that errored/cancelled, or one whose verify quarantined it. Drives
     the per-request attempt cap that stops the auto-grab retry loop."""
+    # Every terminal failure counts here, app-side ones included: this cap is
+    # the loop guard. (Not counting them was tried 2026-10-10 and reverted: a
+    # persistent setup fault such as missing npm would fail every grab
+    # instantly and reopen the request every pass, forever.)
     with _DL_LOCK, db.connect() as conn:
         row = conn.execute(
             "SELECT COUNT(*) FROM downloads WHERE request_id = ?"
@@ -762,24 +940,23 @@ def resolve_request_after_failed_grab(request_id: int | None) -> str | None:
     return None
 
 
-def _remember_failure(download_id: int) -> None:
+def _remember_failure(download_id: int, error: str | None = None) -> None:
     """On error: log the release's info-hash against its episode/request
-    context so retries prefer a different copy."""
+    context so retries prefer a different copy. Errors that were the app's or
+    the debrid service's fault are not held against the release."""
     import re as _re
+    if not is_release_fault(error):
+        return
     row = get_download(download_id)
     if row is None:
         return
     m = _re.search(r"btih:([A-Za-z0-9]{32,40})", row.magnet or "")
     if not m:
         return
-    key = getattr(row, "failure_key", None)
-    if not key:
-        if row.show_id is not None and row.season is not None and row.episode is not None:
-            key = f"ep:{row.show_id}:{row.season}:{row.episode}"
-        elif row.request_id is not None:
-            key = f"req:{row.request_id}"
+    key = _failure_context_key(getattr(row, "failure_key", None), row.show_id,
+                               row.season, row.episode, row.request_id)
     if key:
-        record_failed_grab(key, m.group(1))
+        record_failed_grab(key, m.group(1), progress=row.progress)
 
 
 def display_status(status: str, progress: float, *, error: str | None = None,
@@ -802,14 +979,23 @@ def display_status(status: str, progress: float, *, error: str | None = None,
             return "fetching metadata"
         if phase == "no_peers":
             return "no peers"
+        if phase == "debrid_remote":
+            return "on Real-Debrid"
+        if phase == "debrid":
+            return "downloading (Real-Debrid)"
         return "downloading"
     return status
 
 
 def set_progress(download_id: int, progress: float) -> None:
+    """Record progress and mark the row downloading, unless something else
+    already settled it (a late progress tick from a killed runner must not
+    resurrect a cancelled/stopped/failed/finished row)."""
     with _DL_LOCK, db.connect() as conn:
         conn.execute(
-            "UPDATE downloads SET progress = ?, status = 'downloading' WHERE id = ?",
+            "UPDATE downloads SET progress = ?, status = CASE WHEN status IN"
+            " ('cancelled', 'stopped', 'error', 'downloaded', 'moved')"
+            " THEN status ELSE 'downloading' END WHERE id = ?",
             (progress, download_id),
         )
         conn.commit()
@@ -1433,6 +1619,29 @@ def add_download_file(download_id: int, *, source_relative_path: str | None,
              verification_state, verification_reason, moved_at))
         conn.commit()
         return int(cursor.lastrowid or 0)
+
+
+def placed_copies(rel_paths: list[str], *, exclude_download: int) -> list[DownloadFileRow]:
+    """download_files rows of OTHER downloads that placed one of these exact
+    staged paths (compared without regard to slash direction or case) and
+    whose placed file is still on disk."""
+    from pathlib import Path as _Path
+    wanted = {p.replace("\\", "/").casefold() for p in rel_paths if p}
+    if not wanted:
+        return []
+    with _DL_LOCK, db.connect() as conn:
+        rows = conn.execute(
+            f"SELECT {_DOWNLOAD_FILE_COLS} FROM download_files"
+            " WHERE download_id != ? AND final_path IS NOT NULL"
+            " AND verification_state IN ('verified', 'duplicate')",
+            (exclude_download,)).fetchall()
+    out = []
+    for r in rows:
+        f = _row_to_download_file(r)
+        rel = (f.source_relative_path or "").replace("\\", "/").casefold()
+        if rel in wanted and _Path(f.final_path).is_file():
+            out.append(f)
+    return out
 
 
 def _row_to_download_file(r) -> DownloadFileRow:

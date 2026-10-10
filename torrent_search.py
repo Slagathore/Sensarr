@@ -35,9 +35,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import config
+import torrentio
 
 logger = logging.getLogger(__name__)
 
@@ -106,8 +107,17 @@ class TorrentResult:
     magnet: str
     size_bytes: int
     seeders: int
-    source: str        # "yts" | "tpb" | "nyaa" | "sukebei"
+    source: str        # "yts" | "tpb" | "nyaa" | "sukebei" | "torrentio"
     media_type: str
+    # Torrentio only: the one file this result is about inside a multi-file
+    # torrent (a season pack offered for a single episode), so the engines
+    # fetch that file instead of the whole pack. size_bytes is THAT file's.
+    file_idx: int | None = None
+    file_name: str | None = None
+    # True when Real-Debrid already holds the payload (instant download).
+    cached: bool | None = None
+    # Provider audio/language tags ("Dual Audio", flag emoji) the name may lack.
+    audio_tags: tuple = ()
 
 
 def _http_get(url: str) -> bytes:
@@ -391,6 +401,148 @@ _TPB_DEFAULT_CATEGORIES = ("200",)
 _TPB_PAGE_CAP = 100
 
 
+# ---------------------------------------------------------------------------
+# Torrentio — ID-keyed (IMDb), aggregates TPB/1337x/TGx/EZTV/YTS/Nyaa/...
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class TorrentioTarget:
+    """What to ask Torrentio for: a movie, or one episode of a series."""
+    imdb_id: str
+    kind: str                  # "movie" | "series"
+    season: int | None = None
+    episode: int | None = None
+
+
+_EPISODE_MARK_RE = re.compile(
+    r"(?i)(?<![a-z0-9])(s\d{1,2}e\d{1,3}|\d{1,2}x\d{2,3})(?![0-9])")
+_YEAR_RE = re.compile(r"(?<!\d)(19|20)\d{2}(?!\d)")
+
+
+def _torrent_flags_matter(torrent_name: str) -> bool:
+    """True when the torrent's own name carries a red flag the inner file name
+    may not: a CAM marker or a non-English language tag. Then the torrent name
+    is what the gates must judge ("Movie.2024.HDCAM-XYZ/Movie.2024.mkv")."""
+    try:
+        import rtn_compat
+        import video_quality
+        if video_quality.is_cam_release(torrent_name):
+            return True
+        parsed, _reason = rtn_compat.parse_release(torrent_name)
+        languages = {str(c).lower() for c in (getattr(parsed, "languages", None) or ())}
+        return bool(languages - {"en"})
+    except Exception:
+        return False
+
+
+def _torrentio_title(stream: "torrentio.TorrentioStream") -> str:
+    """The name the selector should judge. For a file inside a multi-file
+    torrent that is the FILE's name when it identifies itself (show name plus
+    an episode marker, or a movie title plus year); otherwise the torrent's."""
+    if stream.file_path and stream.file_name and not _torrent_flags_matter(
+            stream.torrent_name):
+        stem = stream.file_name.rsplit(".", 1)[0]
+        mark = _EPISODE_MARK_RE.search(stem)
+        if mark and re.search(r"[A-Za-z]{3,}", stem[:mark.start()]):
+            return stream.file_name
+        if not mark and _YEAR_RE.search(stem) and re.search(r"[A-Za-z]{3,}", stem):
+            return stream.file_name
+    return stream.torrent_name
+
+
+# Torrentio aggregates 25 sites. For everything but anime, English is the
+# language that matters, so the foreign-language sites (Russian, Brazilian,
+# Spanish, Italian, French) stay out of the pool instead of feeding it dubs.
+# Anime adds the anime trackers. Cams, screeners and 3D are filtered at the
+# source. No limit and no sort: Sensarr's selector ranks the full pool itself.
+# TORRENTIO_OPTIONS (raw "key=value|key=value") overrides all of this.
+_TORRENTIO_GENERAL = ("yts", "eztv", "rarbg", "1337x", "ext", "thepiratebay",
+                      "kickasstorrents", "torrentgalaxy", "magnetdl")
+_TORRENTIO_ANIME = ("nyaasi", "horriblesubs", "tokyotosho", "anidex", "nekobt")
+_TORRENTIO_EXCLUDED_QUALITIES = ("threed", "scr", "cam")
+
+
+def torrentio_options(media_type: str) -> dict:
+    """The Torrentio config segment for one media type, as a dict."""
+    raw = (getattr(config, "TORRENTIO_OPTIONS", "") or "").strip()
+    if raw:
+        opts = {}
+        for part in raw.split("|"):
+            key, _, value = part.partition("=")
+            if key.strip() and value.strip():
+                opts[key.strip()] = value.strip()
+        return opts
+    providers = _TORRENTIO_GENERAL + (
+        _TORRENTIO_ANIME if media_type in ("anime", "xanime") else ())
+    return {"providers": ",".join(providers),
+            "qualityfilter": ",".join(_TORRENTIO_EXCLUDED_QUALITIES)}
+
+
+def debrid_cache_key() -> str | None:
+    """The Real-Debrid token to send Torrentio for cached-release tagging, or
+    None. Only when RD will actually be the download engine (qBittorrent off):
+    a 'cached' tag lets a 0-seed release past the seeder floor, which is only
+    true for a release Real-Debrid is going to fetch."""
+    if (config.REALDEBRID_API_TOKEN and config.REALDEBRID_CACHE_CHECK
+            and not config.QBITTORRENT_ENABLED):
+        return config.REALDEBRID_API_TOKEN
+    return None
+
+
+def search_torrentio(target: TorrentioTarget | None,
+                     media_type: str) -> list[TorrentResult]:
+    """Releases Torrentio knows for exactly this movie/episode. [] when off,
+    unknown, or the provider circuit is open."""
+    if target is None or not target.imdb_id or not config.TORRENTIO_ENABLED:
+        return []
+    if not _provider_available("torrentio"):
+        logger.debug("Torrentio circuit open; skipping %s.", target.imdb_id)
+        return []
+    key = debrid_cache_key()
+    try:
+        streams = torrentio.search(
+            target.imdb_id, target.kind, season=target.season,
+            episode=target.episode, base=config.TORRENTIO_BASE_URL,
+            options=torrentio_options(media_type), debrid_key=key)
+    except torrentio.TorrentioError as exc:
+        _record_provider_failure("torrentio", exc)
+        return []
+    except ValueError as exc:
+        logger.debug("Torrentio target unusable (%s): %s", target, exc)
+        return []
+    _record_provider_success("torrentio")
+    results = []
+    for stream in streams:
+        if stream.size_bytes <= 0 and stream.cached is not True:
+            continue
+        in_pack = bool(stream.file_path)
+        results.append(TorrentResult(
+            title=_torrentio_title(stream),
+            magnet=torrentio.magnet_for(stream, _TRACKERS),
+            size_bytes=stream.size_bytes, seeders=stream.seeders,
+            source="torrentio", media_type=media_type,
+            file_idx=stream.file_idx if in_pack else None,
+            file_name=stream.file_name if in_pack else None,
+            cached=stream.cached,
+            audio_tags=tuple(stream.audio_tags) + tuple(stream.language_flags)))
+    return results
+
+
+def _torrentio_is_enough(results: list[TorrentResult], media_type: str) -> bool:
+    """Skip the text providers when Torrentio already answered well: saves the
+    apibay calls that kept tripping its rate limit. Anime still asks Nyaa (new
+    fansub releases land there first)."""
+    if media_type in ("anime", "xanime") or not results:
+        return False
+    floor = max(1, int(config.MIN_SEEDERS))
+    distinct = {_infohash(r.magnet) or r.title.casefold() for r in results}
+    # Enough copies to choose between, and at least one that can actually be
+    # fetched (seeded past the floor, or already cached on Real-Debrid). A
+    # single cached result is not a pool: it may be a CAM the gates reject.
+    return (len(distinct) >= _ENOUGH_RESULTS
+            and any(r.seeders >= floor or r.cached for r in results))
+
+
 def tpb_categories(media_type: str) -> tuple[str, ...]:
     """The TPB category ids to search for a media type."""
     return _TPB_CATEGORIES.get(media_type, _TPB_DEFAULT_CATEGORIES)
@@ -669,7 +821,9 @@ class CollectedPool:
 
 
 def search_collect(query: str, media_type: str, *,
-                   per_source: int = 50) -> CollectedPool:
+                   per_source: int = 50,
+                   torrentio_target: TorrentioTarget | None = None
+                   ) -> CollectedPool:
     """Gather wide per-source pools (30-50 each), normalize, and dedupe by
     info-hash WITHOUT any global seeder truncation. This is what every automatic
     path uses instead of search_torrents (section 4 item 1). Per-source pool
@@ -684,6 +838,11 @@ def search_collect(query: str, media_type: str, *,
         return CollectedPool(results=tuple(),
                              pool_stats={"per_source": {}, "collected": 0,
                                          "deduped": 0, "duplicates_removed": 0})
+
+    # ID-keyed first: Torrentio answers for exactly this movie/episode. When
+    # that pool is already good enough the text providers are not asked.
+    torrentio_results = search_torrentio(torrentio_target, media_type)
+    skip_text = _torrentio_is_enough(torrentio_results, media_type)
 
     # The spelling ladder runs here, so every automatic caller gets the
     # punctuation-free / distinctive-word / translated retries for free.
@@ -700,8 +859,14 @@ def search_collect(query: str, media_type: str, *,
         return [("tpb", search_tpb(variant, media_type,
                                    limit=per_source, collect=True))]
 
-    per_source_results, contributed, variants_tried = _ladder(
-        query, media_type, per_source=per_source, collect=True, fetch=fetch)
+    if skip_text:
+        per_source_results, contributed, variants_tried = [], [], ()
+    else:
+        per_source_results, contributed, variants_tried = _ladder(
+            query, media_type, per_source=per_source, collect=True, fetch=fetch)
+    if torrentio_target is not None:
+        per_source_results = [("torrentio", torrentio_results),
+                              *per_source_results]
     used_query = ", ".join(contributed) if contributed else query
 
     per_source_stats: dict = {}
@@ -712,6 +877,8 @@ def search_collect(query: str, media_type: str, *,
 
     # Dedupe by info-hash. On a collision keep the copy reporting more seeders
     # (better swarm health for the identical payload); order is otherwise stable.
+    # A Torrentio copy always survives (it knows the exact file inside a pack
+    # and whether it is debrid-cached) but takes the higher seeder count.
     seen: dict[str, int] = {}
     deduped: list[TorrentResult] = []
     for r in collected:
@@ -719,7 +886,11 @@ def search_collect(query: str, media_type: str, *,
         key = ih or f"__noihash__{len(deduped)}"
         if key in seen:
             idx = seen[key]
-            if r.seeders > deduped[idx].seeders:
+            kept = deduped[idx]
+            if "torrentio" in (kept.source, r.source):
+                base = kept if kept.source == "torrentio" else r
+                deduped[idx] = replace(base, seeders=max(kept.seeders, r.seeders))
+            elif r.seeders > kept.seeders:
                 deduped[idx] = r
             continue
         seen[key] = len(deduped)
@@ -735,6 +906,7 @@ def search_collect(query: str, media_type: str, *,
         # Which spelling actually answered, and everything tried on the way.
         "query_used": used_query,
         "query_variants_tried": list(variants_tried),
+        "text_search_skipped": skip_text,
     }
     return CollectedPool(results=tuple(deduped), pool_stats=stats)
 

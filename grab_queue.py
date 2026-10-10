@@ -449,7 +449,14 @@ def reopen_expired_deferrals() -> list[int]:
         detail = downloads_store.get_grab_deferral(f"req:{req.request_id}")
         if downloads_store.deferral_expired(detail):
             queue_store.set_status(req.request_id, queue_store.STATUS_OPEN)
-            downloads_store.clear_grab_deferral(f"req:{req.request_id}")
+            # An expired OVERSIZE hold stays: the grab pass reads its age to
+            # take the oversized release now that the day has passed. Clearing
+            # it here made every movie whose only copies run large (The Love
+            # Hypothesis, Sweetheart, Feast, Sea Fever, Jesus Christ Vampire
+            # Hunter) wait a fresh day, every day, from early September on.
+            if ((detail or {}).get("reason") or ""
+                    ) != downloads_store.OVERSIZE_DEFER_REASON:
+                downloads_store.clear_grab_deferral(f"req:{req.request_id}")
             reopened.append(req.request_id)
     if reopened:
         logger.info("Grab queue: reopened %d expired deferral(s): %s",

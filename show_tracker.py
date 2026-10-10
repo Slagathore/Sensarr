@@ -832,14 +832,18 @@ def plan_for_episode(
          sibling style.
     Only a show with no mapped folders at all falls back to staging.
     """
-    new_filename = torrent_routing.sanitize_for_filesystem(
-        f"{show.title} - S{season:02d}E{episode:02d}"
-    )
+    def stem(season_dir: str | None, show_folder: str | None) -> str:
+        base = torrent_routing.episode_name_base(show.title, show_folder,
+                                                 season_dir)
+        return f"{base} - S{season:02d}E{episode:02d}"
 
     target = shows_store.get_season_target(show.show_id, season)
     if target:
         return torrent_routing.RoutePlan(
-            confident=True, dest_dir=target, new_filename=new_filename,
+            confident=True, dest_dir=target,
+            # A season target can sit anywhere, so its parent is no show
+            # name: follow the files already in it, else the show title.
+            new_filename=stem(target, None),
             season_folder=None, show_folder=None,
             reason=f"season target rule for '{show.title}' S{season}",
         )
@@ -860,7 +864,7 @@ def plan_for_episode(
     return torrent_routing.RoutePlan(
         confident=True,
         dest_dir=str(Path(folder) / season_name),
-        new_filename=new_filename,
+        new_filename=stem(str(Path(folder) / season_name), folder),
         show_folder=folder, season_folder=season_name,
         reason=f"tracked show '{show.title}' → {Path(folder).name}/{season_name}",
     )

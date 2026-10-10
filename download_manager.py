@@ -48,7 +48,8 @@ import torrent_select
 import verification
 from media_identity import MediaIdentity
 from queue_store import get_request, list_requests
-from torrent_search import TorrentResult, search_collect, search_torrents
+from torrent_search import (TorrentioTarget, TorrentResult, search_collect,
+                            search_torrents)
 from torrent_select import SelectWant
 
 logger = logging.getLogger(__name__)
@@ -211,11 +212,112 @@ def _size_prefs(media_type: str) -> tuple[float, float, int]:
 # after this long — unless it's the only option, in which case the least-
 # recently-failed one goes first (rotating through copies across passes).
 FAILED_GRAB_RETRY_AFTER_S = 7 * 24 * 3600
+# Repeat failures stretch the cooldown: 7 days after the first, 30 after the
+# second, 90 from the third on. A flat week brought the same dead torrents
+# back every Thursday (Petals on the Wind 09-17/09-24/10-01, a Panty & Stocking
+# release ten times), each one burning a slot for 15 minutes.
+_FAILURE_COOLDOWN_DAYS = (7, 30, 90)
+# A copy that got at least this far before stalling had a live swarm and a
+# partial on disk to resume, so it keeps the short first-failure cooldown.
+_FAILURE_RESUMABLE_PROGRESS = 0.5
+
+
+def failure_cooldown_seconds(fail_count: int,
+                             last_progress: float | None = None) -> float:
+    """How long a release stays out of the pool after its latest failure."""
+    if last_progress is not None and last_progress >= _FAILURE_RESUMABLE_PROGRESS:
+        return FAILED_GRAB_RETRY_AFTER_S
+    idx = max(0, min(int(fail_count or 1), len(_FAILURE_COOLDOWN_DAYS)) - 1)
+    return _FAILURE_COOLDOWN_DAYS[idx] * 24 * 3600.0
+
+# Reason recorded on the routine-grab oversize cooldown. _deferral_active
+# keys off it: an expired hold with THIS reason is left in place so the gate
+# can read its age and take the oversized release after the day has passed.
+# Defined in downloads_store so grab_queue can honour it without importing us.
+OVERSIZE_DEFER_REASON = downloads_store.OVERSIZE_DEFER_REASON
 
 # Multipart movie disc markers ("Movie.cd1.mkv", "Film Part 2", "disc-01").
 _MULTIPART_RE = re.compile(
     r"(?:^|[\W_])(?:cd|dvd|disc|disk|part|pt)[\s._-]*(\d{1,2})(?:[\W_]|$)",
     re.IGNORECASE)
+
+
+def _file_pin(want_json: str | None) -> tuple[str | None, int | None]:
+    """(file_name, file_idx) a download is pinned to inside its torrent, or
+    (None, None) for a whole-torrent / episode-filtered download."""
+    try:
+        want = json.loads(want_json or "{}")
+    except (TypeError, ValueError):
+        return (None, None)
+    if not isinstance(want, dict):
+        return (None, None)
+    return (want.get("file_name"), want.get("file_idx"))
+
+
+# An existing library file counts as a complete copy of a staged download when
+# it plays at least this share of the staged file's runtime.
+_COMPLETE_COPY_RUNTIME_SHARE = 0.9
+
+
+def _library_copy_is_complete(existing: Path, staged: Path) -> bool:
+    """True when ffprobe says the file already in the library is a full-length
+    copy of what was just downloaded. Anything unknown (no ffprobe, unreadable
+    file) is False, so the old refuse-and-wait behaviour stands."""
+    import video_quality
+    try:
+        have_min, have_exact = video_quality.duration_minutes(
+            str(existing), existing.stat().st_size)
+        got_min, got_exact = video_quality.duration_minutes(
+            str(staged), staged.stat().st_size)
+    except Exception:
+        return False
+    if not (have_exact and got_exact) or got_min <= 0:
+        return False
+    if have_min < got_min * _COMPLETE_COPY_RUNTIME_SHARE:
+        return False
+    # The runtime above comes from the container header, which a truncated
+    # copy (an interrupted hand copy) still carries in full. Only a file with
+    # real video near its claimed end is complete.
+    return _plays_to_the_end(existing, have_min)
+
+
+def _plays_to_the_end(path: Path, minutes: float) -> bool:
+    """True when ffprobe finds video packets in the last stretch of the
+    file's claimed runtime. Unknown (no ffprobe, error, timeout) is False."""
+    import video_quality
+    ffprobe = video_quality._find_ffprobe()
+    if ffprobe is None or minutes <= 0:
+        return False
+    start = max(0.0, minutes * 60.0 - 45.0)
+    try:
+        out = subprocess.run(
+            [ffprobe, "-v", "error", "-select_streams", "v:0",
+             "-read_intervals", f"{start:.0f}%+20",
+             "-show_entries", "packet=pts_time", "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=60,
+            creationflags=_CREATE_NO_WINDOW)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    for line in out.stdout.splitlines():
+        try:
+            if float(line.strip().strip(",")) >= start - 60.0:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _send_to_recycle_bin(path: Path) -> bool:
+    """Recycle a file; False (file untouched) when the recycle bin is not
+    available. Duplicate cleanup never falls back to a permanent delete."""
+    try:
+        from send2trash import send2trash
+        send2trash(str(path))
+        return True
+    except Exception:
+        logger.warning("Could not recycle %s; leaving it in place.", path,
+                       exc_info=True)
+        return False
 
 
 def _magnet_hash(magnet: str) -> str:
@@ -525,6 +627,15 @@ def _build_want_snapshot(
         "size_pref_mb_min": pref,
         "size_max_rate": max_rate,
         "runtime_minutes": minutes,
+        # Torrentio pins the one file this grab is about inside a pack; both
+        # engines read these back so a single episode never pulls the pack.
+        "file_idx": getattr(result, "file_idx", None),
+        "file_name": getattr(result, "file_name", None),
+        # Whether Real-Debrid already had it, and the swarm size at grab time:
+        # a cached release picked past the seeder floor must not fall back to
+        # the torrent client, where it would only stall.
+        "debrid_cached": getattr(result, "cached", None),
+        "seeders": getattr(result, "seeders", None),
     }
 
 
@@ -600,16 +711,25 @@ def _request_title_from_row(row) -> str | None:
     if want_json:
         try:
             want = json.loads(want_json)
-            title = want.get("search_alias") or want.get("canonical_title")
+            if want.get("request_id") is not None:
+                title = want.get("search_alias") or want.get("canonical_title")
+            else:
+                # No request: search_alias is just the torrent's own name (a
+                # manual grab), which routing must not treat as a show title.
+                title = want.get("canonical_title")
             if title:
                 return title
+            if row.request_id is None:
+                return None
         except (ValueError, TypeError):
             pass
     if row.request_id is not None:
         req = get_request(row.request_id)
         if req is not None:
             return _ascii_preferring_title(req.resolved_title, req.content)
-    return row.title
+        return row.title
+    # No request and no snapshot: the torrent's own name is no show title.
+    return None
 
 
 def pick_best_result(results: list[TorrentResult], media_type: str,
@@ -806,6 +926,57 @@ class ManualGrabOutcome:
     needs_override: bool
 
 
+class _DebridHandle:
+    """Stands in for a runner Popen while a Real-Debrid download thread runs,
+    so the queue pump (slot count), stall rotation, cancel/stop and shutdown
+    all treat both engines the same: poll() is None while running, kill()
+    asks the thread to stop at its next poll or chunk."""
+
+    def __init__(self) -> None:
+        self._cancel = threading.Event()
+        # Held while a progress write is in flight, so a kill() cannot land
+        # between "not cancelled" and the write (set_progress would flip a
+        # just-requeued or cancelled row back to 'downloading').
+        self.lock = threading.Lock()
+        self.returncode: int | None = None
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def kill(self) -> None:
+        with self.lock:
+            self._cancel.set()
+
+    def cancelled(self) -> bool:
+        return self._cancel.is_set()
+
+
+_EPISODE_IN_PATH_RE = re.compile(
+    r"(?i)(?:^|\D)s(\d{1,2})[ ._-]*e(\d{1,3})(?:\D|$)|(?:^|\D)(\d{1,2})x(\d{1,3})(?:\D|$)")
+
+
+def _debrid_episode_chooser(season: int | None, episode: int | None):
+    """File pick for a Real-Debrid torrent with no pinned file: the files that
+    carry the wanted SxxEyy (same rule the webtorrent runner applies), or []
+    to let realdebrid.choose_files take every video."""
+    if episode is None:
+        return None
+
+    def choose(files: list[dict]) -> list[int]:
+        hits = []
+        for f in files:
+            path = str(f.get("path", ""))
+            m = _EPISODE_IN_PATH_RE.search(path)
+            if not m:
+                continue
+            s_num = int(m.group(1) or m.group(3))
+            e_num = int(m.group(2) or m.group(4))
+            if e_num == int(episode) and (season is None or s_num == int(season)):
+                hits.append(f["id"])
+        return hits
+    return choose
+
+
 class DownloadManager:
     """Owns runner subprocesses and post-processing. One instance per app."""
 
@@ -820,7 +991,9 @@ class DownloadManager:
         # on_update(download_id) is called (from worker threads!) whenever a
         # download's row changed — the desktop app marshals it to the UI.
         self._on_update = on_update
-        self._processes: dict[int, subprocess.Popen] = {}
+        # Live runner per download: a node Popen, or a _DebridHandle while a
+        # Real-Debrid thread runs (same poll()/kill() surface).
+        self._processes: dict[int, Any] = {}
         # download_id → qBittorrent tag, for cancel when delegating to qBit.
         self._qbit_tags: dict[int, str] = {}
         self._lock = threading.Lock()
@@ -844,6 +1017,13 @@ class DownloadManager:
         # instead of looping forever with no way to tell it to quit.
         self._stop_event = threading.Event()
         self._monitor_thread: threading.Thread | None = None
+        # Monotonic time of the next daily staging sweep (None = not scheduled).
+        self._next_sweep_at: float | None = None
+        # Downloads this manager killed on purpose (rotation, cancel, stop,
+        # shutdown). Their runner thread must not write progress or an error
+        # afterwards: a late tick flipped a requeued row to 'downloading' and
+        # the thread then recorded "runner exit code" against the release.
+        self._stopped_by_owner: set[int] = set()
         downloads_store.initialize_downloads_db()
         self._recover_previous_session()
         if self._QUEUE_MONITOR_AUTOSTART:
@@ -934,7 +1114,24 @@ class DownloadManager:
         # that is already fetching it and hang this request's bookkeeping off
         # that one instead. (A manual Gulliver's Travels grab and the request's
         # own auto-grab both sat at 0.7% for ten hours doing exactly this.)
-        existing = presence_ledger.live_download_for(result.magnet)
+        pin = (getattr(result, "file_name", None),
+               getattr(result, "file_idx", None))
+        our_season = episode_context[1] if episode_context is not None else season
+        existing = None
+        for live in presence_ledger.live_downloads_for(result.magnet):
+            live_pin = _file_pin(live.want_json)
+            if live_pin == pin:
+                existing = live
+                break
+            # A whole-pack download (no pin, no single-episode filter, same or
+            # no season filter) already brings the file a pinned pick wants.
+            # A download pinned to ANOTHER file of the pack does not: riding
+            # along on E05 would leave E06 linked to it forever.
+            if (pin != (None, None) and live_pin == (None, None)
+                    and live.episode is None
+                    and (live.season is None or live.season == our_season)):
+                existing = live
+                break
         if existing is not None:
             logger.info(
                 "Grab: download #%s is already fetching %s — linking to it "
@@ -1091,7 +1288,7 @@ class DownloadManager:
         for download_id, proc in procs.items():
             try:
                 if proc.poll() is None:
-                    proc.kill()
+                    self._owner_kill(download_id, proc)
                     downloads_store.set_status(download_id, "queued")
                     downloads_store.add_history(
                         download_id, "requeued",
@@ -1116,17 +1313,34 @@ class DownloadManager:
         try:
             import psutil
             runner_marker = _RUNNER_PATH.name  # download.mjs
-            for proc in psutil.process_iter(["name", "cmdline"]):
+
+            def _ours(proc) -> bool:
+                cmdline = " ".join(proc.cmdline() or [])
+                return runner_marker in cmdline and str(
+                    Path(config.TORRENT_DOWNLOAD_DIR)) in cmdline
+
+            # Recorded PIDs first: exact, and fast however many processes the
+            # machine runs. The cmdline check guards against a reused PID.
+            for _download_id, pid in downloads_store.registered_runners():
                 try:
-                    if (proc.info["name"] or "").lower() not in ("node.exe", "node"):
-                        continue
-                    cmdline = " ".join(proc.info["cmdline"] or [])
-                    if runner_marker in cmdline and str(
-                            Path(config.TORRENT_DOWNLOAD_DIR)) in cmdline:
+                    proc = psutil.Process(pid)
+                    if _ours(proc):
                         proc.kill()
                         killed += 1
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     continue
+            downloads_store.clear_runner_registry()
+            if sys.platform != "win32":
+                # Elsewhere a full scan is cheap, and catches runners started
+                # before the registry existed.
+                for proc in psutil.process_iter(["name"]):
+                    try:
+                        if ((proc.info["name"] or "").lower() in ("node", "node.exe")
+                                and _ours(proc)):
+                            proc.kill()
+                            killed += 1
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        continue
         except Exception:
             logger.exception("Orphan runner sweep failed.")
         if killed:
@@ -1231,6 +1445,29 @@ class DownloadManager:
                 self._queue_monitor_pass()
             except Exception:
                 logger.exception("Download queue monitor pass failed.")
+            try:
+                self._maybe_sweep_staging()
+            except Exception:
+                logger.exception("Staging sweep failed.")
+
+    # First sweep ten minutes after launch (recovery has requeued whatever it
+    # will resume by then), then once a day.
+    _SWEEP_FIRST_DELAY_S = 10 * 60
+    _SWEEP_INTERVAL_S = 24 * 3600
+
+    def _maybe_sweep_staging(self, now: float | None = None) -> None:
+        """Daily: drop partial files stalled/cancelled downloads left behind
+        (staging_sweep.py keeps the resumable ones)."""
+        if not config.STAGING_SWEEP_ENABLED:
+            return
+        now = time.monotonic() if now is None else now
+        if self._next_sweep_at is None:
+            self._next_sweep_at = now + self._SWEEP_FIRST_DELAY_S
+        if now < self._next_sweep_at:
+            return
+        self._next_sweep_at = now + self._SWEEP_INTERVAL_S
+        import staging_sweep
+        staging_sweep.sweep_stalled_leftovers()
 
     def _queue_monitor_pass(self) -> None:
         """One monitor tick: find no-progress downloads and rotate them, or —
@@ -1274,6 +1511,11 @@ class DownloadManager:
                 self._rotate_or_stall(row, stale_s, now)
         self._maybe_start_next()
 
+    def _owner_kill(self, download_id: int, proc) -> None:
+        """Kill a runner because WE decided to (see _stopped_by_owner)."""
+        self._stopped_by_owner.add(download_id)
+        proc.kill()
+
     def _rotate_or_stall(self, row: downloads_store.DownloadRow,
                          stale_s: float, now: float) -> None:
         """A download made no progress for a full window. Requeue it, or — once
@@ -1285,7 +1527,7 @@ class DownloadManager:
         with self._lock:
             proc = self._processes.get(row.download_id)
         if proc is not None and proc.poll() is None:
-            proc.kill()
+            self._owner_kill(row.download_id, proc)
         if count >= config.DOWNLOAD_MAX_ROTATIONS:
             reason = (f"stalled: no progress after {count} rotations "
                       f"({stale_s / 60:.0f} min idle)")
@@ -1352,7 +1594,7 @@ class DownloadManager:
                 return False
             # Still waiting in the queue — cancelling is just a status flip.
         else:
-            proc.kill()
+            self._owner_kill(download_id, proc)
         downloads_store.set_status(download_id, "cancelled", completed=True)
         downloads_store.add_history(download_id, "cancelled", before=None, after=None)
         self._notify(download_id)
@@ -1377,7 +1619,7 @@ class DownloadManager:
             except Exception as exc:
                 return f"qBittorrent pause failed: {exc}"
         elif proc is not None and proc.poll() is None:
-            proc.kill()
+            self._owner_kill(download_id, proc)
         else:
             return "not running"
         downloads_store.set_status(download_id, "stopped")
@@ -1513,8 +1755,7 @@ class DownloadManager:
         # candidate_stats/selection_run_id (the run row does not exist yet at
         # gate time); the blocked-candidate deferral path carries both.
         if not DownloadManager._defer_for_retry(
-                key, hours=24.0,
-                reason="oversize: every result is >120% of the preferred size"):
+                key, hours=24.0, reason=OVERSIZE_DEFER_REASON):
             logger.info("Oversize deferral expired for %s — proceeding.", key)
             return True
         logger.info("Only oversized results for %s (>120%% of preference) — "
@@ -1528,7 +1769,15 @@ class DownloadManager:
         if detail is None:
             return False
         if downloads_store.deferral_expired(detail):
-            downloads_store.clear_grab_deferral(key)
+            # An expired OVERSIZE hold stays put on purpose: _oversize_gate
+            # reads its age to decide "the day has passed, take the oversized
+            # release" and clears it itself. Deleting it here handed the gate
+            # a blank slate every pass, so it wrote a fresh 24h hold each day
+            # and an episode whose only releases run large was never grabbed
+            # (Chainsmoker Cat S01E09, 2026-09-04..10). Every other expired
+            # hold is still swept so the next pass records a fresh bounded one.
+            if (detail.get("reason") or "") != OVERSIZE_DEFER_REASON:
+                downloads_store.clear_grab_deferral(key)
             return False
         logger.info("%s is deferred until %s (%s) — skipping provider search.",
                     key, detail.get("next_attempt_at"), detail.get("reason"))
@@ -1670,6 +1919,52 @@ class DownloadManager:
         return best if best_score >= 0.85 else None
 
     @staticmethod
+    def _torrentio_target_for_episode(show: shows_store.TrackedShow,
+                                      season: int, episode: int
+                                      ) -> TorrentioTarget | None:
+        """The IMDb-keyed Torrentio query for one tracked episode, or None when
+        Torrentio is off or the show has no IMDb id we can find."""
+        if not config.TORRENTIO_ENABLED:
+            return None
+        imdb = None
+        try:
+            if show.source == "anidb":
+                import anime_db
+                mapping = anime_db.mapping_for_anidb(show.external_id) or {}
+                imdb = mapping.get("imdb_id")
+            if not imdb and show.tmdb_id:
+                import media_lookup
+                imdb = media_lookup.get_imdb_id("tv", show.tmdb_id)
+        except Exception:
+            logger.debug("IMDb lookup failed for show #%s", show.show_id,
+                         exc_info=True)
+            return None
+        if not imdb:
+            return None
+        return TorrentioTarget(imdb_id=str(imdb), kind="series",
+                               season=int(season), episode=int(episode))
+
+    @staticmethod
+    def _torrentio_target_for_movie_request(req) -> TorrentioTarget | None:
+        """The IMDb-keyed Torrentio query for a movie request, or None."""
+        if not config.TORRENTIO_ENABLED or req is None:
+            return None
+        source = getattr(req, "identity_source", None)
+        ext = str(getattr(req, "external_id", "") or "").strip()
+        imdb = None
+        try:
+            if source == "omdb" and ext.startswith("tt"):
+                imdb = ext
+            elif source == "tmdb" and ext:
+                import media_lookup
+                imdb = media_lookup.get_imdb_id("movie", ext)
+        except Exception:
+            logger.debug("IMDb lookup failed for request #%s",
+                         getattr(req, "request_id", "?"), exc_info=True)
+            return None
+        return TorrentioTarget(imdb_id=imdb, kind="movie") if imdb else None
+
+    @staticmethod
     def _tracked_show_for_request(req) -> shows_store.TrackedShow | None:
         """Resolve (upserting if new) the tracked show a request-linked TV grab
         routes through — by IDENTITY (source, external_id), never fuzzy title
@@ -1711,11 +2006,12 @@ class DownloadManager:
         penalised — so a release that is the only remaining option can still
         win.
         """
-        fails = downloads_store.failed_grab_times(context_key)
+        fails = downloads_store.failed_grab_info(context_key)
         if not fails:
             return set()
-        cutoff = time.time() - FAILED_GRAB_RETRY_AFTER_S
-        return {h for h, t in fails.items() if t >= cutoff}
+        now = time.time()
+        return {h for h, (at, count, progress) in fails.items()
+                if at >= now - failure_cooldown_seconds(count, progress)}
 
     def _blocklist_for(self, want: SelectWant):
         """Subject-scoped blocklist input for the selector (Task C item 2).
@@ -1950,6 +2246,36 @@ class DownloadManager:
             download_id, force_move=True, force_rename=True,
             request_title=_row_search_alias(new_req))
         return f"adopted: {outcome}"
+
+    @staticmethod
+    def _placed_by_another_download(row) -> list:
+        """Every staged VIDEO this download expected was already placed by
+        another download (same relative staging path). [] otherwise."""
+        try:
+            manifest = json.loads(row.files_json or "[]")
+        except (TypeError, ValueError):
+            return []
+        videos = [p for p in manifest if isinstance(p, str)
+                  and Path(p).suffix.lower() in torrent_routing.VIDEO_EXTENSIONS]
+        if not videos:
+            return []
+        placed = downloads_store.placed_copies(videos, exclude_download=row.download_id)
+        # Same relative path is not enough ("S01E01.mkv" is a common name):
+        # the other download must have fetched the SAME torrent.
+        ours = _magnet_hash(row.magnet or "")
+        if not ours:
+            return []
+        same_torrent = []
+        for f in placed:
+            other = downloads_store.get_download(f.download_id)
+            if other is not None and _magnet_hash(other.magnet or "") == ours:
+                same_torrent.append(f)
+        placed = same_torrent
+        covered = {(f.source_relative_path or "").replace("\\", "/").casefold()
+                   for f in placed}
+        if all(v.replace("\\", "/").casefold() in covered for v in videos):
+            return placed
+        return []
 
     def _on_download_placed(self, row: downloads_store.DownloadRow,
                             moved_final_paths: list[str]) -> None:
@@ -2602,12 +2928,20 @@ class DownloadManager:
             f"{show.title} S{ep.season:02d}E{ep.episode:02d}")
         results: list[TorrentResult] = []
         pool_stats: dict = {"queries_tried": list(queries)}
+        # Torrentio is keyed by IMDb id, not spelling: ask it once, with the
+        # first query; later spellings only re-ask the text providers.
+        torrentio_target = self._torrentio_target_for_episode(
+            show, ep.season, ep.episode)
         for candidate_query in queries:
             try:
-                pool = search_collect(candidate_query, show.media_type)
+                extra = ({"torrentio_target": torrentio_target}
+                         if torrentio_target is not None else {})
+                pool = search_collect(candidate_query, show.media_type, **extra)
             except Exception:
                 logger.exception("Episode search failed for %s", candidate_query)
                 continue
+            finally:
+                torrentio_target = None
             if pool.results:
                 query = candidate_query
                 results = list(pool.results)
@@ -2654,12 +2988,13 @@ class DownloadManager:
             return []
         survivors = [by_hash[s.infohash] for s in decision.scores
                      if s.infohash in by_hash]
-        if chosen.seeders <= 0:
+        if chosen.seeders <= 0 and not chosen.cached:
             # Reachable only when the seeder gate is disabled (MIN_SEEDERS=0): the
             # engine's TOP pick has no seeders. A guaranteed copy beats a gamble,
             # so grab the best-scored seeded survivor when one exists; otherwise
             # race-or-defer.
-            seeded = next((r for r in survivors if r.seeders > 0), None)
+            seeded = next((r for r in survivors
+                           if r.seeders > 0 or r.cached), None)
             if seeded is not None:
                 chosen = seeded
             else:
@@ -2834,7 +3169,10 @@ class DownloadManager:
                 continue
 
             try:
-                pool = search_collect(query, media_type)
+                target = (self._torrentio_target_for_movie_request(req)
+                          if media_type == "movie" else None)
+                extra = {"torrentio_target": target} if target is not None else {}
+                pool = search_collect(query, media_type, **extra)
             except Exception:
                 logger.exception("Auto-grab search failed for request #%s", req.request_id)
                 continue
@@ -2893,11 +3231,12 @@ class DownloadManager:
                 continue
             survivors = [by_hash[s.infohash] for s in decision.scores
                          if s.infohash in by_hash]
-            if chosen.seeders <= 0:
+            if chosen.seeders <= 0 and not chosen.cached:
                 # Reachable only with the seeder gate disabled (MIN_SEEDERS=0):
                 # prefer a seeded survivor over a 0-seed gamble; race-or-defer
                 # only when every survivor is 0-seed.
-                seeded = next((r for r in survivors if r.seeders > 0), None)
+                seeded = next((r for r in survivors
+                               if r.seeders > 0 or r.cached), None)
                 if seeded is not None:
                     chosen = seeded
                 else:
@@ -3284,10 +3623,132 @@ class DownloadManager:
                       request_title: str | None) -> None:
         # Extra public trackers help poorly-announced magnets find peers.
         magnet = add_public_trackers(magnet)
+        self._stopped_by_owner.discard(download_id)  # a fresh run is its own
         if config.QBITTORRENT_ENABLED:
             self._run_download_qbit(download_id, magnet, staging, request_title)
             return
+        if config.REALDEBRID_API_TOKEN and self._run_download_debrid(
+                download_id, magnet, staging, request_title):
+            return
         self._run_download_node(download_id, magnet, staging, request_title)
+
+    def _run_download_debrid(self, download_id: int, magnet: str, staging: str,
+                             request_title: str | None) -> bool:
+        """Fetch one download through Real-Debrid over HTTPS.
+
+        Returns True when this engine settled the row (done, failed for good,
+        or taken over by a cancel/stop/rotation), False when Real-Debrid
+        itself could not be used (bad token, API or network trouble) and the
+        caller should hand the row to the local torrent client instead. A
+        release RD could not get any data for is a dead swarm: it fails here
+        like a webtorrent stall rather than burning another 15 minutes."""
+        import realdebrid
+
+        row = downloads_store.get_download(download_id)
+        want = downloads_store.get_want(download_id) or {}
+        handle = _DebridHandle()
+        with self._lock:
+            self._processes[download_id] = handle
+        self._phase[download_id] = "debrid_remote"
+        self._notify(download_id)
+
+        last = {"at": 0.0, "fraction": -1.0, "stage": ""}
+
+        def on_progress(stage: str, fraction: float) -> None:
+            fraction = max(0.0, min(1.0, fraction))
+            now = time.monotonic()
+            # One DB write + UI ping per ~0.5% or 3 s, not one per 1 MB chunk.
+            if (stage == last["stage"] and fraction < 1.0
+                    and fraction - last["fraction"] < 0.005
+                    and now - last["at"] < 3.0):
+                return
+            with handle.lock:
+                if handle.cancelled():
+                    return  # whoever cancelled owns the row now
+                downloads_store.set_progress(download_id, fraction)
+                last.update(at=now, fraction=fraction, stage=stage)
+            self._phase[download_id] = ("debrid_remote" if stage == "remote"
+                                        else "debrid")
+            self._notify(download_id)
+
+        error: str | None = None
+        fall_back = False
+        result = None
+        try:
+            client = realdebrid.RealDebridClient(config.REALDEBRID_API_TOKEN)
+            max_total = float(config.TORRENT_MAX_RUNTIME_HOURS) * 3600
+            result = realdebrid.fetch(
+                client, magnet, Path(staging),
+                want_file_name=want.get("file_name"),
+                want_file_idx=want.get("file_idx"),
+                chooser=(None if (want.get("file_name") or want.get("file_idx")
+                                  is not None)
+                         else _debrid_episode_chooser(
+                             row.season if row else None,
+                             row.episode if row else None)),
+                on_progress=on_progress, should_cancel=handle.cancelled,
+                on_files=lambda rels: downloads_store.set_files(download_id, rels),
+                stall_timeout_s=float(config.TORRENT_STALL_TIMEOUT_SECONDS),
+                max_total_s=max_total if max_total > 0 else None)
+        except realdebrid.RealDebridCancelled:
+            pass  # whoever cancelled already owns the row's status
+        except (realdebrid.RealDebridStalled, realdebrid.RealDebridDead) as exc:
+            error = f"stalled: Real-Debrid could not fetch it ({exc})"
+        except realdebrid.RealDebridAuthError as exc:
+            error, fall_back = f"Real-Debrid refused the API token ({exc})", True
+        except Exception as exc:
+            error, fall_back = f"Real-Debrid failed: {exc}", True
+        finally:
+            handle.returncode = 0
+            with self._lock:
+                self._processes.pop(download_id, None)
+            self._phase.pop(download_id, None)
+
+        row = downloads_store.get_download(download_id)
+        if handle.cancelled() or (row is not None and row.status in (
+                "cancelled", "queued", "error", "stopped")):
+            return True
+        if (error and fall_back and want.get("debrid_cached")
+                and int(want.get("seeders") or 0) < int(config.MIN_SEEDERS)):
+            # Picked past the seeder floor only because RD had it cached:
+            # the torrent client could not fetch it, so do not try.
+            error = (f"{error}; release is Real-Debrid-only (too few seeders "
+                     f"for the torrent client)")
+            fall_back = False
+        if error and fall_back and config.REALDEBRID_FALLBACK_TO_P2P:
+            logger.warning("Download #%s: %s — falling back to the torrent "
+                           "client.", download_id, error)
+            downloads_store.add_history(
+                download_id, "debrid_fallback", before=None,
+                after=f"{error} — using the torrent client instead")
+            downloads_store.set_progress(download_id, 0.0)
+            return False
+        if error or result is None:
+            message = error or "Real-Debrid returned nothing"
+            downloads_store.set_status(download_id, "error", error=message,
+                                       completed=True)
+            downloads_store.add_history(download_id, "error", before=None,
+                                        after=message)
+            self._notify(download_id)
+            self._maybe_start_next()
+            return True
+
+        downloads_store.set_progress(download_id, 1.0)
+        downloads_store.set_status(download_id, "downloaded", completed=True)
+        if result.rel_paths:
+            downloads_store.set_files(download_id, result.rel_paths)
+        downloads_store.add_history(
+            download_id, "downloaded", before=None,
+            after=(f"{staging} :: {', '.join(result.rel_paths) or '?'} "
+                   f"(via Real-Debrid{', cached' if result.cached else ''})"))
+        self._notify(download_id)
+        outcome = self._finish_post_process(
+            download_id, request_title=request_title)
+        logger.info("Download #%s (Real-Debrid%s) post-process: %s", download_id,
+                    ", cached" if result.cached else "", outcome)
+        self._notify(download_id)
+        self._maybe_start_next()
+        return True
 
     def _run_download_qbit(self, download_id: int, magnet: str, staging: str,
                            request_title: str | None) -> None:
@@ -3479,6 +3940,11 @@ class DownloadManager:
 
         with self._lock:
             self._processes[download_id] = proc
+        try:
+            downloads_store.register_runner(download_id, proc.pid)
+        except Exception:
+            logger.debug("Could not record runner pid for #%s", download_id,
+                         exc_info=True)
 
         torrent_files: list[dict[str, Any]] = []
         error_message: str | None = None
@@ -3498,6 +3964,8 @@ class DownloadManager:
                     continue
                 kind = event.get("event")
                 if kind == "progress":
+                    if download_id in self._stopped_by_owner:
+                        continue  # a late tick from a runner we killed
                     prog = float(event.get("progress") or 0)
                     downloads_store.set_progress(download_id, prog)
                     self._update_phase(download_id, prog,
@@ -3514,6 +3982,15 @@ class DownloadManager:
                         # stalled/error payload still has an exact ownership
                         # manifest for audit, cleanup, and recovery.
                         downloads_store.set_files(download_id, rel_paths)
+                    neighbours = [str(p) for p in (event.get("neighbours") or [])
+                                  if p]
+                    if neighbours:
+                        # Files outside the selection that share a piece with
+                        # it, so get written too. Recorded exactly, so cleanup
+                        # never has to guess what this download touched.
+                        downloads_store.add_history(
+                            download_id, "neighbours", before=None,
+                            after=json.dumps(neighbours))
                 elif kind == "done":
                     torrent_files = event.get("files") or torrent_files
                 elif kind == "error":
@@ -3522,11 +3999,22 @@ class DownloadManager:
         except Exception as exc:
             error_message = error_message or str(exc)
         finally:
+            # Read the owner-stop mark BEFORE freeing the slot: once the entry
+            # is gone the pump may restart the row, and the new run clears it.
+            owner_stopped = download_id in self._stopped_by_owner
             with self._lock:
                 self._processes.pop(download_id, None)
             self._phase.pop(download_id, None)
+            try:
+                downloads_store.unregister_runner(download_id, proc.pid)
+            except Exception:
+                logger.debug("Could not clear runner pid for #%s", download_id,
+                             exc_info=True)
 
         row = downloads_store.get_download(download_id)
+        if owner_stopped:
+            # We killed it on purpose; whoever did owns the row's status.
+            return
         if row is not None and row.status in (
                 "cancelled", "queued", "error", "stopped"):
             # Someone else already took this row to a terminal/owned state — a
@@ -3628,7 +4116,14 @@ class DownloadManager:
         from subtitles import subtitle_language_filter_spec
 
         spec = subtitle_language_filter_spec()
+        try:
+            want = json.loads(getattr(row, "want_json", None) or "{}")
+        except (TypeError, ValueError):
+            want = {}
+        want = want if isinstance(want, dict) else {}
         return {
+            "fileIdx": want.get("file_idx"),
+            "fileName": want.get("file_name"),
             "videoExtensions": sorted(torrent_routing.VIDEO_EXTENSIONS),
             "subtitleExtensions": sorted(torrent_routing.SUBTITLE_EXTENSIONS),
             "subtitleLanguage": spec,
@@ -3787,6 +4282,25 @@ class DownloadManager:
         # vanished legacy file cannot masquerade forever as "needs placement".
         files = self._media_files_in_staging(row)
         if not files:
+            placed = self._placed_by_another_download(row)
+            if placed:
+                # A pack and a single episode of the SAME torrent wrote the same
+                # staged file; whichever finished first moved it. This one is
+                # the duplicate, not a failed download.
+                others = sorted({f.download_id for f in placed})
+                finals = sorted({f.final_path for f in placed if f.final_path})
+                downloads_store.set_status(download_id, "moved", completed=True)
+                downloads_store.set_verification(
+                    download_id, "verified",
+                    reason=f"already placed by download #{others[0]}")
+                downloads_store.add_history(
+                    download_id, "duplicate", before=None,
+                    after=(f"already placed by download "
+                           f"{', '.join('#' + str(o) for o in others)}: "
+                           + "; ".join(finals)))
+                self._on_download_placed(row, finals)
+                return (f"duplicate: already placed by download "
+                        f"#{others[0]}")
             return "no media files found in staging for this download"
 
         if not do_move and not do_rename:
@@ -3826,9 +4340,13 @@ class DownloadManager:
         if row.show_id is not None:
             show = shows_store.get_show(row.show_id)
             if show is not None:
-                show_name = show.title
+                # Follow the naming already used in the destination season
+                # folder (see torrent_routing.episode_name_base).
+                show_name = torrent_routing.episode_name_base(
+                    show.title, plan.show_folder, plan.dest_dir)
         if show_name is None and plan.show_folder:
-            show_name = Path(plan.show_folder).name
+            show_name = torrent_routing.episode_name_base(
+                Path(plan.show_folder).name, plan.show_folder, plan.dest_dir)
 
         video_files = [f for f in files if f.suffix.lower() in torrent_routing.VIDEO_EXTENSIONS]
 
@@ -4046,6 +4564,25 @@ class DownloadManager:
                             download_id, "replaced", before=str(target),
                             after="partial copy from an audited interrupted "
                                   "move — replaced")
+                    elif (is_video and _library_copy_is_complete(target, src)
+                          and _send_to_recycle_bin(src)):
+                        # The library already has a full-length copy of this
+                        # episode/movie (Furious S01, Lanterns S01E01-03 and
+                        # Dexter Resurrection S01E04 sat in staging for weeks
+                        # as "needs import" over exactly this). The staged
+                        # copy is the duplicate: recycled (above) and the
+                        # download counts as placed.
+                        downloads_store.add_history(
+                            download_id, "duplicate", before=str(src),
+                            after=f"library already has a complete copy "
+                                  f"({target}) — staged copy recycled")
+                        _record("duplicate", final=str(target),
+                                reason="library already has a complete copy "
+                                       "— staged copy recycled")
+                        if is_gating:
+                            moved_gating += 1
+                            moved_final_paths.append(str(target))
+                        continue
                     else:
                         downloads_store.add_history(
                             download_id, "error", before=str(src),
@@ -4100,6 +4637,11 @@ class DownloadManager:
                         if partial else None))
             downloads_store.set_status(download_id, "moved", completed=True)
             self._cleanup_staging_leftovers(row)
+            try:
+                import staging_sweep
+                staging_sweep.remove_pack_neighbours(row)
+            except Exception:
+                logger.exception("Neighbour cleanup failed for #%s", download_id)
             # Quality replacement: the new file is in place — retire the old
             # cam/low-bitrate copy it replaces (recycle bin when available).
             if row.replace_path:

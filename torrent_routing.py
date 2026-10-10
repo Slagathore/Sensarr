@@ -37,8 +37,98 @@ _INVALID_FS_CHARS = re.compile(r'[<>:"/\\|?*]')
 
 
 def sanitize_for_filesystem(name: str) -> str:
-    """Strip characters Windows refuses in file/folder names."""
-    return _INVALID_FS_CHARS.sub("", name).strip()
+    """Strip characters Windows refuses in file/folder names. AniDB titles
+    use a backtick for an apostrophe ("JoJo`s"); write a real one."""
+    return _INVALID_FS_CHARS.sub("", name.replace("`", "'")).strip()
+
+
+# A release name, not a show name: an episode marker or release-quality junk.
+_RELEASE_NAME_RE = re.compile(
+    r"(?i)(?<![a-z0-9])(s\d{1,2}e\d{1,3}|\d{3,4}p|web-?dl|webrip|bluray|"
+    r"blu-ray|bdrip|hdtv|x26[45]|h\.?26[45]|hevc|av1|aac\d?|ddp?\d)(?![a-z0-9])")
+
+
+# A leading "[Group] " tag followed by more text is a release prefix; a title
+# that IS a bracketed name ("[Oshi no Ko]") is not.
+_GROUP_PREFIX_RE = re.compile(r"^\s*\[[^\]]+\]\s*\S")
+
+
+def looks_like_release_name(title: str | None) -> bool:
+    """True for a raw torrent/file name ("[ToonsHub] Show S06E03 1080p ...").
+    Such a string must never become a show folder name."""
+    text = title or ""
+    return bool(_RELEASE_NAME_RE.search(text) or _GROUP_PREFIX_RE.match(text))
+
+
+def _clean_folder_title(name: str) -> str:
+    """A folder name usable as a file-name base: as is when clean, else the
+    show scanner's cleanup ("World Trigger [BD]" -> "World Trigger")."""
+    if not looks_like_release_name(name) and "[" not in name:
+        return name
+    try:
+        import show_tracker
+        cleaned, _year = show_tracker.clean_show_folder_name(name)
+    except Exception:
+        cleaned = ""
+    return cleaned
+
+
+def _same_show(base: str, *names: str) -> bool:
+    """Does an existing file-name base belong to this show? (Guards against a
+    shared season-target folder full of another show's files.)"""
+    nb = _norm(base)
+    cb = re.sub(r"[^a-z0-9]", "", nb)
+    for name in names:
+        nn = _norm(name or "")
+        cn = re.sub(r"[^a-z0-9]", "", nn)
+        if not cb or not cn:
+            continue
+        # Spaces and punctuation ignored: "JoJos Bizarre Adventure" belongs to
+        # "JoJo`s Bizarre Adventure (2012)". Short names must match exactly so
+        # "Show A" never takes "Show B"'s files.
+        shorter = min(len(cb), len(cn))
+        if cb == cn or (shorter >= 5 and (cb in cn or cn in cb)):
+            return True
+        try:
+            from rapidfuzz import fuzz
+            if fuzz.token_set_ratio(nb, nn) >= 90 and shorter >= 5:
+                return True
+        except ImportError:
+            pass
+    return False
+
+
+_EPISODE_FILE_RE = re.compile(r"^(?P<base>.+?) - S\d{2,}E\d{2,}", re.IGNORECASE)
+
+
+def episode_name_base(show_title: str, show_folder: str | None = None,
+                      season_dir: str | None = None) -> str:
+    """The "<base>" in "<base> - S06E04": whatever the episodes already in
+    this season folder use, else the show folder's own (clean) name, else the
+    tracked title. Files land next to "JoJos Bizarre Adventure - S06E03.mkv",
+    so the new one is "JoJos Bizarre Adventure - S06E04.mkv", not AniDB's
+    "JoJo`s Bizarre Adventure (2012) - S06E04.mkv"."""
+    folder_title = _clean_folder_title(Path(show_folder).name.strip()) if show_folder else ""
+    if season_dir:
+        bases: dict[str, int] = {}
+        try:
+            for entry in Path(season_dir).iterdir():
+                if entry.is_file() and entry.suffix.lower() in VIDEO_EXTENSIONS:
+                    m = _EPISODE_FILE_RE.match(entry.stem)
+                    if m:
+                        base = m.group("base").strip()
+                        # Never copy junk or another show's name.
+                        if (not looks_like_release_name(base)
+                                and _same_show(base, show_title, folder_title)):
+                            bases[base] = bases.get(base, 0) + 1
+        except OSError:
+            pass
+        if bases:
+            return sanitize_for_filesystem(max(bases, key=lambda b: bases[b]))
+    if folder_title:
+        return sanitize_for_filesystem(folder_title)
+    cleaned_title = _clean_folder_title(show_title)
+    return sanitize_for_filesystem(cleaned_title or show_title)
 
 
 # --- Movie folder + stem naming (Task D2) -----------------------------------
@@ -304,6 +394,11 @@ def plan_route(torrent_name: str, media_type: str, *, request_title: str | None 
     parsed = parse_torrent_name(torrent_name)
 
     if media_type in ("tv", "anime", "xanime"):
+        if looks_like_release_name(request_title):
+            # A raw release name is not a canonical title (the JoJo S06 mess of
+            # 2026-10-04 made a show folder out of one): match by the parsed
+            # show name instead, and never create a folder from it.
+            request_title = None
         search_title = (request_title or "").strip() or parsed.show_title
         if not search_title:
             return RoutePlan(

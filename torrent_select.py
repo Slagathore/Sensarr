@@ -61,7 +61,13 @@ _RANK_CEIL = 4000.0
 _RTN_QUALITY_MAX = 120.0
 
 _SIZE_CLOSENESS_MAX = 35.0     # 0-35, peaks when size == target
-_SEED_HEALTH_MAX = 8.0         # 0-8, log-scaled
+# 0-35, 5 points per doubling of the swarm (1 seed 5, 7 seeds 15, 31 seeds
+# 25, 127+ seeds 35). Was 0-8, which let a 7-seed copy beat a 752-seed one on
+# a size nudge. Cole, 2026-10-10: seeders are a light litmus test of a file's
+# worth as judged by the crowd, right maybe 60-80% of the time, so they count
+# about as much as size closeness, never as much as quality or language.
+_SEED_HEALTH_PER_DOUBLING = 5.0
+_SEED_HEALTH_MAX = 35.0
 _SEASON_PACK_BONUS = 15.0      # +15 for a pack on a whole-season want
 _COUNTRY_ALIAS_BONUS = 20.0    # +20 on a POSITIVE country/alias match
 _RECENT_FAILURE_PENALTY = -25.0  # replaces _prefer_unfailed's pre-sort reorder
@@ -70,14 +76,43 @@ _RECENT_FAILURE_PENALTY = -25.0  # replaces _prefer_unfailed's pre-sort reorder
 # PENALTY, not a gate: when 2160p is the only thing anyone is seeding it still
 # wins, it just loses to every sane 1080p/720p release that exists.
 _UHD_PENALTY = -60.0
-# Movies only: a release tagged with a non-English language is usually IN that
-# language. Not a disqualifier (some titles exist only that way), but a heavy
-# non-preference — fully cancelled when the title also says ENG/English, which
-# in practice means dual audio or an English track alongside.
-_FOREIGN_LANGUAGE_PENALTY = -40.0
+# Movies and TV: a release tagged with a non-English language is usually IN
+# that language. Not a disqualifier (some titles exist only that way), but a
+# heavy non-preference — fully cancelled when the title also says ENG/English,
+# which in practice means dual audio or an English track alongside. TV joined
+# on 2026-09-12 after "Futurama s06e05 HDTV spanish" was auto-grabbed over
+# plain English releases of the same episode.
+_FOREIGN_LANGUAGE_PENALTY = -40.0  # superseded 2026-10-10, see below
+# For everything except anime, English as the PRIMARY language is paramount
+# (Cole, 2026-10-10). No English at all is all but disqualifying; English
+# alongside other languages (multi/dual audio, "MULTi", "iTA-ENG", the Indian
+# "[Tel + Tam + Hin + Eng]" packs) usually means another default track, so it
+# loses to any plain English copy of similar quality. Both stay scores, not
+# gates: the only copy in existence can still win.
+_NO_ENGLISH_PENALTY = -120.0
+_ENGLISH_NOT_PRIMARY_PENALTY = -50.0
+# Titles from these countries are English-original. For anything else (a
+# Korean show, a French film) the original language is expected, so it is not
+# penalised: Cole's "wild hair for a foreign film" exception.
+_ENGLISH_SPEAKING = frozenset({"US", "GB", "UK", "CA", "AU", "NZ", "IE"})
+# "ENG" / "English" naming the AUDIO, not "ENG.SUBS" / "English Subbed" /
+# "Multi-Subs": a Spanish film with English subtitles is not English.
+_ENGLISH_AUDIO_TOKEN_RE = re.compile(
+    r"(?<![a-z0-9])(eng|english)(?![a-z0-9])(?![\s._-]*sub)", re.IGNORECASE)
+_MULTI_LANGUAGE_RE = re.compile(
+    r"(?<![a-z0-9])(multi|dual)(?![a-z0-9])|dual[\s._-]?audio|multi[\s._-]?audio",
+    re.IGNORECASE)
 # Anime the other way round: an English sub/dub marker is what makes a release
 # watchable here, so it is a strong positive rather than a requirement.
 _ENGLISH_ANIME_BONUS = 30.0
+# And an English AUDIO track beats English subs (Cole, 2026-10-09: "prioritize
+# dual audio"). Replaces the subs bonus rather than adding to it, so the gap
+# over a subs-only release is 45 points: more than any resolution/source step
+# in rtn_quality or the whole size-closeness range, so a dual-audio copy wins
+# unless it is 4K (still penalised) or fails a gate.
+_ENGLISH_AUDIO_ANIME_BONUS = 75.0
+# Already sitting on the debrid service: an instant, stall-proof download.
+_DEBRID_CACHED_BONUS = 30.0
 
 
 def rtn_version() -> str:
@@ -207,6 +242,12 @@ class Candidate:
     size_bytes: int
     seeders: int
     source: str = ""
+    # True when a debrid service already holds this exact payload (instant
+    # HTTPS download, no swarm needed). None when nobody asked.
+    cached: Optional[bool] = None
+    # Provider-supplied tags the release NAME may not carry, e.g. Torrentio's
+    # "Dual Audio" / "Multi Audio" line. Scored like the name's own markers.
+    hints: tuple = ()
 
     @property
     def norm_infohash(self) -> str:
@@ -225,6 +266,8 @@ def to_candidate(result) -> Candidate:
         size_bytes=int(getattr(result, "size_bytes", 0) or 0),
         seeders=int(getattr(result, "seeders", 0) or 0),
         source=getattr(result, "source", "") or "",
+        cached=getattr(result, "cached", None),
+        hints=tuple(getattr(result, "audio_tags", ()) or ()),
     )
 
 
@@ -558,7 +601,9 @@ def _run_gates(candidate: Candidate, want: SelectWant, parsed,
     # 0%" plague). Reject below the want's floor. min_seeders defaults to 0 (gate
     # disabled) so the pure module imposes no policy of its own, and the
     # zero-seeder race can still deliberately gamble on unseeded candidates.
-    if want.min_seeders > 0 and candidate.seeders < want.min_seeders:
+    # A debrid-cached release needs no swarm at all, so the floor never applies.
+    if (want.min_seeders > 0 and candidate.seeders < want.min_seeders
+            and candidate.cached is not True):
         return False, "insufficient_seeders", (
             f"{candidate.seeders} seeders < floor {want.min_seeders}")
 
@@ -624,22 +669,101 @@ def has_english_marker(title: str, parsed=None) -> bool:
     return bool(_ENGLISH_MARKER_RE.search(title or ""))
 
 
-def language_score(title: str, parsed, media_type: str) -> float:
+# An English AUDIO track, in all the ways release names spell it: "Dual Audio",
+# "Dual-Audio", a bare DUAL tag ("...H 264 DUAL-VARYG"), "Multi-Audio",
+# "English Dub", "Eng Dubbed", "EngDub", "English Audio", "JPN+ENG", "Jap/Eng",
+# "Japanese + English", "EN-JA". Deliberately NOT bare "MULTi" (French scene
+# tag for VF+VOSTFR) and NOT "Eng Sub"/"Multi-Subs" (subtitles only).
+_JA = r"(?:jp|jpn|jap|ja|japanese)"
+_EN = r"(?:en|eng|english)"
+_ENGLISH_AUDIO_RE = re.compile(
+    r"(?<![a-z0-9])("
+    # "Dual Subs" / "Dual-Sub" / "[JPN+ENG Subs]" are subtitle tags: the
+    # bare DUAL and the language pairs never count when "sub" follows.
+    r"dual[\s._-]?audio|dual(?![\s._-]?sub)|"
+    r"multi[\s._-]?audio|"
+    r"eng(?:lish)?[\s._-]?(?:dub(?:bed|s)?|audio)|"
+    r"dub(?:bed)?[\s._-]?(?:in[\s._-]?)?eng(?:lish)?|"
+    rf"{_JA}\s*[+&/,|_-]\s*{_EN}(?![\s._-]*sub)|"
+    rf"{_EN}\s*[+&/,|_-]\s*{_JA}(?![\s._-]*sub)"
+    r")(?![a-z0-9])",
+    re.IGNORECASE)
+# A bare "Dub"/"Dubbed" ("Frieren S01E01 1080p -DUB") means an English dub on an
+# English-language tracker unless the name says which other language it is
+# ("[Hindi Dub]", "Latino", "Castellano" all parse to a non-English language).
+_BARE_DUB_RE = re.compile(r"(?<![a-z0-9])dub(?:bed|s)?(?![a-z0-9])", re.IGNORECASE)
+# The parser does not tag every language name ("German Dub" parses to no
+# language at all), so a language word right before the dub settles it.
+_OTHER_LANGUAGE_DUB_RE = re.compile(
+    r"(?<![a-z0-9])(?:hindi|tamil|telugu|malayalam|bengali|german|ger|deutsch|"
+    r"french|fre|fra|spanish|spa|esp|latino|castellano|italian|ita|portuguese|"
+    r"por|brazilian|russian|rus|arabic|ara|korean|kor|chinese|chi|mandarin|"
+    r"cantonese|turkish|tur|polish|pol|thai|indonesian|vietnamese|hungarian|"
+    r"czech|dutch|greek|hebrew|persian|filipino|tagalog|urdu)"
+    r"[\s._-]?dub(?:bed|s)?(?![a-z0-9])",
+    re.IGNORECASE)
+_ENGLISH_FLAGS = ("\U0001F1EC\U0001F1E7", "\U0001F1FA\U0001F1F8")  # GB, US
+_FLAG_RE = re.compile("[\U0001F1E6-\U0001F1FF]{2}")  # any flag emoji
+
+
+def has_english_audio_marker(title: str, parsed=None, hints: tuple = ()) -> bool:
+    """True when the release (name or provider tags) claims an English audio
+    track: dual audio, multi audio, or an English dub."""
+    text = title or ""
+    if _ENGLISH_AUDIO_RE.search(text):
+        return True
+    foreign = {code for code in _parsed_languages(parsed) if code not in ("en", "ja")}
+    if (_BARE_DUB_RE.search(text) and not foreign
+            and not _OTHER_LANGUAGE_DUB_RE.search(text)):
+        return True
+    flags = [h for h in hints if _FLAG_RE.fullmatch(str(h))]
+    for hint in hints:
+        tag = str(hint).strip().lower()
+        if tag == "dual audio":
+            return True
+        # Torrentio says "Multi Audio" for French VF+VOSTFR packs too; trust it
+        # only when no flags are listed or an English one is.
+        if tag == "multi audio" and (not flags or any(
+                f in _ENGLISH_FLAGS for f in flags)):
+            return True
+    return False
+
+
+def language_score(title: str, parsed, media_type: str,
+                   hints: tuple = (), origin_countries=()) -> float:
     """The language preference component.
 
-    Movies: a foreign-language tag with no English marker is a heavy
-    non-preference. Anime/xanime: an English marker is a strong preference.
-    TV and everything else: language is not scored (release names for shows
-    are overwhelmingly English already, and tagging there is noisier).
+    Movies and TV: English must be the primary language. No English at all is
+    a near-disqualifying penalty; English alongside other languages a heavy
+    one. Neither applies to a title whose origin is not English-speaking.
+    Anime: an English audio track (dual audio / English dub) is the top
+    preference, English subtitles the next. Xanime keeps the English-marker
+    preference. Anything else: language is not scored.
     """
     languages = _parsed_languages(parsed)
     english = has_english_marker(title, parsed)
+    if media_type == "anime" and has_english_audio_marker(title, parsed, hints):
+        return _ENGLISH_AUDIO_ANIME_BONUS
     if media_type in ("anime", "xanime"):
         return _ENGLISH_ANIME_BONUS if english else 0.0
-    if media_type == "movie":
+    if media_type in ("movie", "tv"):
+        countries = {str(c).upper() for c in (origin_countries or ()) if c}
+        if countries and not (countries & _ENGLISH_SPEAKING):
+            return 0.0
+        flags = [str(h) for h in hints if _FLAG_RE.fullmatch(str(h))]
+        # English must be an AUDIO claim here; subtitle tags do not count.
+        english = (bool(_ENGLISH_AUDIO_TOKEN_RE.search(title or ""))
+                   or has_english_audio_marker(title, parsed, hints)
+                   or any(f in _ENGLISH_FLAGS for f in flags))
         foreign = {code for code in languages if code != "en"}
+        if any(f not in _ENGLISH_FLAGS for f in flags):
+            foreign.add("flag")
+        multi = bool(_MULTI_LANGUAGE_RE.search(title or "")) or any(
+            str(h).strip().lower() in ("multi audio", "dual audio") for h in hints)
         if foreign and not english:
-            return _FOREIGN_LANGUAGE_PENALTY
+            return _NO_ENGLISH_PENALTY
+        if foreign or multi:
+            return _ENGLISH_NOT_PRIMARY_PENALTY
     return 0.0
 
 
@@ -687,7 +811,8 @@ def _score(candidate: Candidate, want: SelectWant, parsed,
 
     # seed_health: 0-8, log-scaled.
     seed_health = min(_SEED_HEALTH_MAX,
-                      math.log2(candidate.seeders + 1)) if candidate.seeders > 0 else 0.0
+                      _SEED_HEALTH_PER_DOUBLING * math.log2(candidate.seeders + 1)
+                      ) if candidate.seeders > 0 else 0.0
     components["seed_health"] = round(seed_health, 3)
 
     # season_pack: +15 for a pack on a whole-season want.
@@ -723,7 +848,10 @@ def _score(candidate: Candidate, want: SelectWant, parsed,
     # language_pref / resolution_pref: Cole's watchability rules. Both are
     # scores, never gates — the only-copy-in-existence still gets to win.
     components["language_pref"] = language_score(
-        candidate.title, parsed, identity.media_type)
+        candidate.title, parsed, identity.media_type, hints=candidate.hints,
+        origin_countries=identity.origin_countries)
+    components["debrid_cached"] = (_DEBRID_CACHED_BONUS
+                                   if candidate.cached is True else 0.0)
     components["resolution_pref"] = resolution_score(candidate.title, parsed)
 
     total = sum(components.values())

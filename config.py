@@ -440,6 +440,33 @@ TORRENT_MAX_RUNTIME_HOURS: float = float(
 # many seconds, then a later search probes it again automatically.
 TORRENT_PROVIDER_BACKOFF_SECONDS: int = int(
     os.getenv("TORRENT_PROVIDER_BACKOFF_SECONDS", "900"))
+# Once a day, delete the partial files stalled/cancelled downloads leave in
+# staging (staging_sweep.py). Partials 50%+ done are kept 30 days so a retry of
+# the same torrent can resume. On 2026-10-09 these held ~15 GB of a full C:.
+STAGING_SWEEP_ENABLED: bool = _env_bool("STAGING_SWEEP_ENABLED", True)
+# Torrentio (the Stremio addon) as an extra search source. It is keyed by IMDb
+# id, not a text query, so it answers for exactly the right movie/episode, and
+# it aggregates TPB, 1337x, TorrentGalaxy, EZTV, YTS, Nyaa and more, with the
+# exact file inside season packs. Needs TMDB_API_KEY to find IMDb ids.
+TORRENTIO_ENABLED: bool = _env_bool("TORRENTIO_ENABLED", True)
+TORRENTIO_BASE_URL: str = os.getenv(
+    "TORRENTIO_BASE_URL", "https://torrentio.strem.fun").strip()
+# Raw Torrentio config ("providers=...|qualityfilter=cam,scr"), same syntax as
+# the addon's own install URL. Blank = Sensarr's defaults: English-language
+# sites (plus the anime trackers for anime), cams/screeners/3D filtered out.
+TORRENTIO_OPTIONS: str = os.getenv("TORRENTIO_OPTIONS", "").strip()
+# Real-Debrid (https://real-debrid.com/apitoken). With a token, downloads go
+# through Real-Debrid over HTTPS instead of the local torrent client: a release
+# RD already has cached arrives at line speed with no seeders needed, and RD's
+# servers fetch the rest. Empty = off.
+REALDEBRID_API_TOKEN: str = os.getenv("REALDEBRID_API_TOKEN", "").strip()
+# Ask Torrentio (with the RD token) which releases are already cached, so the
+# selector can prefer instant ones. Sends the token to Torrentio, exactly like
+# a Stremio + Torrentio + RD setup does.
+REALDEBRID_CACHE_CHECK: bool = _env_bool("REALDEBRID_CACHE_CHECK", True)
+# When Real-Debrid cannot get a release (dead, stalled, error), fall back to
+# the local torrent client for that download instead of failing it.
+REALDEBRID_FALLBACK_TO_P2P: bool = _env_bool("REALDEBRID_FALLBACK_TO_P2P", True)
 # Built-in engine queue: at most this many downloads run at once; the rest
 # wait as 'queued'. 3-5 is the sweet spot — more just splits bandwidth and
 # stalls everything (the 22-at-once request burst proved it). qBittorrent
@@ -457,7 +484,11 @@ DOWNLOAD_MAX_ROTATIONS: int = int(os.getenv("DOWNLOAD_MAX_ROTATIONS", "2"))
 # Reject any release seeded below this floor before it is ever grabbed — a
 # 0-seed torrent never finishes. The zero-seeder race (below) is the ONLY path
 # allowed to gamble on unseeded candidates, and only when explicitly enabled.
-MIN_SEEDERS: int = int(os.getenv("MIN_SEEDERS", "1"))
+# 4, not 1: over 60 days of real grabs (to 2026-10-09) a release picked at 1
+# seeder finished 2% of the time (9/419), 2-3 seeders 17%, 4-6 seeders 38%, 7+
+# about 56%. A 1-seed pick mostly sat on a download slot for 15 minutes and
+# left a partial file behind. Debrid-cached releases skip this gate entirely.
+MIN_SEEDERS: int = int(os.getenv("MIN_SEEDERS", "4"))
 # How early before a movie's release date auto-grab starts searching for it.
 # Requests get made off trailers, so a film can sit open for months while every
 # pass burns provider calls on something that does not exist yet. Screeners and

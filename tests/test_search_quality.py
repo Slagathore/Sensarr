@@ -265,8 +265,15 @@ def test_foreign_language_movie_is_a_heavy_non_preference():
                        "Some Movie", 2024)["language_pref"] < 0
 
 
-def test_english_marker_cancels_the_language_penalty():
+def test_english_alongside_other_languages_is_still_penalised():
+    # Superseded 2026-10-10 (Cole: English as the PRIMARY language is
+    # paramount): an ENG tag no longer cancels the penalty, it only softens it
+    # from "no English" to "English is not the main track".
     assert _components("Some.Movie.2024.MULTi.ENG.FRE.1080p", "movie",
+                       "Some Movie", 2024)["language_pref"] == -50.0
+    assert _components("Some.Movie.2024.FRENCH.1080p", "movie",
+                       "Some Movie", 2024)["language_pref"] == -120.0
+    assert _components("Some.Movie.2024.1080p.WEB-DL", "movie",
                        "Some Movie", 2024)["language_pref"] == 0
 
 
@@ -290,9 +297,24 @@ def test_dual_audio_counts_as_english_for_anime():
         "[EMBER] Mushoku Tensei (2024) [1080p Dual Audio HEVC 10 bits DDP]")
 
 
-def test_tv_language_is_not_scored():
-    assert _components("Show.S01.SWEDISH.DVDRip.XviD", "tv",
-                       "Show")["language_pref"] == 0
+def test_foreign_language_tv_is_a_heavy_non_preference():
+    assert _components("Show.S01E02.SWEDISH.DVDRip.XviD", "tv",
+                       "Show")["language_pref"] < 0
+
+
+def test_tv_multi_language_with_english_is_still_penalised():
+    assert _components("Show.S01E02.MULTi.ENG.FRE.1080p.WEB", "tv",
+                       "Show")["language_pref"] == -50.0
+
+
+def test_english_tv_episode_beats_the_spanish_one():
+    # The 2026-09-12 grab: a Spanish-tagged Futurama episode was taken over
+    # plain English releases because TV skipped the language score.
+    spanish = _candidate("Futurama s06e05 HDTV spanish", seeders=80)
+    english = _candidate("Futurama.S06E05.HDTV.XviD-FQM", seeders=40)
+    decision = ts.select_torrent([spanish, english],
+                                 _want("tv", "Futurama"))
+    assert decision.chosen_title == english.title
 
 
 # ---------------------------------------------------------------------------
@@ -463,3 +485,54 @@ def test_unreleased_movie_is_held_by_its_own_key_and_out_films_still_grab(
     assert held is not None and "not released yet" in (held["reason"] or "")
     # The film that IS out must not have been deferred by its neighbour.
     assert downloads_store.get_grab_deferral(f"req:{out.request_id}") is None
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-10: English primary for non-anime; seeders count for more
+# ---------------------------------------------------------------------------
+
+def test_plain_english_copy_beats_the_indian_multi_language_one():
+    """The Love Hypothesis case: a 60-seed '[Tel + Tam + Hin + Mal + Kan +
+    Eng]' WEB-DL used to beat a 752-seed English copy."""
+    multi = _candidate("The Love Hypothesis (2026) 1080p TRUE WEB-DL - AVC - "
+                       "[Tel + Tam + Hin + Mal + Kan + Eng] - 5.1", seeders=60)
+    english = _candidate("The Love Hypothesis 2026 1080p WEB-DL HEVC x265 5.1 BONE",
+                         seeders=752)
+    decision = ts.select_torrent([multi, english],
+                                 _want("movie", "The Love Hypothesis", 2026))
+    assert decision.chosen_title == english.title
+
+
+def test_torrentio_language_flags_count():
+    gb, it = "\U0001F1EC\U0001F1E7", "\U0001F1EE\U0001F1F9"
+    parsed, _ = rtn_compat.parse_release("Show S01E01 1080p WEB")
+    assert ts.language_score("Show S01E01 1080p WEB", parsed, "tv", hints=(it,)) == -120.0
+    assert ts.language_score("Show S01E01 1080p WEB", parsed, "tv", hints=(gb, it)) == -50.0
+    assert ts.language_score("Show S01E01 1080p WEB", parsed, "tv", hints=(gb,)) == 0.0
+
+
+def test_a_foreign_original_is_not_penalised_for_its_own_language():
+    """Bloodhounds (KR): a Korean-tagged release is the original, not a dub."""
+    parsed, _ = rtn_compat.parse_release("Bloodhounds S01E01 KOREAN 1080p WEB")
+    assert ts.language_score("Bloodhounds S01E01 KOREAN 1080p WEB", parsed, "tv",
+                             origin_countries=("KR",)) == 0.0
+    assert ts.language_score("Bloodhounds S01E01 KOREAN 1080p WEB", parsed, "tv",
+                             origin_countries=("US",)) == -120.0
+
+
+def test_seeders_now_weigh_about_as_much_as_size():
+    few = _components("Some.Movie.2024.1080p.WEB-DL", "movie", "Some Movie", 2024)
+    assert few["seed_health"] > 8  # the old cap
+    import torrent_select
+    assert torrent_select._SEED_HEALTH_MAX == 35.0
+
+
+def test_english_subtitles_do_not_make_a_foreign_release_english():
+    """Verifier 2026-10-10: ENG.SUBS / Multi-Subs only lifted a Spanish- or
+    Italian-audio film to -50; subtitles are not an English track."""
+    for title in ("Movie.2024.SPANISH.1080p.ENG.SUBS",
+                  "Movie.2024.iTA.1080p.Multi-Subs",
+                  "Movie.2024.FRENCH.1080p.English.Subbed"):
+        assert _components(title, "movie", "Movie", 2024)["language_pref"] == -120.0, title
+    assert _components("Movie.2024.iTA-ENG.1080p", "movie", "Movie",
+                       2024)["language_pref"] == -50.0

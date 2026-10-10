@@ -265,6 +265,60 @@ def _closeable_on_library_match(req) -> bool:
     return True
 
 
+def season_request_complete(req) -> bool:
+    """A season-specific request is done when its tracked show (matched by
+    identity, never by title) has a file for every aired episode of that
+    season, and the season has at least one aired episode.
+
+    This is the season-aware close _closeable_on_library_match leaves out:
+    Dexter: Resurrection S1 and Bloodhounds S1 sat in needs_attention for
+    weeks (2026-09/10) with every episode already on disk."""
+    import datetime as _dt
+    import shows_store
+    if getattr(req, "media_type", None) not in ("tv", "anime", "xanime"):
+        return False
+    season = getattr(req, "season", None)
+    source = getattr(req, "identity_source", None)
+    ext = getattr(req, "external_id", None)
+    if season is None or not (source and ext):
+        return False
+    show = shows_store.get_show_by_identity(source, str(ext))
+    if show is None:
+        return False
+    today = _dt.date.today().isoformat()
+    aired = [e for e in shows_store.list_episodes(show.show_id)
+             if e.season == int(season)
+             and (e.has_file or (e.air_date and e.air_date <= today))]
+    return bool(aired) and all(e.has_file for e in aired)
+
+
+# A season request may close from any of these; never from grabbing (an
+# in-flight grab finishes on its own) or a terminal state.
+_SEASON_CLOSE_STATUSES = ("open", "deferred", "needs_attention")
+
+
+def close_complete_season_requests() -> int:
+    """Close every season request whose season is fully on disk. Returns how
+    many were closed."""
+    import queue_store as qs
+    closed = 0
+    for status in _SEASON_CLOSE_STATUSES:
+        for req in qs.list_requests(status=status, limit=2000):
+            try:
+                if season_request_complete(req):
+                    qs.set_status(req.request_id, qs.STATUS_FULFILLED)
+                    closed += 1
+                    logger.info(
+                        "Reconcile: request #%s (%s season %s) has every aired "
+                        "episode on disk — closed as fulfilled.",
+                        req.request_id, req.resolved_title or req.content,
+                        req.season)
+            except Exception:
+                logger.exception("Season completion check failed for request #%s",
+                                 getattr(req, "request_id", "?"))
+    return closed
+
+
 def daily_library_check() -> dict:
     """Reconcile requests against the library BY IDENTITY (Task C item 5).
 
@@ -389,6 +443,10 @@ def daily_library_check() -> dict:
         except Exception as exc:
             errors.append(f"Error reconciling request #{req.request_id}: {exc}")
 
+    # 3. Season requests: closed once every aired episode of the season is on
+    #    disk (the found flag above only proves the SHOW is in the library).
+    fulfilled_from_library += close_complete_season_requests()
+
     return {"checked": checked, "newly_found": newly_found,
             "cleared_false_found": cleared_false_found, "reopened": reopened,
             "sequels_blocked": sequels_blocked,
@@ -408,6 +466,9 @@ def _placement_still_valid(req) -> bool:
     import downloads_store
     import media_identity
     import verification
+    if season_request_complete(req):
+        # Closed by season completeness, which is still true: nothing to undo.
+        return True
     want = _request_want_identity(req)
     have_links = False
     for dl in downloads_store.downloads_for_request(req.request_id):
@@ -452,6 +513,16 @@ def reconcile_requests_with_library(statuses: tuple[str, ...] | None = None) -> 
     present = marked_found = closed = 0
     for req in requests:
         try:
+            if (req.status in _SEASON_CLOSE_STATUSES
+                    and season_request_complete(req)):
+                qs.set_status(req.request_id, qs.STATUS_FULFILLED)
+                closed += 1
+                logger.info(
+                    "Watcher reconcile: request #%s (%s season %s) has every "
+                    "aired episode on disk — closed as fulfilled.",
+                    req.request_id, req.resolved_title or req.content,
+                    req.season)
+                continue
             if not request_present_in_library(req):
                 continue
             present += 1
