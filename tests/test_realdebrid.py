@@ -324,3 +324,42 @@ def test_pack_subset_lands_under_the_torrent_name_not_the_file_name(tmp_path):
                    download=downloader({"https://dl/a": b"abcd"}),
                    sleep=clock.sleep, monotonic=clock.now)
     assert res.rel_paths == ["Show Complete Series/S06/Show S06E12.mkv"]
+
+
+def test_a_stream_that_ends_short_resumes_instead_of_failing(tmp_path):
+    """Live 2026-10-10: a 583 MB file arrived 7,048 bytes short and the whole
+    download was thrown away. It must resume with a Range request."""
+    fake = FakeRD([single_file_info()], LINKS)
+    calls = []
+
+    def flaky(url, start):
+        calls.append(start)
+        data = BLOBS[url]
+        if len(calls) == 1:
+            return 200, iter([data[:6]])          # connection ends early
+        return 206, iter([data[start:]])
+    clock = Clock()
+    res = rd.fetch(client(fake), MAGNET, tmp_path, download=flaky,
+                   sleep=clock.sleep, monotonic=clock.now)
+    assert calls == [0, 6]
+    assert (tmp_path / res.rel_paths[0]).read_bytes() == b"0123456789"
+
+
+def test_a_dropped_connection_mid_stream_resumes(tmp_path):
+    fake = FakeRD([single_file_info()], LINKS)
+    calls = []
+
+    def dropping(url, start):
+        calls.append(start)
+        data = BLOBS[url]
+        if len(calls) == 1:
+            def gen():
+                yield data[:4]
+                raise ConnectionResetError("reset by peer")
+            return 200, gen()
+        return 206, iter([data[start:]])
+    clock = Clock()
+    res = rd.fetch(client(fake), MAGNET, tmp_path, download=dropping,
+                   sleep=clock.sleep, monotonic=clock.now)
+    assert calls == [0, 4]
+    assert (tmp_path / res.rel_paths[0]).read_bytes() == b"0123456789"

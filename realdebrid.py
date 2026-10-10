@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import time
@@ -35,6 +36,8 @@ logger = logging.getLogger(__name__)
 API_BASE = "https://api.real-debrid.com/rest/1.0"
 USER_AGENT = "Sensarr/1.6"
 CHUNK_SIZE = 1024 * 1024
+# Tries per file before a short or dropped HTTPS stream counts as a failure.
+DOWNLOAD_ATTEMPTS = 4
 
 VIDEO_EXTS = (".mkv", ".mp4", ".avi", ".m4v", ".mov", ".wmv", ".ts",
               ".m2ts", ".webm", ".mpg", ".mpeg")
@@ -387,37 +390,61 @@ def fetch(client: RealDebridClient, magnet: str, dest_dir: Path, *,
         if have > size:
             part.unlink()
             have = 0
-        if have < size or size == 0:
-            status_code, chunks = download(url, have)
-            if status_code == 416:
-                part.unlink(missing_ok=True)
-                have = 0
-                status_code, chunks = download(url, 0)
-            if status_code not in (200, 206):
-                raise RealDebridError(f"Download failed: HTTP {status_code}",
-                                      status_code)
-            mode = "ab" if (have and status_code == 206) else "wb"
-            if mode == "wb":
-                have = 0
-            written = have
+        # A stream that ends early (seen live 2026-10-10: 7 KB short of 583 MB)
+        # or drops mid-way resumes from where it stopped with a Range request,
+        # instead of throwing the whole file away. Gives up after
+        # DOWNLOAD_ATTEMPTS tries, or as soon as a try makes no progress.
+        attempts = 0
+        while have < size or (size == 0 and attempts == 0):
+            attempts += 1
+            before = have
             try:
-                with open(part, mode) as fh:
-                    for chunk in chunks:
-                        if cancelled():
-                            fh.flush()
-                            close = getattr(chunks, "close", None)
-                            if close:
-                                close()
-                            drop(tid)
-                            raise RealDebridCancelled("Cancelled")
-                        fh.write(chunk)
-                        written += len(chunk)
-                        progress("local", (done + written) / total if total else 1.0)
-            finally:
-                close = getattr(chunks, "close", None)
-                if close:
-                    close()
-            have = written
+                status_code, chunks = download(url, have)
+                if status_code == 416:
+                    part.unlink(missing_ok=True)
+                    have = 0
+                    status_code, chunks = download(url, 0)
+                if status_code not in (200, 206):
+                    raise RealDebridError(f"Download failed: HTTP {status_code}",
+                                          status_code)
+                mode = "ab" if (have and status_code == 206) else "wb"
+                if mode == "wb":
+                    have = 0
+                written = have
+                try:
+                    with open(part, mode) as fh:
+                        for chunk in chunks:
+                            if cancelled():
+                                fh.flush()
+                                close = getattr(chunks, "close", None)
+                                if close:
+                                    close()
+                                drop(tid)
+                                raise RealDebridCancelled("Cancelled")
+                            fh.write(chunk)
+                            written += len(chunk)
+                            progress("local", (done + written) / total if total else 1.0)
+                finally:
+                    close = getattr(chunks, "close", None)
+                    if close:
+                        close()
+                have = written
+            except (OSError, http.client.HTTPException) as exc:
+                have = part.stat().st_size if part.exists() else 0
+                if attempts >= DOWNLOAD_ATTEMPTS:
+                    raise RealDebridError(
+                        f"Download of {rel} kept failing: {exc}") from None
+                logger.info("RD download of %s dropped at %d/%d bytes (%s); "
+                            "resuming.", rel, have, size, exc)
+                sleep(min(2 ** attempts, 10))
+                continue
+            if have >= size or size == 0:
+                break
+            if have <= before or attempts >= DOWNLOAD_ATTEMPTS:
+                break
+            logger.info("RD download of %s ended at %d/%d bytes; resuming.",
+                        rel, have, size)
+            sleep(1)
         if have != size:
             part.unlink(missing_ok=True)
             raise RealDebridError(
