@@ -1,5 +1,6 @@
 import calendar
 import os
+import sys
 from datetime import datetime, timedelta
 
 import pytest
@@ -107,6 +108,16 @@ def test_tombstoned_other_reason_is_swept(staging):
 
 
 def test_shared_with_live_row_kept(staging):
+    _make(staging, ["shared.mkv"])
+    _make(staging, ["shared.mkv"], status="downloading", progress=0.1, write=False)
+    rep = _sweep(staging)
+    assert (staging / "shared.mkv").exists()
+    assert rep.skipped_shared == 1 and rep.files_deleted == 0
+
+
+@pytest.mark.skipif(sys.platform != "win32",
+                    reason="paths differing only in case are one file only on Windows")
+def test_shared_path_matches_case_insensitively_on_windows(staging):
     _make(staging, ["shared.mkv"])
     _make(staging, ["Shared.MKV"], status="downloading", progress=0.1, write=False)
     rep = _sweep(staging)
