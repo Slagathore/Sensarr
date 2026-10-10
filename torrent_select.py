@@ -498,6 +498,9 @@ def _as_recent_failure_lookup(recent_failures) -> RecentFailureLookup:
 # The eight hard gates, in order (section 4 item 2)
 # ---------------------------------------------------------------------------
 
+_BRACKETED_YEAR_RE = re.compile(r"\s*\((?:19|20)\d{2}\)\s*$")
+
+
 def _run_gates(candidate: Candidate, want: SelectWant, parsed,
                blocklist: BlocklistLookup,
                cam_check: Optional[Callable[[str], bool]],
@@ -528,11 +531,19 @@ def _run_gates(candidate: Candidate, want: SelectWant, parsed,
     # kill it.
     canonical = identity.canonical_title or ""
     parsed_title = getattr(parsed, "parsed_title", "") or ""
+    # Trackers disambiguate same-named shows with a bracketed year ("Monster
+    # (2022)", "East of Eden (2026)"); releases write "Monster 2022 S02E01",
+    # which parses to "Monster". Match on the bare title; the year itself is
+    # still checked by the year gate below. Every episode of both shows was
+    # rejected as title_mismatch until 2026-10-10.
+    bare = _BRACKETED_YEAR_RE.sub("", canonical).strip() or canonical
     if canonical and parsed_title:
         try:
-            matched = title_match(canonical, parsed_title)
+            matched = title_match(canonical, parsed_title) or (
+                bare != canonical and title_match(bare, parsed_title))
         except Exception:
             matched = False
+        canonical = bare
         if not matched:
             return False, "title_mismatch", (
                 f"'{parsed_title}' does not match wanted '{canonical}'")
@@ -751,7 +762,12 @@ def language_score(title: str, parsed, media_type: str,
     if media_type in ("movie", "tv"):
         countries = {str(c).upper() for c in (origin_countries or ()) if c}
         if countries and not (countries & _ENGLISH_SPEAKING):
-            return 0.0
+            # A foreign original (Bloodhounds, a Korean show) gets the anime
+            # rule (Cole, 2026-10-10): dual audio / an English dub is best,
+            # English subs next, the original language alone is still fine.
+            if has_english_audio_marker(title, parsed, hints):
+                return _ENGLISH_AUDIO_ANIME_BONUS
+            return _ENGLISH_ANIME_BONUS if english else 0.0
         flags = [str(h) for h in hints if _FLAG_RE.fullmatch(str(h))]
         # English must be an AUDIO claim here; subtitle tags do not count.
         english = (bool(_ENGLISH_AUDIO_TOKEN_RE.search(title or ""))

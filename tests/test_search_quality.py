@@ -536,3 +536,35 @@ def test_english_subtitles_do_not_make_a_foreign_release_english():
         assert _components(title, "movie", "Movie", 2024)["language_pref"] == -120.0, title
     assert _components("Movie.2024.iTA-ENG.1080p", "movie", "Movie",
                        2024)["language_pref"] == -80.0
+
+
+def test_foreign_original_prefers_dual_audio_like_anime():
+    """Cole 2026-10-10: for anything of non-English origin, dual audio wins."""
+    def score(title):
+        parsed, _ = rtn_compat.parse_release(title)
+        return ts.language_score(title, parsed, "tv", origin_countries=("KR",))
+    assert score("Bloodhounds S02E01 1080p NF WEB-DL DUAL AAC2.0 H 264") == 75.0
+    assert score("Bloodhounds S02E01 1080p WEB English Dub") == 75.0
+    assert score("Bloodhounds S02E01 1080p WEB-DL KOREAN ENG SUBS") == 30.0
+    assert score("Bloodhounds S02E01 1080p WEB-DL KOREAN") == 0.0
+
+
+@pytest.mark.parametrize("wanted,release", [
+    ("Monster (2022)", "Monster 2022 S02E01 Blame It on the Rain 1080p NF WEB-DL DDP5 1 x264"),
+    ("East of Eden (2026)", "East of Eden 2026 S01E01 1080p WEB H264-CAKES"),
+])
+def test_a_bracketed_year_in_the_tracked_name_still_matches(wanted, release):
+    """Every episode of both shows was rejected as title_mismatch (2026-10-10)."""
+    want = ts.SelectWant(identity=MediaIdentity(
+        media_type="tv", canonical_title=wanted, season=int(release.split(" S")[1][:2]),
+        episode=1))
+    decision = ts.select_torrent([_candidate(release)], want)
+    assert decision.chosen_title == release, decision.verdicts
+
+
+def test_the_bare_title_does_not_let_another_show_through():
+    want = ts.SelectWant(identity=MediaIdentity(
+        media_type="tv", canonical_title="Monster (2022)", season=1, episode=1))
+    decision = ts.select_torrent(
+        [_candidate("Monster High 2022 S01E01 The Monstering 1080p AMZN WEB-DL")], want)
+    assert decision.chosen_title is None

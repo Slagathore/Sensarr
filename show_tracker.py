@@ -554,6 +554,95 @@ def _scan_folders_for_episodes(folders: tuple[str, ...]) -> dict[tuple[int, int]
     return found
 
 
+# The episode title a file name carries after its SxxEyy / NxNN marker
+# ("Man.vs.Wild.S02E01.Everglades - Florida.avi" -> "Everglades - Florida").
+_TITLE_AFTER_MARKER_RE = re.compile(
+    r"(?i)(?:s\d{1,2}[ ._-]*e\d{1,3}|\b\d{1,2}x\d{2,3})[ ._-]*(?P<title>.+)$")
+_TITLE_RELEASE_JUNK_RE = re.compile(
+    r"(?i)(?<![a-z0-9])(480p|576p|720p|1080p|2160p|hdtv|pdtv|web[ .-]?dl|webrip|"
+    r"bluray|blu-ray|bdrip|brrip|dvdrip|xvid|divx|x26[45]|h[ .]?26[45]|hevc|"
+    r"aac|ac3|dd5|proper|repack|internal)(?![a-z0-9]).*$")
+
+
+def _title_from_filename(path: str) -> str:
+    stem = Path(path).stem
+    m = _TITLE_AFTER_MARKER_RE.search(stem)
+    if not m:
+        return ""
+    title = re.sub(r"[._]", " ", m.group("title"))
+    title = _TITLE_RELEASE_JUNK_RE.sub("", title)
+    title = re.sub(r"\[[^\]]*\]", " ", title)
+    return re.sub(r"\s{2,}", " ", title).strip(" -\u2013")
+
+
+def _title_key(title: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", " ", (title or "").lower())).strip()
+
+
+def _remap_disk_by_titles(
+    found: dict[tuple[int, int], str], episodes: list,
+) -> tuple[dict[tuple[int, int], str], int]:
+    """Match files to episodes by TITLE where their numbers disagree.
+
+    Packs and DVD sets number episodes their own way: the Man vs Wild pack's
+    "S02E01 Everglades" is TVDB/TMDB's S01E10 "Everglades", because the pack
+    splits the broadcaster's 15-episode first season into 9 + 6. No TVDB
+    ordering matches that (checked 2026-10-10), but the titles do.
+
+    A file moves only when its own slot's title clearly disagrees, its title
+    clearly matches exactly ONE other episode, and nothing else claims that
+    episode. Files without a title in their name keep their numbers.
+    Returns (mapping, number of files moved).
+    """
+    try:
+        from rapidfuzz import fuzz
+    except ImportError:
+        return found, 0
+    titled = [e for e in episodes
+              if e.season > 0 and _title_key(getattr(e, "title", "") or "")]
+    if not titled:
+        return found, 0
+    by_slot = {(e.season, e.episode): _title_key(e.title) for e in titled}
+
+    def similar(a: str, b: str) -> float:
+        return fuzz.token_set_ratio(a, b)
+
+    moves: dict[tuple[int, int], tuple[int, int]] = {}
+    for slot, path in found.items():
+        if slot[0] <= 0:
+            continue
+        disk_title = _title_key(_title_from_filename(path))
+        if len(disk_title) < 4:
+            continue
+        here = by_slot.get(slot)
+        if here and similar(disk_title, here) >= 80:
+            continue  # the numbers already agree
+        ranked = sorted(((similar(disk_title, t), key) for key, t in by_slot.items()),
+                        reverse=True)
+        best_score, best_slot = ranked[0]
+        if best_score < 88 or best_slot == slot:
+            continue
+        if len(ranked) > 1 and ranked[1][0] >= best_score - 5:
+            continue  # ambiguous: two episodes fit about equally well
+        moves[slot] = best_slot
+
+    if not moves:
+        return found, 0
+    claims: dict[tuple[int, int], int] = {}
+    for target in moves.values():
+        claims[target] = claims.get(target, 0) + 1
+    staying = {k: v for k, v in found.items() if k not in moves}
+    result = dict(staying)
+    moved = 0
+    for source, target in moves.items():
+        if claims[target] > 1 or target in staying:
+            result.setdefault(source, found[source])  # contested: leave it
+            continue
+        result[target] = found[source]
+        moved += 1
+    return result, moved
+
+
 def _remap_disk_seasons_to_tracker(
     found: dict[tuple[int, int], str], episodes: list,
 ) -> tuple[dict[tuple[int, int], str], bool]:
@@ -734,6 +823,9 @@ def _sync_show_impl(show_id: int) -> str:
         found, remapped = _remap_disk_seasons_to_tracker(found, episodes)
         if remapped:
             ordering_note += " (Season folders matched to the tracker's continuous numbering)"
+        found, by_title = _remap_disk_by_titles(found, episodes)
+        if by_title:
+            ordering_note += f" ({by_title} file(s) matched by episode title)"
 
     # One-episode shows (most hentai, many OVAs) often ship a single file
     # with no number at all — a lone video IS episode 1.
