@@ -21,7 +21,8 @@ before zipping, and never zip a staged folder (staging injects the local
    `CN=Charles Chambers`.
 5. **Assemble the zip** from the RAW build folder (never from a staged one):
    bundle + `anime_meta.sqlite` + `.env.example` + `setup_autostart.bat` +
-   `remove_autostart.bat` + `LICENSE` → `Sensarr-v<ver>-windows.zip` (the
+   `start_sensarr.bat` + `remove_autostart.bat` + `LICENSE` →
+   `Sensarr-v<ver>-windows.zip` (the
    name pattern the 1.3.x releases actually shipped).
    For the 1.4.x transition releases: also drop a second copy of the signed
    `Sensarr.exe` into the zip's bundle folder named `Plexxarr.exe`. The 1.3.x
