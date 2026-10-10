@@ -252,9 +252,14 @@ torrent.on("ready", () => {
     neighbours: neighbours.map((f) => f.path),
   });
   // Finish when OUR files are done (see finish()). Resumed data may already
-  // complete them.
-  selectedFiles.forEach((file) => file.on("done", () => { if (wantedDone()) finish(); }));
-  if (wantedDone()) finish();
+  // complete them. Deferred with setImmediate: a file's "done" fires inside
+  // webtorrent's own _checkDone loop, and destroying the client right there
+  // crashed the next loop step (TypeError on a null client) after we had
+  // already reported "done", so every finished download exited with code 1.
+  selectedFiles.forEach((file) => file.on("done", () => {
+    setImmediate(() => { if (wantedDone()) finish(); });
+  }));
+  setImmediate(() => { if (wantedDone()) finish(); });
 });
 
 const progressTimer = setInterval(() => {
@@ -304,6 +309,8 @@ function wantedDone() {
   return wantedFiles.length > 0 && wantedFiles.every((f) => f.done);
 }
 
+let doneReported = false;
+
 function finish() {
   if (finished) return;
   clearInterval(progressTimer);
@@ -312,7 +319,16 @@ function finish() {
     name: torrent.name,
     files: wantedFiles.map((f) => ({ path: f.path, size: f.length })),
   });
+  doneReported = true;
   die(0); // destroy immediately — stops seeding
 }
 
-torrent.on("done", finish);
+torrent.on("done", () => setImmediate(finish));
+
+// Anything that blows up while tearing down AFTER the files were reported
+// done must not turn a finished download into a failed one.
+process.on("uncaughtException", (err) => {
+  if (doneReported) process.exit(0);
+  emit({ event: "error", message: String((err && err.message) || err) });
+  process.exit(1);
+});

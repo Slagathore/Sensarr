@@ -155,7 +155,44 @@ def test_cache_check_sends_the_rd_token_only_when_asked(monkeypatch):
     monkeypatch.setattr(config, "REALDEBRID_CACHE_CHECK", False)
     torrentio.clear_cache()
     torrent_search.search_torrentio(FUTURAMA, "tv")
-    assert [c[4] for c in calls] == ["tok123", None]
+    # With the check on: the keyless pool query, then the keyed cache query.
+    assert [c[4] for c in calls] == [None, "tok123", None]
+
+
+def test_full_pool_is_keyless_and_the_key_only_marks_cached(monkeypatch):
+    """Live 2026-10-10: a keyed Torrentio query returned 11 releases (10
+    cached) where the keyless one returned 51, and every plain-English copy
+    was missing. The pool must come from the keyless answer."""
+    full = [_stream(ch, torrent=f"Movie 2024 1080p {ch}", seeders=50) for ch in "abcd"]
+    keyed = [_stream("a", torrent="Movie 2024 1080p a", seeders=50, cached=True),
+             _stream("e", torrent="Movie 2024 720p only-on-rd", seeders=0, cached=True)]
+
+    def fake(video_id, kind, **kw):
+        return list(keyed if kw.get("debrid_key") else full)
+    monkeypatch.setattr(torrentio, "search", fake)
+    monkeypatch.setattr(config, "REALDEBRID_API_TOKEN", "tok123")
+    monkeypatch.setattr(config, "REALDEBRID_CACHE_CHECK", True)
+    monkeypatch.setattr(config, "QBITTORRENT_ENABLED", False)
+    res = {torrent_search._infohash(r.magnet)[:1]: r for r in
+           torrent_search.search_torrentio(TorrentioTarget("tt1", "movie"), "movie")}
+    assert set(res) == {"a", "b", "c", "d", "e"}
+    assert res["a"].cached is True and res["e"].cached is True
+    assert res["b"].cached is False          # RD answered: known not cached
+
+
+def test_a_failed_cache_check_keeps_the_pool_with_unknown_cache_state(monkeypatch):
+    full = [_stream(ch, torrent=f"Movie 2024 1080p {ch}", seeders=50) for ch in "ab"]
+
+    def fake(video_id, kind, **kw):
+        if kw.get("debrid_key"):
+            raise torrentio.TorrentioError("HTTP 502", 502)
+        return list(full)
+    monkeypatch.setattr(torrentio, "search", fake)
+    monkeypatch.setattr(config, "REALDEBRID_API_TOKEN", "tok123")
+    monkeypatch.setattr(config, "REALDEBRID_CACHE_CHECK", True)
+    monkeypatch.setattr(config, "QBITTORRENT_ENABLED", False)
+    res = torrent_search.search_torrentio(TorrentioTarget("tt1", "movie"), "movie")
+    assert len(res) == 2 and all(r.cached is None for r in res)
 
 
 def test_disabled_or_no_target_never_calls_torrentio(monkeypatch):

@@ -90,7 +90,9 @@ _FOREIGN_LANGUAGE_PENALTY = -40.0  # superseded 2026-10-10, see below
 # loses to any plain English copy of similar quality. Both stay scores, not
 # gates: the only copy in existence can still win.
 _NO_ENGLISH_PENALTY = -120.0
-_ENGLISH_NOT_PRIMARY_PENALTY = -50.0
+# -80, not -50: at -50 an Indian multi-language TRUE WEB-DL still tied an
+# English BluRay with 100 seeders (The Love Hypothesis, 2026-10-10).
+_ENGLISH_NOT_PRIMARY_PENALTY = -80.0
 # Titles from these countries are English-original. For anything else (a
 # Korean show, a French film) the original language is expected, so it is not
 # penalised: Cole's "wild hair for a foreign film" exception.

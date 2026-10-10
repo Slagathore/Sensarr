@@ -99,7 +99,7 @@ def test_dual_audio_is_a_bonus_for_anime_only():
     # For TV/movies English must be the primary track, so dual audio is the
     # "English is not primary" penalty there, never the anime bonus.
     parsed, _ = rtn_compat.parse_release("Show S01E01 1080p Dual Audio")
-    assert ts.language_score("Show S01E01 1080p Dual Audio", parsed, "tv") == -50.0
+    assert ts.language_score("Show S01E01 1080p Dual Audio", parsed, "tv") == -80.0
 
 
 def test_cached_release_skips_the_seeder_floor_and_scores_a_bonus():

@@ -270,7 +270,7 @@ def test_english_alongside_other_languages_is_still_penalised():
     # paramount): an ENG tag no longer cancels the penalty, it only softens it
     # from "no English" to "English is not the main track".
     assert _components("Some.Movie.2024.MULTi.ENG.FRE.1080p", "movie",
-                       "Some Movie", 2024)["language_pref"] == -50.0
+                       "Some Movie", 2024)["language_pref"] == -80.0
     assert _components("Some.Movie.2024.FRENCH.1080p", "movie",
                        "Some Movie", 2024)["language_pref"] == -120.0
     assert _components("Some.Movie.2024.1080p.WEB-DL", "movie",
@@ -304,7 +304,7 @@ def test_foreign_language_tv_is_a_heavy_non_preference():
 
 def test_tv_multi_language_with_english_is_still_penalised():
     assert _components("Show.S01E02.MULTi.ENG.FRE.1080p.WEB", "tv",
-                       "Show")["language_pref"] == -50.0
+                       "Show")["language_pref"] == -80.0
 
 
 def test_english_tv_episode_beats_the_spanish_one():
@@ -507,7 +507,7 @@ def test_torrentio_language_flags_count():
     gb, it = "\U0001F1EC\U0001F1E7", "\U0001F1EE\U0001F1F9"
     parsed, _ = rtn_compat.parse_release("Show S01E01 1080p WEB")
     assert ts.language_score("Show S01E01 1080p WEB", parsed, "tv", hints=(it,)) == -120.0
-    assert ts.language_score("Show S01E01 1080p WEB", parsed, "tv", hints=(gb, it)) == -50.0
+    assert ts.language_score("Show S01E01 1080p WEB", parsed, "tv", hints=(gb, it)) == -80.0
     assert ts.language_score("Show S01E01 1080p WEB", parsed, "tv", hints=(gb,)) == 0.0
 
 
@@ -535,4 +535,4 @@ def test_english_subtitles_do_not_make_a_foreign_release_english():
                   "Movie.2024.FRENCH.1080p.English.Subbed"):
         assert _components(title, "movie", "Movie", 2024)["language_pref"] == -120.0, title
     assert _components("Movie.2024.iTA-ENG.1080p", "movie", "Movie",
-                       2024)["language_pref"] == -50.0
+                       2024)["language_pref"] == -80.0

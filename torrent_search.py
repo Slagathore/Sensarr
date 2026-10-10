@@ -499,11 +499,15 @@ def search_torrentio(target: TorrentioTarget | None,
         logger.debug("Torrentio circuit open; skipping %s.", target.imdb_id)
         return []
     key = debrid_cache_key()
+    query = dict(season=target.season, episode=target.episode,
+                 base=config.TORRENTIO_BASE_URL,
+                 options=torrentio_options(media_type))
     try:
-        streams = torrentio.search(
-            target.imdb_id, target.kind, season=target.season,
-            episode=target.episode, base=config.TORRENTIO_BASE_URL,
-            options=torrentio_options(media_type), debrid_key=key)
+        # The full pool comes from a KEYLESS query: with a Real-Debrid key
+        # Torrentio answers mostly with cached releases and drops most of the
+        # rest (The Love Hypothesis, 2026-10-10: 51 releases without the key,
+        # 11 with it, every plain-English copy gone).
+        streams = torrentio.search(target.imdb_id, target.kind, **query)
     except torrentio.TorrentioError as exc:
         _record_provider_failure("torrentio", exc)
         return []
@@ -511,9 +515,28 @@ def search_torrentio(target: TorrentioTarget | None,
         logger.debug("Torrentio target unusable (%s): %s", target, exc)
         return []
     _record_provider_success("torrentio")
+
+    # The keyed query is used only to learn which releases RD already holds.
+    cached_hashes: set[str] = set()
+    cache_known = False
+    extra: list = []
+    if key:
+        try:
+            keyed = torrentio.search(target.imdb_id, target.kind,
+                                     debrid_key=key, **query)
+            cached_hashes = {s.info_hash for s in keyed if s.cached}
+            known = {s.info_hash for s in streams}
+            extra = [s for s in keyed if s.info_hash not in known]
+            cache_known = True
+        except torrentio.TorrentioError as exc:
+            logger.info("Torrentio cache check failed (pool kept, cache "
+                        "state unknown): %s", exc)
+
     results = []
-    for stream in streams:
-        if stream.size_bytes <= 0 and stream.cached is not True:
+    for stream in list(streams) + extra:
+        cached = (True if stream.info_hash in cached_hashes
+                  else (False if cache_known else None))
+        if stream.size_bytes <= 0 and cached is not True:
             continue
         in_pack = bool(stream.file_path)
         results.append(TorrentResult(
@@ -523,7 +546,7 @@ def search_torrentio(target: TorrentioTarget | None,
             source="torrentio", media_type=media_type,
             file_idx=stream.file_idx if in_pack else None,
             file_name=stream.file_name if in_pack else None,
-            cached=stream.cached,
+            cached=cached,
             audio_tags=tuple(stream.audio_tags) + tuple(stream.language_flags)))
     return results
 
