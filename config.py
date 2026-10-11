@@ -456,6 +456,13 @@ TORRENTIO_BASE_URL: str = os.getenv(
 # the addon's own install URL. Blank = Sensarr's defaults: English-language
 # sites (plus the anime trackers for anime), cams/screeners/3D filtered out.
 TORRENTIO_OPTIONS: str = os.getenv("TORRENTIO_OPTIONS", "").strip()
+# The same, per media type (Settings shows one box with a type dropdown). A
+# blank one uses Sensarr's default for that type; TORRENTIO_OPTIONS above is
+# the old one-for-everything key and only fills a type left blank.
+TORRENTIO_OPTIONS_MOVIE: str = os.getenv("TORRENTIO_OPTIONS_MOVIE", "").strip()
+TORRENTIO_OPTIONS_TV: str = os.getenv("TORRENTIO_OPTIONS_TV", "").strip()
+TORRENTIO_OPTIONS_ANIME: str = os.getenv("TORRENTIO_OPTIONS_ANIME", "").strip()
+TORRENTIO_OPTIONS_XANIME: str = os.getenv("TORRENTIO_OPTIONS_XANIME", "").strip()
 # Real-Debrid (https://real-debrid.com/apitoken). With a token, downloads go
 # through Real-Debrid over HTTPS instead of the local torrent client: a release
 # RD already has cached arrives at line speed with no seeders needed, and RD's
@@ -533,3 +540,13 @@ SHOWS_AUTO_GRAB: bool = _env_bool("SHOWS_AUTO_GRAB", False)
 SHOWS_GRAB_LIMIT_PER_PASS: int = int(os.getenv("SHOWS_GRAB_LIMIT_PER_PASS", "8"))
 # Re-sync a show's episode list when older than this before auto-grabbing.
 SHOWS_SYNC_MAX_AGE_HOURS: int = int(os.getenv("SHOWS_SYNC_MAX_AGE_HOURS", "12"))
+# A show tagged "match existing size" is one Cole wants the moment it airs: its
+# newly aired episodes are re-checked every FAST_FOLLOW_RECHECK_MINUTES for
+# FAST_FOLLOW_WINDOW_DAYS after airing, and may take a release up to
+# FAST_FOLLOW_SIZE_FACTOR x the standard size right away instead of waiting a
+# day. Preference order: the library's own size, then the standard size, then
+# anything up to that factor.
+FAST_FOLLOW_ENABLED: bool = _env_bool("FAST_FOLLOW_ENABLED", True)
+FAST_FOLLOW_RECHECK_MINUTES: float = float(os.getenv("FAST_FOLLOW_RECHECK_MINUTES", "30"))
+FAST_FOLLOW_WINDOW_DAYS: int = int(os.getenv("FAST_FOLLOW_WINDOW_DAYS", "7"))
+FAST_FOLLOW_SIZE_FACTOR: float = float(os.getenv("FAST_FOLLOW_SIZE_FACTOR", "4"))

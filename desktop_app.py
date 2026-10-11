@@ -3,6 +3,7 @@ import dataclasses
 import datetime
 import logging
 import os
+import queue
 import re
 import shutil
 import subprocess
@@ -169,6 +170,12 @@ class DesktopApp:
     def __init__(self) -> None:
         self.bot_service = TelegramBotService()
         self.root = tk.Tk()
+        # Worker threads hand UI work to this queue and only the Tk thread runs
+        # it (_drain_ui_queue). Calling root.after() from five download threads
+        # at once hung the whole window on 2026-10-10 (py-spy: every
+        # torrent-dl thread parked in tkinter's _register).
+        self._ui_thread = threading.current_thread()
+        self._ui_queue: queue.Queue = queue.Queue()
         self.root.title(f"Sensarr v{config.APP_VERSION}")
         try:
             # Taskbar/alt-tab icon — same mark as the tray and the EXE.
@@ -502,6 +509,7 @@ class DesktopApp:
                                exc_info=True)
                 self._tray_icon = None
         self.root.after(0, self._initialize_runtime_state)
+        self.root.after(50, self._drain_ui_queue)
         # Legacy-path migration (Task H item 2) is offered in main.py BEFORE
         # this class constructs — __init__ initializes databases at the XDG
         # destination, which would otherwise block the main DB's copy.
@@ -1248,12 +1256,39 @@ class DesktopApp:
         self.root.withdraw()
 
     def _post_to_ui(self, callback, *, delay_ms: int = 0) -> bool:
+        if threading.current_thread() is not getattr(self, "_ui_thread", None):
+            # Never touch Tk from a worker thread; the Tk thread picks it up.
+            self._ui_queue.put((delay_ms, callback))
+            return True
         try:
             self.root.after(delay_ms, callback)
             return True
         except (RuntimeError, tk.TclError):
             logger.debug("Skipped UI callback because Tk is not accepting new work.")
             return False
+
+    def _drain_ui_queue(self) -> None:
+        """Run the UI work worker threads queued (Tk thread only). Bounded per
+        tick so a burst of progress updates cannot starve mouse and keys."""
+        for _ in range(500):
+            try:
+                delay_ms, callback = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                if delay_ms > 0:
+                    self.root.after(delay_ms, callback)
+                else:
+                    callback()
+            except (RuntimeError, tk.TclError):
+                logger.debug("Skipped UI callback because Tk is not accepting new work.")
+            except Exception:
+                logger.exception("UI callback failed.")
+        if not self._quitting:
+            try:
+                self.root.after(50, self._drain_ui_queue)
+            except (RuntimeError, tk.TclError):
+                pass
 
     def _messagebox_parent(self) -> tk.Misc | None:
         return self.root if self.root.winfo_viewable() else None
@@ -3144,6 +3179,13 @@ class DesktopApp:
             except Exception:
                 return False
 
+        # One worker at a time: a pass still searching from the last tick
+        # would collide with a new one on the Shows lock (and a shows pass
+        # that lost that race was then skipped for six hours).
+        previous = getattr(self, "_auto_grab_thread", None)
+        if previous is not None and previous.is_alive():
+            self.root.after(300_000, self._auto_grab_tick)
+            return
         run_request_pass = bool(config.TORRENT_AUTO_GRAB)
         # Shows loop: auto-grab missing episodes at most every 6 hours (the
         # pass re-syncs stale shows itself, so freshly-aired episodes appear).
@@ -3154,8 +3196,11 @@ class DesktopApp:
             and (config.SHOWS_AUTO_GRAB or _any_flagged()))
         if run_shows_pass:
             self._last_shows_grab_pass = time.time()
+        # "Match existing size" shows get their newly aired episodes checked on
+        # every tick; each episode's own 30-minute hold keeps this cheap.
+        run_fast_follow = bool(config.FAST_FOLLOW_ENABLED)
 
-        if run_request_pass or run_shows_pass:
+        if run_request_pass or run_shows_pass or run_fast_follow:
             def worker() -> None:
                 # These passes can both sync tracked-show episode grids.  They
                 # used to launch as competing threads at the same instant on
@@ -3171,6 +3216,14 @@ class DesktopApp:
                     else:
                         if started:
                             self._post_to_ui(self.refresh_downloads)
+                if run_fast_follow:
+                    try:
+                        started = self.download_manager.fast_follow_pass()
+                    except Exception:
+                        logger.exception("Fast follow pass failed.")
+                    else:
+                        if started:
+                            self._post_to_ui(self.refresh_downloads)
                 if not run_shows_pass:
                     return
                 try:
@@ -3182,8 +3235,9 @@ class DesktopApp:
                     logger.info("Shows auto-grab started %d download(s).", len(started))
                     self._post_to_ui(self.refresh_downloads)
                     self._post_to_ui(self.shows_tab.refresh)
-            threading.Thread(
-                target=worker, name="ui-auto-grab", daemon=True).start()
+            self._auto_grab_thread = threading.Thread(
+                target=worker, name="ui-auto-grab", daemon=True)
+            self._auto_grab_thread.start()
 
         self.root.after(300_000, self._auto_grab_tick)
 
@@ -6247,7 +6301,7 @@ class DesktopApp:
         ("STAGING_SWEEP_ENABLED", "Daily cleanup of partial files from stalled downloads", "bool"),
         ("TORRENTIO_ENABLED", "Also search Torrentio (needs the TMDB key)", "bool"),
         ("TORRENTIO_BASE_URL", "Torrentio address", "text"),
-        ("TORRENTIO_OPTIONS", "Torrentio options (blank = Sensarr defaults)", "text"),
+        ("TORRENTIO_OPTIONS", "Torrentio options, per type (blank = Sensarr default)", "torrentio_options"),
         # Real-Debrid (optional download service)
         ("REALDEBRID_API_TOKEN", "Real-Debrid API token (real-debrid.com/apitoken; blank = off)", "secret"),
         ("REALDEBRID_CACHE_CHECK", "Prefer releases already cached on Real-Debrid", "bool"),
@@ -6433,6 +6487,9 @@ class DesktopApp:
                 # At build time AND on every dropdown open (retry-friendly).
                 combo.configure(postcommand=_fill_accounts)
                 _fill_accounts()
+            elif kind == "torrentio_options":
+                var = self._build_torrentio_options_row(
+                    form_frame, row, current_values, legacy=current)
             else:  # "text"
                 var = tk.StringVar(value=current)
                 ttk.Entry(form_frame, textvariable=var).grid(row=row, column=1, sticky="ew")
@@ -6668,6 +6725,63 @@ class DesktopApp:
         self._settings_refresh_paths_tree()
         self._settings_status_var.set(f"Removed {len(to_drop)} path(s) (not yet saved)")
 
+    _TORRENTIO_TYPES = (("movie", "Movies", "TORRENTIO_OPTIONS_MOVIE"),
+                        ("tv", "TV shows", "TORRENTIO_OPTIONS_TV"),
+                        ("anime", "Anime", "TORRENTIO_OPTIONS_ANIME"),
+                        ("xanime", "Hentai", "TORRENTIO_OPTIONS_XANIME"))
+
+    def _build_torrentio_options_row(self, frame: ttk.Frame, row: int,
+                                     current_values: dict[str, str],
+                                     legacy: str) -> tk.StringVar:
+        """One text box with a type dropdown in front of it: each media type
+        keeps its own Torrentio string. Returns the var for the old
+        all-types key, which saves blank once its value has moved into every
+        type."""
+        from torrent_search import format_torrentio_options, torrentio_default_options
+        legacy = (legacy or "").strip()
+        types = [t for t in self._TORRENTIO_TYPES
+                 if t[0] != "xanime" or config.XANIME_ENABLED]
+        type_vars: dict[str, tk.StringVar] = {}
+        for _media, _label, key in self._TORRENTIO_TYPES:
+            saved = (current_values.get(key) or getattr(config, key, "") or "").strip()
+            type_vars[key] = tk.StringVar(value=saved or legacy)
+            self._settings_vars[key] = type_vars[key]
+        self._torrentio_option_keys = [key for *_rest, key in self._TORRENTIO_TYPES]
+
+        cell = ttk.Frame(frame)
+        cell.grid(row=row, column=1, sticky="ew")
+        cell.columnconfigure(1, weight=1)
+        choice = tk.StringVar(value=types[0][1])
+        combo = ttk.Combobox(cell, textvariable=choice, state="readonly", width=10,
+                             values=[label for _m, label, _k in types])
+        combo.grid(row=0, column=0, sticky="w")
+        entry = ttk.Entry(cell)
+        entry.grid(row=0, column=1, sticky="ew", padx=6)
+        hint = ttk.Label(cell, foreground=_MUTED_TEXT, wraplength=640, justify="left")
+        hint.grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 0))
+
+        def selected() -> tuple[str, str]:
+            for media, label, key in types:
+                if label == choice.get():
+                    return media, key
+            return types[0][0], types[0][2]
+
+        def show(_event: Any = None) -> None:
+            media, key = selected()
+            entry.configure(textvariable=type_vars[key])
+            default = format_torrentio_options(torrentio_default_options(media))
+            hint.configure(text=f"Blank uses the default for {choice.get().lower()}: "
+                                f"{default}")
+
+        def fill_default() -> None:
+            media, key = selected()
+            type_vars[key].set(format_torrentio_options(torrentio_default_options(media)))
+
+        ttk.Button(cell, text="Fill in default", command=fill_default).grid(row=0, column=2)
+        combo.bind("<<ComboboxSelected>>", show)
+        show()
+        return tk.StringVar(value="")
+
     def _settings_browse_file(self, var: tk.Variable) -> None:
         chosen = filedialog.askopenfilename(parent=self.root, title="Select file")
         if chosen:
@@ -6723,6 +6837,12 @@ class DesktopApp:
             value = float(var.get())
             updates[key] = f"{value:g}" if value > 0 else ""
 
+        # Per-type Torrentio strings (the dropdown row keeps one var per type).
+        for key in getattr(self, "_torrentio_option_keys", ()):
+            var = self._settings_vars.get(key)
+            if var is not None:
+                updates[key] = str(var.get()).strip()
+
         # Encode the path list. Always write MEDIA_LIBRARY_PATHS, and clear
         # PLEX_LIBRARY_PATHS so we don't keep a stale legacy fallback active.
         updates["MEDIA_LIBRARY_PATHS"] = config.format_media_library_paths(
@@ -6757,6 +6877,12 @@ class DesktopApp:
         # immediately for everything that reads `config.NAME` at call time
         # (library paths, API keys, server URLs, etc.).
         reload_warning = ""
+        # A setting saved blank is dropped from .env, but load_dotenv only ever
+        # ADDS to os.environ, so the old value would live on until a restart
+        # (a cleared Torrentio box kept the old string). Clear them here.
+        for key, value in updates.items():
+            if value == "":
+                os.environ.pop(key, None)
         try:
             reload_config_from_env(config.DOTENV_PATH)
         except RuntimeError as exc:

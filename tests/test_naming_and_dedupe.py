@@ -173,6 +173,41 @@ def test_torrentio_options_per_media_type(monkeypatch):
                                                       "sort": "seeders"}
 
 
+def test_torrentio_options_can_differ_per_type(monkeypatch):
+    # Cole, 2026-10-11: one override for everything was wrong; each type gets
+    # its own, and changing anime must not touch movies.
+    for key in torrent_search.TORRENTIO_TYPE_KEYS.values():
+        monkeypatch.setattr(config, key, "")
+    monkeypatch.setattr(config, "TORRENTIO_OPTIONS", "")
+    monkeypatch.setattr(config, "TORRENTIO_OPTIONS_ANIME", "providers=nyaasi|sort=seeders")
+    assert torrent_search.torrentio_options("anime") == {"providers": "nyaasi",
+                                                         "sort": "seeders"}
+    assert torrent_search.torrentio_options("movie") == \
+        torrent_search.torrentio_default_options("movie")
+    # Hentai gets the anime trackers by default.
+    assert "nyaasi" in torrent_search.torrentio_options("xanime")["providers"]
+    # The old all-types key only fills a type left blank.
+    monkeypatch.setattr(config, "TORRENTIO_OPTIONS", "providers=yts")
+    assert torrent_search.torrentio_options("tv") == {"providers": "yts"}
+    assert torrent_search.torrentio_options("anime")["providers"] == "nyaasi"
+    # Round trip through Torrentio's own syntax.
+    default = torrent_search.torrentio_default_options("tv")
+    monkeypatch.setattr(config, "TORRENTIO_OPTIONS_TV",
+                        torrent_search.format_torrentio_options(default))
+    assert torrent_search.torrentio_options("tv") == default
+
+
+def test_hentai_text_search_also_asks_the_main_nyaa_site(monkeypatch):
+    calls = []
+    monkeypatch.setattr(torrent_search, "search_sukebei",
+                        lambda q, **k: calls.append("sukebei") or [])
+    monkeypatch.setattr(torrent_search, "_search_nyaa_rss",
+                        lambda base, q, cat, source, media_type, **k:
+                        calls.append((base, media_type)) or [])
+    torrent_search._search_one("Some Title", "xanime", limit=5, collect=False)
+    assert calls == ["sukebei", ("https://nyaa.si", "xanime")]
+
+
 # --- attempt cap ------------------------------------------------------------------------
 
 def test_attempt_cap_still_counts_app_side_failures():

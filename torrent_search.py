@@ -455,27 +455,48 @@ def _torrentio_title(stream: "torrentio.TorrentioStream") -> str:
 # Spanish, Italian, French) stay out of the pool instead of feeding it dubs.
 # Anime adds the anime trackers. Cams, screeners and 3D are filtered at the
 # source. No limit and no sort: Sensarr's selector ranks the full pool itself.
-# TORRENTIO_OPTIONS (raw "key=value|key=value") overrides all of this.
+# Each type can be overridden with a raw "key=value|key=value" string in
+# Settings (TORRENTIO_OPTIONS_MOVIE / _TV / _ANIME / _XANIME).
 _TORRENTIO_GENERAL = ("yts", "eztv", "rarbg", "1337x", "ext", "thepiratebay",
                       "kickasstorrents", "torrentgalaxy", "magnetdl")
 _TORRENTIO_ANIME = ("nyaasi", "horriblesubs", "tokyotosho", "anidex", "nekobt")
 _TORRENTIO_EXCLUDED_QUALITIES = ("threed", "scr", "cam")
+TORRENTIO_TYPE_KEYS = {"movie": "TORRENTIO_OPTIONS_MOVIE",
+                       "tv": "TORRENTIO_OPTIONS_TV",
+                       "anime": "TORRENTIO_OPTIONS_ANIME",
+                       "xanime": "TORRENTIO_OPTIONS_XANIME"}
 
 
-def torrentio_options(media_type: str) -> dict:
-    """The Torrentio config segment for one media type, as a dict."""
-    raw = (getattr(config, "TORRENTIO_OPTIONS", "") or "").strip()
-    if raw:
-        opts = {}
-        for part in raw.split("|"):
-            key, _, value = part.partition("=")
-            if key.strip() and value.strip():
-                opts[key.strip()] = value.strip()
-        return opts
+def torrentio_default_options(media_type: str) -> dict:
+    """Sensarr's own Torrentio config for a type: English-language sites, the
+    anime trackers for anime and hentai, cams/screeners/3D filtered out."""
     providers = _TORRENTIO_GENERAL + (
         _TORRENTIO_ANIME if media_type in ("anime", "xanime") else ())
     return {"providers": ",".join(providers),
             "qualityfilter": ",".join(_TORRENTIO_EXCLUDED_QUALITIES)}
+
+
+def format_torrentio_options(opts: dict) -> str:
+    """The dict back into Torrentio's own "key=value|key=value" syntax."""
+    return "|".join(f"{k}={v}" for k, v in opts.items())
+
+
+def torrentio_options(media_type: str) -> dict:
+    """The Torrentio config segment for one media type, as a dict: that type's
+    override from Settings, else the old all-types override, else the
+    default."""
+    key = TORRENTIO_TYPE_KEYS.get(media_type, "TORRENTIO_OPTIONS_TV")
+    raw = ((getattr(config, key, "") or "").strip()
+           or (getattr(config, "TORRENTIO_OPTIONS", "") or "").strip())
+    if raw:
+        opts = {}
+        for part in raw.split("|"):
+            k, _, value = part.partition("=")
+            if k.strip() and value.strip():
+                opts[k.strip()] = value.strip()
+        if opts:
+            return opts
+    return torrentio_default_options(media_type)
 
 
 def debrid_cache_key() -> str | None:
@@ -722,6 +743,9 @@ def _search_one(query: str, media_type: str, *, limit: int,
         results.extend(search_nyaa(query, limit=limit, collect=collect))
     elif media_type == "xanime":
         results.extend(search_sukebei(query, limit=limit, collect=collect))
+        # Softer titles live on the main nyaa site, not just sukebei.
+        results.extend(_search_nyaa_rss("https://nyaa.si", query, "1_2", "nyaa",
+                                        "xanime", limit=limit, collect=collect))
     else:  # tv / other / unknown
         results.extend(search_tpb(query, media_type, limit=limit, collect=collect))
     return results

@@ -289,17 +289,21 @@ def test_interrupted_on_restart():
     """Rows persisted as running/queued by a dead process become
     'interrupted' at init — the journal never pretends a daemon thread
     survived a restart."""
+    # Recent timestamps: fixed 2026-07-13 dates aged past the 90-day
+    # retention on 2026-10-11 and the prune deleted the rows under test.
+    import datetime
+    now = datetime.datetime.now(datetime.timezone.utc)
+    stamp = lambda s: (now - datetime.timedelta(seconds=s)).strftime("%Y-%m-%d %H:%M:%S")
     with db.connect() as conn:
         conn.execute(maint_jobs._SCHEMA_JOBS)
         cur = conn.execute(
             "INSERT INTO maintenance_jobs (tool_key, label, state, queued_at, "
-            "started_at) VALUES ('t_restart', 'Zombie run', 'running', "
-            "'2026-07-13 03:00:00', '2026-07-13 03:00:05')")
+            "started_at) VALUES ('t_restart', 'Zombie run', 'running', ?, ?)",
+            (stamp(65), stamp(60)))
         running_id = int(cur.lastrowid or 0)
         cur = conn.execute(
             "INSERT INTO maintenance_jobs (tool_key, label, state, queued_at) "
-            "VALUES ('t_restart', 'Never-started run', 'queued', "
-            "'2026-07-13 03:00:01')")
+            "VALUES ('t_restart', 'Never-started run', 'queued', ?)", (stamp(64),))
         queued_id = int(cur.lastrowid or 0)
         conn.commit()
 

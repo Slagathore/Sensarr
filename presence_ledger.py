@@ -126,8 +126,16 @@ def placed_episodes(download_id: int) -> list[tuple[int, int, str]]:
             season, episode = _season_episode_from_path(entry.final_path)
         if episode is None:
             continue
-        out.append((int(season) if season is not None else 1,
-                    int(episode), entry.final_path))
+        season = int(season) if season is not None else 1
+        out.append((season, int(episode), entry.final_path))
+        # A multi-episode file ("Max & Ruby - S01E04-E06") covers every
+        # episode in its range, not just the first.
+        import torrent_routing
+        parsed = torrent_routing.parse_torrent_name(Path(entry.final_path).name)
+        if (parsed.last_episode is not None and parsed.episode == int(episode)
+                and parsed.last_episode - int(episode) <= 10):
+            out.extend((season, e, entry.final_path)
+                       for e in range(int(episode) + 1, parsed.last_episode + 1))
     return out
 
 

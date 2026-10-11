@@ -674,10 +674,12 @@ def _show_folder_records(progress, indexed: list[tuple[str, str]],
     return out
 
 
-def _download_records(progress) -> list[dict]:
+def _download_records(progress, wanted: set[str] | None = None) -> list[dict]:
     """Phase 3 (movies): a placed movie download's verified file inherits the
     identity of the request it fulfilled. Covers movies moved before the
-    placement hook existed."""
+    placement hook existed. `wanted` (normcased paths) limits it to the files
+    the folder watcher just saw, before the per-file name check runs."""
+    import os
     import downloads_store
     import queue_store
     out: list[dict] = []
@@ -690,6 +692,9 @@ def _download_records(progress) -> list[dict]:
                 if f.verification_state not in ("verified", "duplicate"):
                     continue
                 if not f.final_path:
+                    continue
+                if (wanted is not None and os.path.normcase(
+                        os.path.normpath(f.final_path)) not in wanted):
                     continue
                 if placed_file_contradicts(
                         f.final_path, media_type="movie",
@@ -863,6 +868,6 @@ def backfill_paths(paths: list[str]) -> dict:
     summary = {
         "episodes": _bulk_upsert(_keep(_episode_records(_noop, shows))),
         "show_folder": _bulk_upsert(_show_folder_records(_noop, indexed, shows)),
-        "download": _bulk_upsert(_keep(_download_records(_noop))),
+        "download": _bulk_upsert(_keep(_download_records(_noop, wanted=want))),
     }
     return summary

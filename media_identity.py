@@ -391,5 +391,21 @@ def compare_media_identity(want: MediaIdentity, parsed) -> IdentityVerdict:
             return IdentityVerdict(
                 False, "season_contradiction",
                 f"wanted S{want.season}, parsed seasons {season_list}")
+        # Same season, different episode: only when the name spells out both
+        # (S02E06), so absolute-numbered anime ("Show - 25") never trips it.
+        # Real-Debrid served Monster S02E06 to the S02E07 and S02E08 downloads
+        # on 2026-10-10; only a lucky duplicate check kept it from being filed
+        # as S02E07.
+        episodes = getattr(parsed, "episodes", None) or []
+        try:
+            episode_list = [int(e) for e in episodes]
+        except (TypeError, ValueError):
+            episode_list = []
+        if (want.episode is not None and season_list and episode_list
+                and int(want.episode) not in episode_list):
+            return IdentityVerdict(
+                False, "episode_contradiction",
+                f"wanted S{want.season}E{want.episode}, parsed episodes "
+                f"{episode_list}")
 
     return IdentityVerdict(True, "ok", "")

@@ -97,6 +97,8 @@ _RUNNER_PATH = _resolve_runner_path()
 # shell out to npm on every attempt.
 _RUNNER_READY: bool | None = None
 _RUNNER_READY_LOCK = threading.Lock()
+# grab()'s "already fetching?" check and its create_download must be atomic.
+_GRAB_LOCK = threading.RLock()
 
 
 def runner_missing_deps(runner_dir: Path | None = None) -> bool:
@@ -1117,70 +1119,76 @@ class DownloadManager:
         pin = (getattr(result, "file_name", None),
                getattr(result, "file_idx", None))
         our_season = episode_context[1] if episode_context is not None else season
-        existing = None
-        for live in presence_ledger.live_downloads_for(result.magnet):
-            live_pin = _file_pin(live.want_json)
-            if live_pin == pin:
-                existing = live
-                break
-            # A whole-pack download (no pin, no single-episode filter, same or
-            # no season filter) already brings the file a pinned pick wants.
-            # A download pinned to ANOTHER file of the pack does not: riding
-            # along on E05 would leave E06 linked to it forever.
-            if (pin != (None, None) and live_pin == (None, None)
-                    and live.episode is None
-                    and (live.season is None or live.season == our_season)):
-                existing = live
-                break
-        if existing is not None:
-            logger.info(
-                "Grab: download #%s is already fetching %s — linking to it "
-                "instead of starting a second copy.",
-                existing.download_id, result.title)
-            if request_id is not None:
-                role = ("episode" if episode is not None
-                        else "season_pack" if season is not None else "movie")
-                downloads_store.link_request_download(
-                    request_id, existing.download_id, role)
-                if req is not None and req.status in (
-                        queue_store.STATUS_OPEN, queue_store.STATUS_DEFERRED):
-                    queue_store.set_status(request_id,
-                                           queue_store.STATUS_GRABBING)
+        # Check and create as one step: two grab passes ran request #224 at
+        # once on 2026-10-10 and both created Monster S02E02 (#1678/#1679),
+        # which then fought over the same .part file.
+        with _GRAB_LOCK:
+            existing = None
+            for live in presence_ledger.live_downloads_for(result.magnet):
+                live_pin = _file_pin(live.want_json)
+                if live_pin == pin:
+                    existing = live
+                    break
+                # A whole-pack download (no pin, no single-episode filter, same
+                # or no season filter) already brings the file a pinned pick
+                # wants. A download pinned to ANOTHER file of the pack does
+                # not: riding along on E05 would leave E06 linked to it forever.
+                if (pin != (None, None) and live_pin == (None, None)
+                        and live.episode is None
+                        and (live.season is None or live.season == our_season)):
+                    existing = live
+                    break
+            if existing is not None:
+                logger.info(
+                    "Grab: download #%s is already fetching %s — linking to it "
+                    "instead of starting a second copy.",
+                    existing.download_id, result.title)
+                if request_id is not None:
+                    role = ("episode" if episode is not None
+                            else "season_pack" if season is not None else "movie")
+                    downloads_store.link_request_download(
+                        request_id, existing.download_id, role)
+                    if req is not None and req.status in (
+                            queue_store.STATUS_OPEN, queue_store.STATUS_DEFERRED):
+                        queue_store.set_status(request_id,
+                                               queue_store.STATUS_GRABBING)
+                if episode_context is not None:
+                    shows_store.set_episode_grab(
+                        episode_context[0], episode_context[1], episode_context[2],
+                        existing.download_id)
+                return existing.download_id
+
+            download_id = downloads_store.create_download(
+                title=result.title, magnet=result.magnet, source=result.source,
+                media_type=result.media_type, request_id=request_id,
+                staging_dir=str(staging),
+                planned_dest=plan.dest_dir if plan.confident else None,
+                planned_name=plan.new_filename,
+                route_reason=plan.reason,
+                auto_rename=auto_rename, auto_move=auto_move,
+                show_id=show_id, season=season, episode=episode,
+                replace_path=replace_path, failure_key=failure_key,
+                want_json=json.dumps(want), quality_label=quality_label,
+            )
             if episode_context is not None:
                 shows_store.set_episode_grab(
                     episode_context[0], episode_context[1], episode_context[2],
-                    existing.download_id)
-            return existing.download_id
-
-        download_id = downloads_store.create_download(
-            title=result.title, magnet=result.magnet, source=result.source,
-            media_type=result.media_type, request_id=request_id,
-            staging_dir=str(staging),
-            planned_dest=plan.dest_dir if plan.confident else None,
-            planned_name=plan.new_filename,
-            route_reason=plan.reason,
-            auto_rename=auto_rename, auto_move=auto_move,
-            show_id=show_id, season=season, episode=episode,
-            replace_path=replace_path, failure_key=failure_key,
-            want_json=json.dumps(want), quality_label=quality_label,
-        )
-        if episode_context is not None:
-            shows_store.set_episode_grab(
-                episode_context[0], episode_context[1], episode_context[2], download_id,
-            )
-        # Provenance junction from the moment of grab (Task C item 3/4) so a
-        # season request's several episode downloads all trace back to it.
-        if request_id is not None:
-            role = ("episode" if episode is not None
-                    else "season_pack" if season is not None else "movie")
-            downloads_store.link_request_download(request_id, download_id, role)
-            # The request now has a grab in flight — mark it so, so it drops out
-            # of the auto-grab 'open' pool and the UI shows it as grabbing rather
-            # than idle-open. Only advance from a grabbable state; never yank a
-            # request that is already placed/fulfilled/needs_attention.
-            if req is not None and req.status in (
-                    queue_store.STATUS_OPEN, queue_store.STATUS_DEFERRED):
-                queue_store.set_status(request_id, queue_store.STATUS_GRABBING)
+                    download_id,
+                )
+            # Provenance junction from the moment of grab (Task C item 3/4) so
+            # a season request's several episode downloads all trace back to it.
+            if request_id is not None:
+                role = ("episode" if episode is not None
+                        else "season_pack" if season is not None else "movie")
+                downloads_store.link_request_download(request_id, download_id, role)
+                # The request now has a grab in flight — mark it so, so it drops
+                # out of the auto-grab 'open' pool and the UI shows it as
+                # grabbing rather than idle-open. Only advance from a grabbable
+                # state; never yank a request that is already
+                # placed/fulfilled/needs_attention.
+                if req is not None and req.status in (
+                        queue_store.STATUS_OPEN, queue_store.STATUS_DEFERRED):
+                    queue_store.set_status(request_id, queue_store.STATUS_GRABBING)
 
         if config.QBITTORRENT_ENABLED:
             # qBittorrent has its own queue/active limits — hand over directly.
@@ -1763,6 +1771,48 @@ class DownloadManager:
         return False
 
     @staticmethod
+    def _is_fast_follow(show, ep) -> bool:
+        """A "match existing size" show's episode that aired within the
+        fast-follow window."""
+        if (not config.FAST_FOLLOW_ENABLED or not getattr(ep, "air_date", None)
+                or getattr(show, "size_mode", None)
+                != size_match.SIZE_MODE_MATCH_LIBRARY):
+            return False
+        import datetime as _dt
+        today = _dt.date.today()
+        oldest = today - _dt.timedelta(days=config.FAST_FOLLOW_WINDOW_DAYS)
+        return oldest.isoformat() <= ep.air_date <= today.isoformat()
+
+    @staticmethod
+    def _fast_follow_tier(result: TorrentResult, *, minutes: float,
+                          library_rate: float | None,
+                          standard_rate: float) -> int:
+        """0 = the library's own size (within 20%), 1 = the standard size or
+        under (up to 1.2x), 2 = anything bigger the raised cap let through."""
+        if not minutes or minutes <= 0 or result.size_bytes <= 0:
+            return 2
+        rate = result.size_bytes / (minutes * 1024 * 1024)
+        if library_rate and 0.8 * library_rate <= rate <= 1.2 * library_rate:
+            return 0
+        if standard_rate > 0 and rate <= 1.2 * standard_rate:
+            return 1
+        return 2
+
+    @classmethod
+    def _fast_follow_pick(cls, survivors: list[TorrentResult],
+                          chosen: TorrentResult, *, minutes: float,
+                          library_rate: float | None,
+                          standard_rate: float) -> TorrentResult:
+        """Cole's order for a fast-follow grab: matching the library's size,
+        then the standard size, then a bigger one. Within a tier the selector's
+        own ranking (survivors are best-first) still decides."""
+        usable = [r for r in survivors if r.seeders > 0 or r.cached] or [chosen]
+        best = min(enumerate(usable), key=lambda pair: (cls._fast_follow_tier(
+            pair[1], minutes=minutes, library_rate=library_rate,
+            standard_rate=standard_rate), pair[0]))[1]
+        return best
+
+    @staticmethod
     def _deferral_active(key: str) -> bool:
         """True when a prior decision says this key is not due to search yet."""
         detail = downloads_store.get_grab_deferral(key)
@@ -1861,8 +1911,10 @@ class DownloadManager:
         known names. 'House of the Dragon S03E03' can never again be grabbed
         for some anime's S03E03 slot."""
         parsed = torrent_routing.parse_torrent_name(result_title)
-        if episode is not None and parsed.episode is not None and parsed.episode != episode:
-            return False
+        if episode is not None and parsed.episode is not None:
+            last = parsed.last_episode or parsed.episode
+            if not parsed.episode <= episode <= last:   # S01E04E05E06 covers E05
+                return False
         if season is not None and parsed.season is not None and parsed.season != season:
             return False
         names = self._known_names(show)
@@ -2895,7 +2947,8 @@ class DownloadManager:
     def _grab_one_episode(self, show: shows_store.TrackedShow,
                           ep: shows_store.EpisodeRow,
                           *, request_id: int | None = None,
-                          search_title: str | None = None) -> list[int]:
+                          search_title: str | None = None,
+                          fast_follow: bool | None = None) -> list[int]:
         """Search + grab a single tracked episode (shared by the missing-
         episode pass, follow-new/keep-at-100, and season-aware requests).
 
@@ -2903,7 +2956,19 @@ class DownloadManager:
         stop losing their provenance (the Task C item 4 leak; the LINKAGE lands
         now, the junction table is Phase 4). Selection runs through the engine
         in automatic-episode mode.
+
+        `fast_follow` (a newly aired episode of a "match existing size" show)
+        rechecks every FAST_FOLLOW_RECHECK_MINUTES, allows up to
+        FAST_FOLLOW_SIZE_FACTOR x the standard size without the day's wait, and
+        prefers the library's size, then the standard size, then the rest.
+        Left as None it is worked out here, so every pass that reaches such an
+        episode treats it the same (a 6-hour hold from the regular pass would
+        otherwise block the 30-minute cadence).
         """
+        if fast_follow is None:
+            fast_follow = self._is_fast_follow(show, ep)
+        recheck_hours = (config.FAST_FOLLOW_RECHECK_MINUTES / 60.0
+                         if fast_follow else None)
         if ep.grab_download_id is not None:
             linked = downloads_store.get_download(ep.grab_download_id)
             if linked is not None and linked.status not in ("error", "cancelled"):
@@ -2964,6 +3029,12 @@ class DownloadManager:
         if size_pick is not None:
             pool_stats["size_match"] = size_pick.meta()
         pref_override = size_pick.mb_per_min if (size_pick and size_pick.ok) else None
+        standard_rate, _max, default_minutes = _size_prefs(show.media_type)
+        if fast_follow and want.size_max_rate and standard_rate > 0:
+            from dataclasses import replace as _dc_replace
+            want = _dc_replace(want, size_max_rate=max(
+                want.size_max_rate, config.FAST_FOLLOW_SIZE_FACTOR * standard_rate))
+            pool_stats["fast_follow"] = True
         decision, by_hash = self._run_selection(
             viable, want, failure_key=key, pool_stats=pool_stats)
         chosen = by_hash.get(decision.chosen_infohash) if decision.chosen else None
@@ -2977,10 +3048,12 @@ class DownloadManager:
                     deferral_key, viable, show.media_type, minutes=minutes,
                     request_id=request_id,
                     episode_context=(show.show_id, ep.season, ep.episode),
-                    run_id=run_id, candidate_stats=decision.verdict_histogram())
+                    run_id=run_id, candidate_stats=decision.verdict_histogram(),
+                    defer_hours=recheck_hours)
             skipped = decision.pool_stats.get("recent_failures_skipped", 0)
             self._defer_for_retry(
-                deferral_key, hours=config.NO_RESULT_DEFER_HOURS,
+                deferral_key, hours=(recheck_hours if fast_follow
+                                     else config.NO_RESULT_DEFER_HOURS),
                 reason=("all matching releases recently failed"
                         if skipped else "no acceptable episode release found"),
                 candidate_stats=decision.verdict_histogram(),
@@ -3001,9 +3074,33 @@ class DownloadManager:
                 return self._race_or_defer(
                     deferral_key, survivors, show.media_type, minutes=minutes,
                     request_id=request_id,
-                    episode_context=(show.show_id, ep.season, ep.episode))
-        if not self._oversize_gate(survivors, show.media_type, deferral_key,
-                                   minutes=minutes, pref_override=pref_override):
+                    episode_context=(show.show_id, ep.season, ep.episode),
+                    defer_hours=recheck_hours)
+        if fast_follow:
+            # No day's wait: the raised cap already bounds the size, and the
+            # tiers pick the library's size first, then the standard size.
+            # Every gate-passing release is eligible, not just the scored top 5.
+            downloads_store.clear_grab_deferral(deferral_key)
+            ranked = list(survivors)
+            seen = {id(r) for r in ranked}
+            for v in decision.verdicts:
+                r = by_hash.get(getattr(v, "infohash", None))
+                if getattr(v, "passed", False) and r is not None and id(r) not in seen:
+                    ranked.append(r)
+                    seen.add(id(r))
+            picked = self._fast_follow_pick(
+                ranked, chosen, minutes=minutes or default_minutes,
+                library_rate=pref_override, standard_rate=standard_rate)
+            if picked is not chosen:
+                # Keep the recorded decision honest about what was grabbed.
+                from dataclasses import replace as _dc_replace
+                decision.pool_stats["fast_follow_overrode"] = chosen.title
+                decision = _dc_replace(
+                    decision, chosen_infohash=_magnet_hash(picked.magnet)
+                    or decision.chosen_infohash, chosen_title=picked.title)
+                chosen = picked
+        elif not self._oversize_gate(survivors, show.media_type, deferral_key,
+                                     minutes=minutes, pref_override=pref_override):
             downloads_store.record_selection_run(decision, request_id=request_id)
             return []
         download_id = self.grab(
@@ -3284,6 +3381,79 @@ class DownloadManager:
             logger.info("Auto-grab missing skipped — a Shows scan/sync is already running.")
             return []
 
+    def fast_follow_pass(self) -> list[int]:
+        """Grab newly aired episodes of "match existing size" shows as soon as
+        they show up. Runs on every 5-minute tick; each episode's own hold
+        spaces its searches FAST_FOLLOW_RECHECK_MINUTES apart, so a quiet tick
+        costs nothing. Sensarr only knows air DATES, so checks start on the air
+        date (never later than an hour after airing)."""
+        if not config.FAST_FOLLOW_ENABLED:
+            return []
+        try:
+            # The Shows lock covers picking what is due (and any re-sync) only;
+            # the searches run after it is released, so Scan/Sync in the Shows
+            # tab are not locked out every 30 minutes.
+            due = show_tracker.run_exclusive("Fast follow", self._fast_follow_due)
+        except show_tracker.ShowsBusyError:
+            return []
+        started: list[int] = []
+        for show, ep in due:
+            if len(started) >= config.SHOWS_GRAB_LIMIT_PER_PASS:
+                break
+            started.extend(self._grab_one_episode(show, ep, fast_follow=True))
+        if started:
+            logger.info("Fast follow started %d download(s).", len(started))
+        return started
+
+    def _fast_follow_due(self) -> list[tuple]:
+        """(show, episode) pairs whose fast-follow check is due now. Only shows
+        that are actually followed (auto-grab, follow-new, or the global
+        toggle): the size tag changes HOW FAST a followed show grabs, never
+        WHETHER an unfollowed one does."""
+        import datetime as _dt
+        today = _dt.date.today().isoformat()
+        synced_for = self.__dict__.setdefault("_fast_follow_synced", set())
+        due: list[tuple] = []
+        for show in shows_store.list_shows():
+            if show.size_mode != size_match.SIZE_MODE_MATCH_LIBRARY:
+                continue
+            if not (config.SHOWS_AUTO_GRAB or show.auto_grab or show.follow_new):
+                continue
+            # The episode the last sync said was coming has aired: re-sync
+            # once per air date so a list TVDB/TMDB only just filled in shows
+            # up (once, even if the fetch comes back empty).
+            if show.next_air_date and show.next_air_date <= today:
+                stamp = (show.show_id, show.next_air_date)
+                if stamp not in synced_for:
+                    synced_for.add(stamp)
+                    try:
+                        show_tracker._sync_show_impl(show.show_id)
+                        show = shows_store.get_show(show.show_id) or show
+                    except Exception:
+                        logger.exception("Fast follow: sync failed for '%s'",
+                                         show.title)
+            follow_only = not (config.SHOWS_AUTO_GRAB or show.auto_grab)
+            for ep in shows_store.missing_episodes(show.show_id):
+                if not self._is_fast_follow(show, ep):
+                    continue
+                if follow_only and show.follow_since and ep.air_date < show.follow_since:
+                    continue
+                hold = downloads_store.get_grab_deferral(
+                    f"ep:{show.show_id}:{ep.season}:{ep.episode}")
+                if hold is not None and not downloads_store.deferral_expired(hold):
+                    continue   # not due; skip quietly (no log line per tick)
+                due.append((show, ep))
+        return due
+
+    def _fast_follow_impl(self) -> list[int]:
+        """Kept for callers/tests that run the whole pass under one lock."""
+        started: list[int] = []
+        for show, ep in self._fast_follow_due():
+            started.extend(self._grab_one_episode(show, ep, fast_follow=True))
+        if started:
+            logger.info("Fast follow started %d download(s).", len(started))
+        return started
+
     def _auto_grab_missing_impl(self, limit: int | None,
                                 show_ids: list[int] | None = None) -> list[int]:
         limit = config.SHOWS_GRAB_LIMIT_PER_PASS if limit is None else limit
@@ -3351,17 +3521,19 @@ class DownloadManager:
                        request_title: str | None = None,
                        episode_context: tuple[int, int, int] | None = None,
                        run_id: int | None = None,
-                       candidate_stats: dict | None = None) -> list[int]:
+                       candidate_stats: dict | None = None,
+                       defer_hours: float | None = None) -> list[int]:
         """A pool whose only gate-clean releases are unseeded. Gamble on a
         bounded zero-seeder race when it is explicitly enabled; otherwise write
         a deferral and recheck later rather than grabbing dead torrents
-        (Task D items 1-2)."""
+        (Task D items 1-2). `defer_hours` shortens the recheck (fast follow)."""
         if config.TORRENT_ZERO_SEEDER_RACE:
             return self.start_zero_seeder_race(
                 results, media_type, minutes=minutes, request_id=request_id,
                 request_title=request_title, episode_context=episode_context)
         downloads_store.check_grab_deferral(
-            key, wait_hours=config.ZERO_SEEDER_DEFER_HOURS,
+            key, wait_hours=(defer_hours if defer_hours is not None
+                             else config.ZERO_SEEDER_DEFER_HOURS),
             reason="no seeded release available",
             candidate_stats=candidate_stats, selection_run_id=run_id)
         # A request-level single grab is genuinely held: flip it to 'deferred' so
@@ -4827,9 +4999,17 @@ class DownloadManager:
                 season = parsed.season
                 if season is None:
                     season = (plan.parsed.season if plan.parsed and plan.parsed.season else 1)
+                # A multi-episode file keeps its range in a form Plex reads.
+                tail = (f"-E{parsed.last_episode:02d}"
+                        if parsed.last_episode is not None else "")
                 return torrent_routing.sanitize_for_filesystem(
-                    f"{show_name} - S{season:02d}E{parsed.episode:02d}"
+                    f"{show_name} - S{season:02d}E{parsed.episode:02d}{tail}"
                 )
+            # No SxxEyy in the file ("01. Monster High - Jaundice Brothers"):
+            # a lone video of a single-episode grab takes the plan's own
+            # "Show - SxxEyy" name, which already knows the episode.
+            if single_video and plan.new_filename:
+                return plan.new_filename
             return None
         # Movie (no show_name): the plan stem is "<Title (Year)>". A single
         # primary video ALWAYS takes the plain stem — a "Part 2" in the movie's
@@ -4867,8 +5047,10 @@ class DownloadManager:
             if parsed.episode is not None:
                 season = parsed.season or (
                     plan.parsed.season if plan.parsed and plan.parsed.season else 1)
+                tail = (f"-E{parsed.last_episode:02d}"
+                        if parsed.last_episode is not None else "")
                 video_stem = torrent_routing.sanitize_for_filesystem(
-                    f"{show_name} - S{season:02d}E{parsed.episode:02d}")
+                    f"{show_name} - S{season:02d}E{parsed.episode:02d}{tail}")
         else:
             video_stem = movie_stem
         if not video_stem:

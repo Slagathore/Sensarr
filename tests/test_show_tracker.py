@@ -35,6 +35,45 @@ def test_scan_derives_season_from_folder(tmp_path):
     assert (2, 3) in found
 
 
+def test_multi_episode_files_cover_their_range(tmp_path):
+    # Max & Ruby ships three segments per file; the name parsed as nothing.
+    import torrent_routing
+    p = torrent_routing.parse_torrent_name(
+        "Max And Ruby S01E04E05E06 AMZN WEB-DL DDP2 0 H 264-LAZY[EZTVx.to].mkv")
+    assert (p.season, p.episode, p.last_episode) == (1, 4, 6)
+    assert torrent_routing.parse_torrent_name("Show - S01E04-E06.mkv").last_episode == 6
+    # Ordinary names are untouched.
+    plain = torrent_routing.parse_torrent_name("Severance.S02E05.1080p.WEB.mkv")
+    assert (plain.season, plain.episode, plain.last_episode) == (2, 5, None)
+    assert torrent_routing.parse_torrent_name("Show S01E04 - Extended.mkv").last_episode is None
+    show = tmp_path / "Max & Ruby" / "Season 01"
+    show.mkdir(parents=True)
+    (show / "Max & Ruby - S01E04-E06.mkv").write_bytes(b"x")
+    found = show_tracker._scan_folders_for_episodes((str(show.parent),))
+    assert {(1, 4), (1, 5), (1, 6)} <= set(found)
+
+
+def test_a_multi_episode_release_serves_every_episode_in_it():
+    # Reviewer finding: once the name parsed as E04, the E05/E06 grabs
+    # rejected it and verification would have quarantined it.
+    from pathlib import Path
+    import media_identity
+    import verification
+    from download_manager import DownloadManager
+    name = "Max And Ruby S01E04E05E06 AMZN WEB-DL DDP2 0 H 264-LAZY"
+    assert verification.parse_file(Path(name + ".mkv")).episodes == (4, 5, 6)
+    want = media_identity.MediaIdentity(media_type="tv", canonical_title="Max & Ruby",
+                                        season=1, episode=5)
+    assert verification.verify_file(Path(name + ".mkv"), want, "primary_video").ok
+    show_id = shows_store.upsert_show(title="Max & Ruby", media_type="tv",
+                                      source="tvdb", external_id="mr-1")
+    show = shows_store.get_show(show_id)
+    dm = DownloadManager.__new__(DownloadManager)
+    assert dm._result_matches_show(name, show, season=1, episode=5)
+    assert dm._result_matches_show(name, show, season=1, episode=6)
+    assert not dm._result_matches_show(name, show, season=1, episode=7)
+
+
 def test_parse_episode_no_number():
     assert _parse_episode_from_file("Some Movie.mkv") is None
 

@@ -23,6 +23,7 @@ from __future__ import annotations
 import http.client
 import json
 import logging
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -194,6 +195,23 @@ def _stem(name: str) -> str:
     return name.rsplit(".", 1)[0] if "." in name else name
 
 
+def _name_key(name: str) -> str:
+    """A file name with case and punctuation dropped, so Torrentio's spelling
+    of a pack file still matches RD's."""
+    return re.sub(r"[^0-9a-z]+", "", _basename(name).lower())
+
+
+def served_wanted_file(all_files: list[dict], want_file_name: str | None) -> bool:
+    """False only when the pinned file IS in the torrent but RD selected other
+    files instead. Nothing pinned by name, or a name the torrent does not list
+    (the index fallback picked), cannot be judged and passes."""
+    if not want_file_name:
+        return True
+    wanted = _name_key(want_file_name)
+    listed = [f for f in all_files if _name_key(str(f.get("path", ""))) == wanted]
+    return not listed or any(f.get("selected") for f in listed)
+
+
 def choose_files(files: list[dict], *, want_file_name: str | None = None,
                  want_file_idx: int | None = None,
                  video_exts: tuple[str, ...] = VIDEO_EXTS,
@@ -211,6 +229,10 @@ def choose_files(files: list[dict], *, want_file_name: str | None = None,
         for f in files:
             if _basename(str(f.get("path", ""))).lower() == wanted:
                 return [f["id"]]
+        loose = [f for f in files
+                 if _name_key(str(f.get("path", ""))) == _name_key(want_file_name)]
+        if len(loose) == 1:
+            return [loose[0]["id"]]
     if want_file_idx is not None:
         for f in files:
             if f.get("id") == want_file_idx + 1 and is_video(f):
@@ -356,6 +378,14 @@ def fetch(client: RealDebridClient, magnet: str, dest_dir: Path, *,
     cached = not seen_active
     all_files = info.get("files") or []
     chosen = [f for f in all_files if f.get("selected")]
+    if not served_wanted_file(all_files, want_file_name):
+        # Seen 2026-10-10: the S02E07 and S02E08 pins of a Monster pack came
+        # back as S02E06. Never save one episode under another's download.
+        drop(tid)
+        served = ", ".join(_basename(str(f.get("path", ""))) for f in chosen)
+        raise RealDebridError(
+            f"Real-Debrid served {served[:160] or 'nothing'} instead of "
+            f"{want_file_name}")
     links = info.get("links") or []
     # The torrent's own name is the root folder webtorrent would create. RD's
     # "filename" becomes the SELECTED file's name when only part of a pack is

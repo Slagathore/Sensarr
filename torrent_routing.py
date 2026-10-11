@@ -224,7 +224,10 @@ def pick_root_by_free_space(candidates: list[str]) -> str | None:
 # "(?:v\d+)?" — release version suffixes ("S01E05v2") sit flush against the
 # episode number, which otherwise breaks the \b word boundary entirely.
 _EPISODE_PATTERNS = [
-    re.compile(r"\bS(?P<season>\d{1,2})[\s._-]*E(?P<episode>\d{1,3})(?:v\d+)?\b", re.IGNORECASE),
+    # Multi-episode files chain the extra numbers on: "S01E04E05E06" (Max &
+    # Ruby, 2026-10-11, which used to parse as nothing at all) or "S01E04-E06".
+    re.compile(r"\bS(?P<season>\d{1,2})[\s._-]*E(?P<episode>\d{1,3})(?:v\d+)?"
+               r"(?:-?E(?P<last>\d{1,3}))*\b", re.IGNORECASE),
     re.compile(r"\b(?P<season>\d{1,2})x(?P<episode>\d{2,3})(?:v\d+)?\b", re.IGNORECASE),
     # "[Raze] Dandadan S2 - 11 (...)" — season token, separator, episode.
     re.compile(r"\bS(?P<season>\d{1,2})\s*[-._]\s*(?P<episode>\d{1,3})(?:v\d+)?\b",
@@ -248,6 +251,8 @@ class ParsedName:
     show_title: str          # cleaned title portion ("" if none survived)
     season: int | None
     episode: int | None
+    # Last episode of a multi-episode file (S01E04E05E06 -> 6), else None.
+    last_episode: int | None = None
 
 
 @dataclass
@@ -284,13 +289,16 @@ def parse_torrent_name(name: str) -> ParsedName:
     """Extract show title + season/episode from a torrent or file name."""
     working = name.replace("_", " ")
 
-    season = episode = None
+    season = episode = last_episode = None
     cut_at = len(working)
     for pat in _EPISODE_PATTERNS:
         m = pat.search(working)
         if m:
             season = int(m.group("season"))
             episode = int(m.group("episode"))
+            last = m.groupdict().get("last")
+            if last is not None and int(last) > episode:
+                last_episode = int(last)
             cut_at = min(cut_at, m.start())
             break
     if season is None:
@@ -307,7 +315,8 @@ def parse_torrent_name(name: str) -> ParsedName:
         title_part = pat.sub("", title_part)
     title_part = re.sub(r"[\s\-–]+$", "", title_part).strip()
     title_part = re.sub(r"\s{2,}", " ", title_part)
-    return ParsedName(show_title=title_part, season=season, episode=episode)
+    return ParsedName(show_title=title_part, season=season, episode=episode,
+                      last_episode=last_episode)
 
 
 # --- Show folder matching ----------------------------------------------------

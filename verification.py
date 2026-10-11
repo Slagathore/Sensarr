@@ -90,6 +90,9 @@ def parse_file(path: Path) -> ParsedFile:
     year = int(ym.group(1)) if ym else None
     seasons = (parsed.season,) if parsed.season is not None else ()
     episodes = (parsed.episode,) if parsed.episode is not None else ()
+    if parsed.episode is not None and parsed.last_episode is not None:
+        # "S01E04E05E06" holds E04-E06, not just E04.
+        episodes = tuple(range(parsed.episode, parsed.last_episode + 1))
     # parsed_title stays the raw stem so the sequel guard sees "<name> 2 <year>".
     return ParsedFile(parsed_title=stem, year=year, seasons=seasons,
                       episodes=episodes, country=_detect_country(name))
@@ -158,11 +161,20 @@ class VerificationResult:
 # Movies keep the full sequel logic; only tv/anime episodic wants strip.
 _EPISODIC_TRAILING_NUM_RE = re.compile(r"[\s._\-]+\d{1,4}\s*$")
 _BRACKET_BLOCK_RE = re.compile(r"\[[^\]]*\]|\([^)]*\)")
+# A leading track number on an episode file ("01. Monster High - Jaundice
+# Brothers.mp4", "20 Monster High - ...") is the episode, not a sequel. It
+# quarantined a whole Monster High webisode pack on 2026-10-11. Never 4 digits
+# (1883), never digit-dash-digit (9-1-1), never when the show's own title
+# starts with that number (24, 30 Rock).
+_EPISODIC_LEADING_NUM_RE = re.compile(r"^\s*(\d{1,3})(?:\s*[.)\]]\s*|\s+-\s+|\s+)(?=\D)")
 
 
-def _episodic_compare_title(raw: str) -> str:
+def _episodic_compare_title(raw: str, want_title: str | None = None) -> str:
     t = _BRACKET_BLOCK_RE.sub(" ", raw)
     t = re.sub(r"\s{2,}", " ", t).strip()
+    m = _EPISODIC_LEADING_NUM_RE.match(t)
+    if m and not media_identity.normalize_title(want_title or "").startswith(m.group(1)):
+        t = t[m.end():].strip()
     prev = None
     while prev != t:
         prev = t
@@ -180,7 +192,8 @@ def verify_file(path: Path, want: MediaIdentity, role: str) -> FileVerdict:
     # fails; only the bare-number false sequel is defused).
     if want.media_type in ("tv", "anime", "xanime"):
         parsed = replace(
-            parsed, parsed_title=_episodic_compare_title(parsed.parsed_title))
+            parsed, parsed_title=_episodic_compare_title(
+                parsed.parsed_title, want.canonical_title))
     verdict = media_identity.compare_media_identity(want, parsed)
     return FileVerdict(path, role, verdict.ok, verdict.reason_code,
                        verdict.detail, parsed)

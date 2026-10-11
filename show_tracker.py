@@ -552,6 +552,11 @@ def _scan_folders_for_episodes(folders: tuple[str, ...]) -> dict[tuple[int, int]
             if season is None:
                 season = 1  # flat folder, absolute numbering
             found.setdefault((season, episode), str(f))
+            # "S01E04E05E06" / "S01E04-E06" holds the whole range.
+            last = parse_torrent_name(f.name).last_episode
+            if last is not None and episode < last <= episode + 10:
+                for extra in range(episode + 1, last + 1):
+                    found.setdefault((season, extra), str(f))
     return found
 
 
@@ -914,6 +919,49 @@ def _folder_containing_season(show: shows_store.TrackedShow, season: int) -> str
     return None
 
 
+def _new_show_folder(show: shows_store.TrackedShow) -> tuple[str, Path] | None:
+    """(library root, show folder) for a tracked show with no mapped folders.
+
+    A folder already named for the show on any of its type's roots is reused,
+    so a show kept on D: never gets a second folder on I:. A same-name folder
+    that belongs to a DIFFERENT tracked show is left alone and the year is
+    appended instead. Otherwise the folder is new, on the root with the most
+    free space. Always named from the identity-backed show title, never a
+    torrent name. None when the type has no library root configured."""
+    import os
+    roots = [p for p in config.media_paths_for_types(show.media_type)
+             if Path(p).is_dir()]
+    if not roots:
+        return None
+    names = [torrent_routing.sanitize_for_filesystem(show.title)]
+    if show.year and f"({show.year})" not in show.title:
+        names.append(torrent_routing.sanitize_for_filesystem(
+            f"{show.title} ({show.year})"))
+
+    def key(p) -> str:
+        return os.path.normcase(os.path.normpath(str(p)))
+    owners = {key(f): s.show_id for s in shows_store.list_shows() for f in s.folders}
+
+    def taken(p: Path) -> bool:
+        owner = owners.get(key(p))
+        return owner is not None and owner != show.show_id
+
+    # 1. A folder already on disk under either name, that no other show owns.
+    for name in names:
+        for root in roots:
+            candidate = Path(root) / name
+            if candidate.is_dir() and not taken(candidate):
+                return root, candidate
+    # 2. A new folder under the first name no other show uses.
+    new_root = torrent_routing.pick_root_by_free_space(roots)
+    if new_root is None:
+        return None
+    for name in names:
+        if not any(taken(Path(r) / name) for r in roots):
+            return new_root, Path(new_root) / name
+    return None
+
+
 def plan_for_episode(
     show: shows_store.TrackedShow, season: int, episode: int,
 ) -> torrent_routing.RoutePlan:
@@ -926,7 +974,10 @@ def plan_for_episode(
          season-subfolder naming style.
       3. The show's first mapped folder, creating "Season NN" per the
          sibling style.
-    Only a show with no mapped folders at all falls back to staging.
+      4. A show with no mapped folders gets "<type root>/<Show Title>/Season
+         NN", the same as a season pack (episodes of Monster, East of Eden and
+         Max & Ruby sat in staging on 2026-10-10 because only packs did this).
+    Only a type with no library root configured falls back to staging.
     """
     def stem(season_dir: str | None, show_folder: str | None) -> str:
         base = torrent_routing.episode_name_base(show.title, show_folder,
@@ -951,9 +1002,24 @@ def plan_for_episode(
         or (show.folders[0] if show.folders else None)
     )
     if folder is None:
+        fresh = _new_show_folder(show)
+        if fresh is None:
+            return torrent_routing.RoutePlan(
+                confident=False, dest_dir=str(Path(config.TORRENT_DOWNLOAD_DIR)),
+                reason=f"'{show.title}' has no mapped folders and none could "
+                       f"be made (no library root, or every name is another "
+                       f"show's) — staying in staging",
+            )
+        new_root, show_dir = fresh
+        season_name = torrent_routing._season_folder_name(show_dir, season)
+        dest = show_dir / season_name
         return torrent_routing.RoutePlan(
-            confident=False, dest_dir=str(Path(config.TORRENT_DOWNLOAD_DIR)),
-            reason=f"'{show.title}' has no mapped folders — staying in staging",
+            confident=True, dest_dir=str(dest),
+            new_filename=stem(str(dest), str(show_dir)),
+            show_folder=str(show_dir), season_folder=season_name,
+            library_root=new_root,
+            reason=f"new show — '{show_dir.name}'/{season_name} under "
+                   f"{Path(new_root).name}",
         )
 
     season_name = torrent_routing._season_folder_name(Path(folder), season)
@@ -1008,24 +1074,22 @@ def plan_for_season(
     # No mapped folders: create one under the type's root from the CANONICAL
     # (identity-backed) show title — this is the show_id equivalent of
     # plan_route's new-show branch, with no fuzzy folder matching involved.
-    type_roots = [p for p in config.media_paths_for_types(show.media_type)
-                  if Path(p).is_dir()]
-    new_root = torrent_routing.pick_root_by_free_space(type_roots)
-    if new_root is not None:
-        show_name = torrent_routing.sanitize_for_filesystem(show.title)
-        show_dir = Path(new_root) / show_name
-        season_name = f"Season {season:02d}"
+    fresh = _new_show_folder(show)
+    if fresh is not None:
+        new_root, show_dir = fresh
+        season_name = torrent_routing._season_folder_name(show_dir, season)
         dest = show_dir / season_name
         return torrent_routing.RoutePlan(
             confident=True, dest_dir=str(dest), parsed=parsed,
             show_folder=str(show_dir), season_folder=season_name,
             library_root=new_root,
-            reason=f"new show — creating '{show_name}'/{season_name} "
+            reason=f"new show — creating '{show_dir.name}'/{season_name} "
                    f"under {Path(new_root).name}",
         )
     return torrent_routing.RoutePlan(
         confident=False, dest_dir=str(Path(config.TORRENT_DOWNLOAD_DIR)),
         parsed=parsed,
-        reason=f"'{show.title}' has no mapped folders and no library root "
-               f"configured — staying in staging",
+        reason=f"'{show.title}' has no mapped folders and none could be made "
+               f"(no library root, or every name is another show's) — staying "
+               f"in staging",
     )

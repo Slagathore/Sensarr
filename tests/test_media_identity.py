@@ -93,6 +93,45 @@ def test_compare_rejects_year_and_season():
         want_tv, _Parsed(parsed_title="Severance", seasons=[1, 2, 3])).ok
 
 
+def test_a_leading_track_number_is_not_a_sequel():
+    # The Monster High webisode pack was quarantined over "01." (2026-10-11).
+    from pathlib import Path
+    import verification
+    want = mi.MediaIdentity(media_type="tv", canonical_title="Monster High",
+                            season=1, episode=1)
+    for name in ("01. Monster Highâ„¢ - Jaundice Brothers.mp4",
+                 "20 Monster High - Rumor Run Wild.mp4",
+                 "05 - Monster High - Party Planners.mp4"):
+        v = verification.verify_file(Path(name), want, "primary_video")
+        assert v.ok, (name, v.reason_code, v.detail)
+    # A show whose own title starts with the number keeps it.
+    assert verification._episodic_compare_title("24 - Day One", "24").startswith("24")
+    assert verification._episodic_compare_title("30 Rock S01E01", "30 Rock").startswith("30")
+    assert verification._episodic_compare_title("1883 S01E01", "Other").startswith("1883")
+    assert verification._episodic_compare_title("9-1-1 S01E01", "Other").startswith("9-1-1")
+
+
+def test_episode_contradiction_needs_both_markers():
+    # RD served Monster S02E06 to the S02E07 download (2026-10-10).
+    want = mi.MediaIdentity(media_type="tv", canonical_title="Monster", season=2, episode=7)
+    assert mi.compare_media_identity(
+        want, _Parsed(parsed_title="Monster", seasons=[2], episodes=[6])
+    ).reason_code == "episode_contradiction"
+    assert mi.compare_media_identity(
+        want, _Parsed(parsed_title="Monster", seasons=[2], episodes=[7])).ok
+    # a multi-episode file that includes the wanted one passes
+    assert mi.compare_media_identity(
+        want, _Parsed(parsed_title="Monster", seasons=[2], episodes=[6, 7])).ok
+    # absolute-numbered anime carries no season: never judged on the number
+    anime = mi.MediaIdentity(media_type="anime", canonical_title="Show", season=2, episode=1)
+    assert mi.compare_media_identity(
+        anime, _Parsed(parsed_title="Show", seasons=[], episodes=[25])).ok
+    # a pack want (no episode) is untouched
+    assert mi.compare_media_identity(
+        mi.MediaIdentity(media_type="tv", canonical_title="Monster", season=2),
+        _Parsed(parsed_title="Monster", seasons=[2], episodes=[6])).ok
+
+
 def test_identity_subject_key_and_qualified():
     unq = mi.MediaIdentity(media_type="movie", canonical_title="X")
     assert not unq.is_qualified and unq.subject_key is None

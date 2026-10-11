@@ -326,6 +326,51 @@ def test_pack_subset_lands_under_the_torrent_name_not_the_file_name(tmp_path):
     assert res.rel_paths == ["Show Complete Series/S06/Show S06E12.mkv"]
 
 
+def _monster_pack(selected_id):
+    files = [{"id": 1, "path": "/Season 2/Monster (2022) - S02E06 - Don't Dream It's Over.mkv",
+              "bytes": 4},
+             {"id": 17, "path": "/Season 2/Monster (2022) - S02E07 - Showtime.mkv",
+              "bytes": 4}]
+    for f in files:
+        f["selected"] = 1 if f["id"] == selected_id else 0
+    return {"id": "TID1", "original_filename": "Monster Pack", "status": "downloaded",
+            "progress": 100, "files": files, "links": ["A"]}
+
+
+def test_a_different_episode_from_the_pack_is_refused(tmp_path):
+    """Live 2026-10-10: the S02E07 pin came back as S02E06. Refuse it (the
+    caller falls back to the torrent client) and write nothing."""
+    fake = FakeRD([_monster_pack(selected_id=1)],
+                  {"A": {"filesize": 4, "download": "https://dl/a", "filename": "x.mkv"}})
+    with pytest.raises(rd.RealDebridError, match="instead of"):
+        rd.fetch(client(fake), MAGNET, tmp_path,
+                 want_file_name="Monster (2022) - S02E07 - Showtime.mkv", want_file_idx=16,
+                 download=downloader({"https://dl/a": b"abcd"}))
+    assert not list(tmp_path.rglob("*.mkv*"))
+    assert fake.deleted == ["TID1"]
+
+
+def test_the_right_episode_from_the_pack_is_kept(tmp_path):
+    fake = FakeRD([_monster_pack(selected_id=17)],
+                  {"A": {"filesize": 4, "download": "https://dl/a", "filename": "x.mkv"}})
+    res = rd.fetch(client(fake), MAGNET, tmp_path,
+                   want_file_name="monster (2022) - s02e07 - showtime.MKV",
+                   download=downloader({"https://dl/a": b"abcd"}))
+    assert res.rel_paths == ["Monster Pack/Season 2/Monster (2022) - S02E07 - Showtime.mkv"]
+
+
+def test_a_pin_the_torrent_does_not_list_is_not_judged():
+    files = [{"id": 1, "path": "/a.mkv", "selected": 1}]
+    assert rd.served_wanted_file(files, "Something Else.mkv")
+    assert rd.served_wanted_file(files, None)
+
+
+def test_choose_files_matches_a_name_with_different_punctuation():
+    files = [{"id": 1, "path": "/S2/Show - S02E06 - Don't Go.mkv"},
+             {"id": 2, "path": "/S2/Show - S02E07 - Showtime.mkv"}]
+    assert rd.choose_files(files, want_file_name="Show.S02E07.Showtime.mkv") == [2]
+
+
 def test_a_stream_that_ends_short_resumes_instead_of_failing(tmp_path):
     """Live 2026-10-10: a 583 MB file arrived 7,048 bytes short and the whole
     download was thrown away. It must resume with a Range request."""

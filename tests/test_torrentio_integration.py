@@ -371,6 +371,35 @@ def test_a_whole_pack_download_of_another_season_does_not(grab_dm):
                         episode_context=(7, 1, 6)) != s2
 
 
+def test_two_passes_grabbing_the_same_file_at_once_make_one_download(grab_dm, monkeypatch):
+    # Request #224, 2026-10-10: two grab passes both created Monster S02E02.
+    import threading
+    import time
+    import presence_ledger
+    real = presence_ledger.live_downloads_for
+
+    def slow(magnet):
+        found = real(magnet)
+        time.sleep(0.2)          # widen the check-then-create window
+        return found
+    monkeypatch.setattr(presence_ledger, "live_downloads_for", slow)
+    got, start = [], threading.Barrier(2)
+
+    def worker():
+        start.wait()
+        got.append(grab_dm.grab(_pinned_pick("Show.S01E06.mkv", 5),
+                                episode_context=(7, 1, 6)))
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    assert len(got) == 2 and got[0] == got[1]
+    import db
+    with db.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM downloads").fetchone()[0] == 1
+
+
 def test_the_right_live_copy_is_found_among_several(grab_dm):
     _live(PACK, want={"file_idx": 4, "file_name": "Show.S01E05.mkv"}, season=1, episode=5)
     e06 = _live(PACK, want={"file_idx": 5, "file_name": "Show.S01E06.mkv"},
