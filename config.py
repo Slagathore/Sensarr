@@ -107,7 +107,7 @@ TELEGRAM_ALLOWED_USER_IDS: tuple[int, ...] = _parse_id_list(
 )
 APP_PRODUCT_NAME: str = "Sensarr"
 # Every push bumps this (patch by default), per fleet guardrail 14.
-APP_VERSION: str = "1.6.1"
+APP_VERSION: str = "1.6.2"
 
 # How long (seconds) to pause between each process-gone check after Exit is clicked.
 # Plex can take 10-30s to fully stop — 3s intervals × 10 retries = 30s total window.
