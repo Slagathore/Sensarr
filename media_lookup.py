@@ -1758,6 +1758,25 @@ def get_jikan_status(mal_id: str) -> str:
 # the airing schedule.
 
 
+def find_tmdb_tv_by_tvdb(tvdb_id: str | int | None) -> str | None:
+    """The TMDB TV id TMDB itself links to a TVDB id, or None. Exact, so it
+    beats a title search whenever TMDB knows the TVDB id (353 of 360 tracked
+    TVDB shows in 2026-10). Anthologies TMDB splits per season (Monster) come
+    back empty and fall through to the title search."""
+    if not tvdb_id or not _tmdb_enabled():
+        return None
+    try:
+        data = _get_json(f"{_TMDB_BASE}/find/{tvdb_id}?api_key={config.TMDB_API_KEY}"
+                         f"&external_source=tvdb_id")
+    except RuntimeError:
+        return None
+    hits = [r for r in (data.get("tv_results") or []) if r.get("id")]
+    return str(hits[0]["id"]) if len(hits) == 1 else None
+
+
+_BRACKETED_YEAR_RE = re.compile(r"\s*[\(\[]\s*((?:19|20)\d{2})\s*[\)\]]\s*")
+
+
 def resolve_tmdb_tv_id(title: str, year: int | None = None,
                        *, prefer_anime: bool = False) -> str | None:
     """Best-effort TMDB TV id for a title (for airing data on non-TMDB shows).
@@ -1766,9 +1785,18 @@ def resolve_tmdb_tv_id(title: str, year: int | None = None,
     match and — when prefer_anime is set — for Japanese-language animation.
     Without the anime bias a search for "One Piece" would happily return the
     live-action series instead of the 1999 anime.
+
+    A bracketed year is a disambiguator, not part of the name: searching
+    "Monster (2022)" matched Monster High: Webisodes (4-minute episodes, so
+    every real Monster episode read as oversize), and "East of Eden (2026)"
+    matched nothing. It is stripped and used as the year filter instead.
     """
     if not _tmdb_enabled():
         return None
+    m = _BRACKETED_YEAR_RE.search(title or "")
+    if m:
+        year = year or int(m.group(1))
+        title = _BRACKETED_YEAR_RE.sub(" ", title).strip() or title
     params = {"api_key": config.TMDB_API_KEY, "query": title,
               "include_adult": "true", "page": "1"}
     if year:

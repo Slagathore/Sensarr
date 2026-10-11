@@ -31,6 +31,7 @@ import torrent_routing
 from media_lookup import (
     EpisodeInfo, MediaResult,
     best_title_similarity,
+    find_tmdb_tv_by_tvdb,
     get_anime_airing,
     get_jikan_episodes, get_jikan_status,
     get_tmdb_next_air, get_tmdb_show_runtime, get_tmdb_tv_episodes, get_tmdb_tv_status,
@@ -693,6 +694,9 @@ def _ensure_tmdb_id(show: shows_store.TrackedShow) -> str | None:
         mapping = anime_db.mapping_for_anidb(show.external_id) or {}
         if mapping.get("tmdb_id"):
             tmdb_id = str(mapping["tmdb_id"])
+    elif show.source == "tvdb":
+        # TMDB's own cross-reference is exact; the title search is the fallback.
+        tmdb_id = find_tmdb_tv_by_tvdb(show.external_id)
     if not tmdb_id:
         tmdb_id = resolve_tmdb_tv_id(
             show.title, show.year, prefer_anime=show.media_type in ("anime", "xanime"),

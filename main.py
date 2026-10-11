@@ -28,8 +28,16 @@ import sys
 # smoke. The env redirection MUST happen before any app module import —
 # config resolves every path the moment it first loads.
 if "--smoke-test" in sys.argv:
+    import atexit as _atexit
+    import shutil as _shutil
     import tempfile as _tempfile
     _smoke_root = _tempfile.mkdtemp(prefix="sensarr-smoke-")
+
+    def _remove_smoke_root() -> None:
+        logging.shutdown()   # release the log file so Windows can delete it
+        _shutil.rmtree(_smoke_root, ignore_errors=True)
+
+    _atexit.register(_remove_smoke_root)
     for _key, _sub in (("SENSARR_CONFIG_DIR", "config"),
                        ("SENSARR_DATA_DIR", "data"),
                        ("SENSARR_CACHE_DIR", "cache"),

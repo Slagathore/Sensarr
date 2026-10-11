@@ -32,6 +32,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import db
 
@@ -341,6 +342,50 @@ def prune_orphans() -> int:
         return 0
 
 
+def placed_file_contradicts(path: str, *, media_type: str,
+                            identity_source, external_id,
+                            canonical_title, canonical_year) -> bool:
+    """True when a placed movie file's own name contradicts the request it was
+    placed for. The July wrong-movie grabs ('The Last House on the Left (2009)'
+    for 'The Last House' 2026, 'The Boss Baby Christmas Bonus (2022)' for 'The
+    Boss Baby' 2017) were stamped with the request's identity, so the identity
+    join kept closing the request while the placement check kept reopening it.
+    This is the same test maintenance._placement_still_valid runs, so the two
+    can never disagree about one file. Movies only; best-effort."""
+    if media_type != "movie":
+        return False
+    try:
+        import media_identity
+        import verification
+        want = media_identity.MediaIdentity(
+            media_type="movie", identity_source=identity_source,
+            external_id=(str(external_id) if external_id is not None else None),
+            canonical_title=canonical_title, canonical_year=canonical_year)
+        parsed = verification.parse_file(Path(path))
+        return not media_identity.compare_media_identity(want, parsed).ok
+    except Exception:
+        return False
+
+
+def purge_contradicting_placements(identity_source: str | None, external_id) -> int:
+    """Drop download-stamped movie rows for this identity whose file name
+    contradicts it. Called when the reconcile reopens a request, so a wrong
+    file stops answering 'present' for it. Returns how many rows went."""
+    if not (identity_source and external_id):
+        return 0
+    initialize_library_identity_db()
+    with _DB_LOCK, db.connect() as conn:
+        rows = conn.execute(
+            "SELECT path, canonical_title, canonical_year FROM library_identity "
+            "WHERE identity_source = ? AND external_id = ? AND resolved_by = ?"
+            + _namespace_clause(True),
+            (identity_source, str(external_id), RESOLVED_DOWNLOAD)).fetchall()
+    bad = [r[0] for r in rows if placed_file_contradicts(
+        r[0], media_type="movie", identity_source=identity_source,
+        external_id=external_id, canonical_title=r[1], canonical_year=r[2])]
+    return remove_identities(bad)
+
+
 # ---------------------------------------------------------------------------
 # Placement hook — called from download_manager._on_download_placed
 # ---------------------------------------------------------------------------
@@ -375,6 +420,18 @@ def record_placement(row, moved_final_paths: list[str]) -> int:
             episode = p_episode if p_episode is not None else getattr(row, "episode", None)
             if req.media_type == "movie":
                 season, episode = None, None
+            if placed_file_contradicts(
+                    path, media_type=req.media_type,
+                    identity_source=req.identity_source,
+                    external_id=req.external_id,
+                    canonical_title=req.resolved_title or req.content,
+                    canonical_year=req.canonical_year):
+                logger.warning(
+                    "Download #%s placed %s, which does not match request #%s "
+                    "(%s); not tagging it with that identity.",
+                    getattr(row, "download_id", "?"), path, req.request_id,
+                    req.resolved_title or req.content)
+                continue
             set_identity(
                 path, media_type=req.media_type,
                 identity_source=req.identity_source, external_id=req.external_id,
@@ -633,6 +690,13 @@ def _download_records(progress) -> list[dict]:
                 if f.verification_state not in ("verified", "duplicate"):
                     continue
                 if not f.final_path:
+                    continue
+                if placed_file_contradicts(
+                        f.final_path, media_type="movie",
+                        identity_source=req.identity_source,
+                        external_id=req.external_id,
+                        canonical_title=req.resolved_title or req.content,
+                        canonical_year=req.canonical_year):
                     continue
                 out.append(_rec(
                     f.final_path, media_type="movie",

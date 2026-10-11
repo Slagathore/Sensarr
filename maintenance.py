@@ -440,6 +440,18 @@ def daily_library_check() -> dict:
                     reopened += 1
                     logger.info("Reconcile: request #%s no longer verifies on "
                                 "disk — reopened.", req.request_id)
+                    if req.media_type == "movie":
+                        # A wrong file stamped with this identity would make the
+                        # watcher close it again within the hour (and the
+                        # at-grab check skip it), so drop that stamp now.
+                        import library_identity
+                        dropped = library_identity.purge_contradicting_placements(
+                            req.identity_source, req.external_id)
+                        if dropped:
+                            logger.info(
+                                "Reconcile: request #%s dropped %d identity "
+                                "tag(s) on files that are a different movie.",
+                                req.request_id, dropped)
         except Exception as exc:
             errors.append(f"Error reconciling request #{req.request_id}: {exc}")
 

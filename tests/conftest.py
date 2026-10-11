@@ -1,4 +1,7 @@
+import atexit
+import logging
 import os
+import shutil
 import socket
 import sys
 import tempfile
@@ -9,6 +12,16 @@ from pathlib import Path
 # the env var must be set here at module level — a session fixture is too late
 # and the tests would write into the real application database.
 _TEST_DB_DIR = tempfile.mkdtemp(prefix="prb-tests-")
+
+
+def _remove_test_dir() -> None:
+    # Close the log file first or Windows keeps the folder; 98 of these had
+    # piled up in %TEMP% by 2026-10.
+    logging.shutdown()
+    shutil.rmtree(_TEST_DB_DIR, ignore_errors=True)
+
+
+atexit.register(_remove_test_dir)
 os.environ["APP_DB_PATH"] = str(Path(_TEST_DB_DIR) / "test_app.db")
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test-token-not-real")
 # Task H: pin every app_paths contract dir to the temp tree too, so tests
@@ -123,7 +136,7 @@ def _no_airing_network(monkeypatch):
         import show_tracker
     except Exception:
         return
-    for name in ("resolve_tmdb_tv_id", "get_tmdb_next_air"):
+    for name in ("resolve_tmdb_tv_id", "get_tmdb_next_air", "find_tmdb_tv_by_tvdb"):
         monkeypatch.setattr(show_tracker, name, lambda *a, **k: None, raising=False)
     monkeypatch.setattr(show_tracker, "get_tmdb_tv_episodes", lambda *a, **k: [], raising=False)
     monkeypatch.setattr(show_tracker, "get_anime_airing", lambda *a, **k: (None, ""), raising=False)
