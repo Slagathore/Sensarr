@@ -176,6 +176,9 @@ class DesktopApp:
         # torrent-dl thread parked in tkinter's _register).
         self._ui_thread = threading.current_thread()
         self._ui_queue: queue.Queue = queue.Queue()
+        self._quitting = False
+        self._refresh_lock = threading.Lock()
+        self._download_refresh_queued = False
         self.root.title(f"Sensarr v{config.APP_VERSION}")
         try:
             # Taskbar/alt-tab icon — same mark as the tray and the EXE.
@@ -329,7 +332,6 @@ class DesktopApp:
         self._last_library_check_date: str = ""
         self._last_log_count = 0
         self._tray_icon = self._build_tray_icon()
-        self._quitting = False
         # Task K: folder watcher (Plex-style pickup of manual additions).
         # Constructed lazily in _start_library_watcher after UI init; None until
         # then and whenever watchdog is unavailable / the feature is off.
@@ -342,8 +344,12 @@ class DesktopApp:
         # fresh daemon thread every 15s tick (which leaked OS handles at idle).
         self._refresh_pool = concurrent.futures.ThreadPoolExecutor(
             max_workers=2, thread_name_prefix="ui-refresh")
-        self._refresh_lock = threading.Lock()
         self._refresh_futures: dict[str, concurrent.futures.Future] = {}
+        self._snapshot_running: set[str] = set()
+        self._snapshot_pending: dict[str, tuple] = {}
+        self._download_rows_by_id: dict[int, Any] = {}
+        self._request_rows_by_id: dict[int, Any] = {}
+        self._request_add_pending = False
 
         # Task L: header-wide activity strip. ActivityModel (activity_strip.py)
         # is the pure, Tk-free brain (unit-tested directly, no display
@@ -488,18 +494,7 @@ class DesktopApp:
             self._bot_dot.configure(foreground=_DOT_AMBER)
             self.root.after(400, self.open_setup_wizard)
         else:
-            try:
-                self.bot_service.start()
-                self.bot_status_var.set("Telegram bot: running")
-                self._bot_dot.configure(foreground=_DOT_GREEN)
-            except Exception as exc:
-                logger.exception("Failed to start Telegram bot service.")
-                self.bot_status_var.set(f"Telegram bot: failed ({exc})")
-                self._bot_dot.configure(foreground=_DOT_RED)
-                messagebox.showerror(
-                    "Telegram bot failed",
-                    f"Could not start the Telegram bot service.\n\n{exc}",
-                )
+            self._start_bot_async()
 
         if self._tray_icon is not None:
             try:
@@ -542,6 +537,43 @@ class DesktopApp:
         # Local anime metadata (manami + anime-lists dumps): build/refresh in
         # the background when missing or older than a week.
         anime_db.ensure_fresh(background=True)
+
+    def _start_bot_async(self, on_finished=None) -> None:
+        """Telegram's connection wait must not postpone Tk's main loop."""
+        self.bot_status_var.set("Telegram bot: connecting…")
+        self._bot_dot.configure(foreground=_DOT_AMBER)
+
+        def worker() -> None:
+            error = None
+            connected = False
+            try:
+                if self._quitting:
+                    return
+                connected = self.bot_service.start()
+            except Exception as exc:
+                logger.exception("Failed to start Telegram bot service.")
+                error = str(exc)
+            if self._quitting:
+                self.bot_service.stop()
+                return
+
+            def finish() -> None:
+                if error is not None:
+                    self.bot_status_var.set(f"Telegram bot: failed ({error})")
+                    self._bot_dot.configure(foreground=_DOT_RED)
+                else:
+                    # A timeout returns False while the service keeps retrying.
+                    self._refresh_bot_indicator()
+                if on_finished is not None:
+                    on_finished(connected, error)
+                elif error is not None:
+                    messagebox.showerror(
+                        "Telegram bot failed",
+                        f"Could not start the Telegram bot service.\n\n{error}")
+
+            self._post_to_ui(finish)
+
+        threading.Thread(target=worker, name="ui-start-telegram", daemon=True).start()
 
     def _schedule_midnight_rollover(self) -> None:
         """At 00:05 every day: re-render Upcoming (yesterday's box must not
@@ -893,7 +925,9 @@ class DesktopApp:
         request_entry = ttk.Entry(requests_toolbar, textvariable=self.request_content_var)
         request_entry.grid(row=0, column=3, padx=(6, 12), sticky="ew")
         request_entry.bind("<Return>", lambda _event: self.add_request_from_ui())
-        ttk.Button(requests_toolbar, text="Add", command=self.add_request_from_ui).grid(row=0, column=4, padx=(0, 6))
+        self._request_add_btn = ttk.Button(
+            requests_toolbar, text="Add", command=self.add_request_from_ui)
+        self._request_add_btn.grid(row=0, column=4, padx=(0, 6))
         ttk.Button(requests_toolbar, text="🔍 Find Source", command=self.search_source_for_selected_request).grid(row=0, column=5, padx=(0, 6))
         ttk.Button(requests_toolbar, text="🆔 Resolve", command=self.resolve_selected_request).grid(row=0, column=9, padx=(0, 6))
         ttk.Button(requests_toolbar, text="⬇ Grab Torrent", command=self.grab_torrent_for_selected_request).grid(row=0, column=6, padx=(0, 6))
@@ -1256,6 +1290,8 @@ class DesktopApp:
         self.root.withdraw()
 
     def _post_to_ui(self, callback, *, delay_ms: int = 0) -> bool:
+        if self._quitting:
+            return False
         if threading.current_thread() is not getattr(self, "_ui_thread", None):
             # Never touch Tk from a worker thread; the Tk thread picks it up.
             self._ui_queue.put((delay_ms, callback))
@@ -1270,7 +1306,8 @@ class DesktopApp:
     def _drain_ui_queue(self) -> None:
         """Run the UI work worker threads queued (Tk thread only). Bounded per
         tick so a burst of progress updates cannot starve mouse and keys."""
-        for _ in range(500):
+        deadline = time.monotonic() + 0.010
+        for _ in range(50):
             try:
                 delay_ms, callback = self._ui_queue.get_nowait()
             except queue.Empty:
@@ -1284,6 +1321,8 @@ class DesktopApp:
                 logger.debug("Skipped UI callback because Tk is not accepting new work.")
             except Exception:
                 logger.exception("UI callback failed.")
+            if time.monotonic() >= deadline:
+                break
         if not self._quitting:
             try:
                 self.root.after(50, self._drain_ui_queue)
@@ -1329,11 +1368,17 @@ class DesktopApp:
     def refresh_requests(self) -> None:
         if self.requests_tree is None:
             return
-
         # Show every request with outstanding work, including needs_identity
         # rows so they are visible for resolution (Resolve button here; the
         # Grab-queue subtab offers the same action from its right-click menu).
-        requests = list_requests(status="active", limit=200)
+        self._load_ui_snapshot(
+            "requests", lambda: (list_requests(status="active", limit=200),
+                                  open_request_count()), self._render_requests)
+
+    def _render_requests(self, snapshot) -> None:
+        if self.requests_tree is None:
+            return
+        requests, count = snapshot
         selected = self.requests_tree.selection()
         selected_id = None
         if selected:
@@ -1344,6 +1389,7 @@ class DesktopApp:
         for item_id in self.requests_tree.get_children():
             self.requests_tree.delete(item_id)
 
+        self._request_rows_by_id = {row.request_id: row for row in requests}
         for request in requests:
             row_id = str(request.request_id)
             display_title = request.resolved_title or request.content
@@ -1366,7 +1412,7 @@ class DesktopApp:
         if selected_id and self.requests_tree.exists(selected_id):
             self.requests_tree.selection_set(selected_id)
 
-        self.queue_var.set(f"Outstanding requests: {open_request_count()}")
+        self.queue_var.set(f"Outstanding requests: {count}")
 
     def _on_request_selected(self, _event: Any) -> None:
         if self.requests_tree is None or self.request_detail_text is None:
@@ -1381,8 +1427,12 @@ class DesktopApp:
             return
 
         request_id = int(values[0])
-        req = get_request(request_id)
+        # Selection events can also be generated by a periodic refresh.
+        # Its snapshot already contains the complete row; do not re-lock the
+        # database from this Tk callback just to render the same data.
+        req = self._request_rows_by_id.get(request_id)
         if req is None:
+            self.refresh_requests()
             return
 
         type_label = self._TYPE_LABEL.get(req.media_type, "?")
@@ -1429,6 +1479,8 @@ class DesktopApp:
         text.configure(state=tk.DISABLED)
 
     def add_request_from_ui(self) -> None:
+        if self._request_add_pending:
+            return
         requester = self.requester_var.get().strip() or "Admin"
         content = self.request_content_var.get().strip()
         if not content:
@@ -1440,21 +1492,55 @@ class DesktopApp:
         # movie/show, and only then store a qualified, auto-grabbable identity.
         # No candidate / no pick => needs_identity (visible, never grabbed).
         self.status_var.set(f"Looking up '{content}'…")
-        try:
-            candidates = request_intake.search_candidates(content)
-        except Exception:
-            logger.exception("Candidate lookup failed for %r", content)
-            candidates = []
+        self._request_add_pending = True
+        restore = begin_busy(self._request_add_btn, working_text="Adding…")
 
-        if not candidates:
-            created = request_intake.add_needs_identity(content, requester)
-            self._finish_request_add(created, needs_identity=True)
-            return
+        def release_add() -> None:
+            self._request_add_pending = False
+            restore()
 
-        self._show_candidate_picker(content, requester, candidates)
+        def load():
+            try:
+                candidates = request_intake.search_candidates(content)
+            except Exception:
+                logger.exception("Candidate lookup failed for %r", content)
+                candidates = []
+            # The fallback also writes to the shared database, so it belongs
+            # in the worker alongside the provider lookup.
+            created = (None if candidates else
+                       request_intake.add_needs_identity(content, requester))
+            return candidates, created
 
-    def _finish_request_add(self, created, *, needs_identity: bool) -> None:
-        self.request_content_var.set("")
+        def finish(snapshot) -> None:
+            def apply_result() -> None:
+                try:
+                    candidates, created = snapshot
+                    if created is not None:
+                        self._finish_request_add(
+                            created, needs_identity=True, submitted_content=content)
+                        release_add()
+                    else:
+                        self._show_candidate_picker(
+                            content, requester, candidates, on_finished=release_add)
+                except Exception:
+                    release_add()
+                    raise
+
+            # A modal picker enters a nested Tk event loop. Open it after
+            # this queue-drain callback returns, so the drain keeps running
+            # and can deliver Search again results while the picker is open.
+            self._post_to_ui(apply_result)
+
+        def failed(error) -> None:
+            release_add()
+            self.status_var.set(f"Could not add request: {error}")
+
+        self._load_ui_snapshot("request-add", load, finish, on_error=failed)
+
+    def _finish_request_add(self, created, *, needs_identity: bool,
+                            submitted_content: str | None = None) -> None:
+        if submitted_content is None or self.request_content_var.get().strip() == submitted_content:
+            self.request_content_var.set("")
         tag = " (needs identity — pick a title to enable auto-grab)" if needs_identity else ""
         self.last_action_var.set(f"Last action: added request #{created.request_id}{tag}")
         self.status_var.set(f"Queued request #{created.request_id}: {created.content}{tag}")
@@ -1502,6 +1588,10 @@ class DesktopApp:
 
         candidates: list[Any] = list(initial_candidates or [])
         result: list[Any] = [None, False, candidates]
+        search_generation = 0
+        searching = False
+        closed = False
+        search_key = f"resolve-search-{id(win)}"
         NONE_LABEL = "None of these — file as needs identity"
 
         ttk.Label(win, text="Search:").grid(
@@ -1545,15 +1635,47 @@ class DesktopApp:
                 status_var.set("No matches — edit the search above and try again.")
 
         def _run_search() -> None:
-            nonlocal candidates
+            nonlocal search_generation, searching
+            if closed:
+                return
+            search_generation += 1
+            generation = search_generation
+            searching = True
             mt = type_var.get()
-            candidates, error = _resolve_dialog_search(
-                query_var.get(), None if mt == "auto" else mt,
-                search_fn=search_fn)
-            result[2] = candidates
-            _render(candidates, error)
+            search_query = query_var.get()
+            status_var.set(f"Searching for '{search_query.strip()}'…")
+            listbox.configure(state=tk.DISABLED)
+            confirm_btn.configure(state=tk.DISABLED)
+
+            def load():
+                if closed:
+                    return [], None
+                return _resolve_dialog_search(
+                    search_query, None if mt == "auto" else mt,
+                    search_fn=search_fn)
+
+            def apply(snapshot) -> None:
+                nonlocal candidates, searching
+                if closed or generation != search_generation or not win.winfo_exists():
+                    return
+                candidates, error = snapshot
+                searching = False
+                result[2] = candidates
+                listbox.configure(state=tk.NORMAL)
+                confirm_btn.configure(state=tk.NORMAL)
+                _render(candidates, error)
+
+            self._load_ui_snapshot(search_key, load, apply)
+
+        def _mark_closed(event=None) -> None:
+            nonlocal closed, search_generation
+            if event is None or event.widget is win:
+                closed = True
+                search_generation += 1
 
         def _confirm() -> None:
+            if searching or closed:
+                return
             sel = listbox.curselection()
             if not sel:
                 status_var.set("Select a result, or Cancel.")
@@ -1567,10 +1689,12 @@ class DesktopApp:
                 status_var.set("Select a result, or Cancel.")
                 return
             result[2] = candidates
+            _mark_closed()
             win.destroy()
 
         def _cancel() -> None:
             result[0], result[1], result[2] = None, False, candidates
+            _mark_closed()
             win.destroy()
 
         entry.bind("<Return>", lambda _e: _run_search())
@@ -1578,10 +1702,12 @@ class DesktopApp:
 
         btns = ttk.Frame(win)
         btns.grid(row=5, column=0, pady=10)
-        ttk.Button(btns, text="OK", command=_confirm).grid(row=0, column=0, padx=4)
+        confirm_btn = ttk.Button(btns, text="OK", command=_confirm)
+        confirm_btn.grid(row=0, column=0, padx=4)
         ttk.Button(btns, text="Cancel", command=_cancel).grid(row=0, column=1, padx=4)
 
         win.protocol("WM_DELETE_WINDOW", _cancel)
+        win.bind("<Destroy>", _mark_closed, add="+")
         self._apply_dark_widget_styles(win)
 
         if candidates:
@@ -1593,7 +1719,8 @@ class DesktopApp:
         self.root.wait_window(win)
         return cast(Any, result[0]), bool(result[1]), cast(list, result[2])
 
-    def _show_candidate_picker(self, content: str, requester: str, candidates: list) -> None:
+    def _show_candidate_picker(self, content: str, requester: str, candidates: list,
+                               *, on_finished=None) -> None:
         """Tk glue over request_intake.add_picked_candidate: collect the pick
         (and a season answer for TV) via the shared editable resolve dialog
         (Task E item 3), then hand the decision to the store layer. 'None of
@@ -1604,9 +1731,12 @@ class DesktopApp:
             "Which one did you mean?", content,
             initial_candidates=candidates, include_none_of_these=True)
         if match is None and not explicit_none:
+            self.status_var.set("Request not added.")
+            if on_finished is not None:
+                on_finished()
             return  # dialog cancelled — add nothing
 
-        seasons = None
+        answer = None
         if match is not None and match.media_type == "tv":
             from tkinter import simpledialog
             answer = simpledialog.askstring(
@@ -1615,8 +1745,10 @@ class DesktopApp:
                 "every aired season.",
                 parent=self.root)
             if answer is None:
+                self.status_var.set("Request not added.")
+                if on_finished is not None:
+                    on_finished()
                 return  # season prompt cancelled — add nothing
-            seasons = request_intake.seasons_for_answer(answer, match)
 
         # Pass the FULL sibling set `shown` (not just [match]) plus the real
         # index of the pick within it: add_picked_candidate builds
@@ -1643,16 +1775,40 @@ class DesktopApp:
                     getattr(match, "title", match))
                 picked = shown + [match]
                 choice_index = len(picked) - 1
-        outcome = request_intake.add_picked_candidate(
-            content, requester, picked, choice_index, seasons=seasons)
-        self.request_content_var.set("")
-        needs = outcome.status == "needs_identity"
-        tag = " (needs identity — pick a title to enable auto-grab)" if needs else ""
-        self.last_action_var.set(
-            f"Last action: added {len(outcome.request_ids)} request(s){tag}")
-        self.status_var.set(
-            f"Queued {len(outcome.request_ids)} request(s) for '{content}'{tag}")
-        self.refresh_requests()
+        self.status_var.set(f"Adding request for '{content}'…")
+
+        def load():
+            # 'All seasons' can fetch provider data, and filing can wait on
+            # a database writer. The pick and prompt are already complete;
+            # neither operation needs Tk.
+            seasons = (request_intake.seasons_for_answer(answer, match)
+                       if match is not None and match.media_type == "tv" else None)
+            return request_intake.add_picked_candidate(
+                content, requester, picked, choice_index, seasons=seasons)
+
+        def finish(outcome) -> None:
+            try:
+                if self.request_content_var.get().strip() == content:
+                    self.request_content_var.set("")
+                needs = outcome.status == "needs_identity"
+                tag = " (needs identity — pick a title to enable auto-grab)" if needs else ""
+                self.last_action_var.set(
+                    f"Last action: added {len(outcome.request_ids)} request(s){tag}")
+                self.status_var.set(
+                    f"Queued {len(outcome.request_ids)} request(s) for '{content}'{tag}")
+                self.refresh_requests()
+            finally:
+                if on_finished is not None:
+                    on_finished()
+
+        def failed(error) -> None:
+            try:
+                self.status_var.set(f"Could not add request: {error}")
+            finally:
+                if on_finished is not None:
+                    on_finished()
+
+        self._load_ui_snapshot("request-filing", load, finish, on_error=failed)
 
     def resolve_selected_request(self) -> None:
         """The resolve path for a needs_identity row: pick the exact title, then
@@ -1885,7 +2041,7 @@ class DesktopApp:
         """Render the health (and optionally update) report into the Status tab."""
         label = "Health + Update Check" if include_updates else "Health Check"
         self.status_var.set(f"Running {label.lower()}…")
-        bot_running = self.bot_service.running
+        bot_running = self.bot_service.connected
         self.run_action(
             label,
             lambda: format_health_report(bot_running=bot_running,
@@ -1910,10 +2066,29 @@ class DesktopApp:
         self._plex_dot.configure(foreground=color)
         if hasattr(self, "_status_plex_dot"):
             self._status_plex_dot.configure(foreground=color)
-        if hasattr(self, "_status_bot_dot"):
-            self._status_bot_dot.configure(
-                foreground=_DOT_GREEN if self.bot_service.running else _DOT_RED)
+        self._refresh_bot_indicator()
         self.plex_status_var.set("Plex: running" if running else "Plex: not running")
+
+    def _refresh_bot_indicator(self) -> None:
+        """Sync the Telegram label and dots with the bot's live state.
+
+        Set once at startup, the label went stale both ways: "failed" while
+        a late start had connected (2026-10-24), "running" after a crash.
+        """
+        if not config.TELEGRAM_BOT_TOKEN:
+            return  # "not configured" stays until the wizard saves a token
+        if self.bot_service.connected:
+            text, color = "Telegram bot: running", _DOT_GREEN
+        elif self.bot_service.running:
+            text, color = "Telegram bot: connecting…", _DOT_AMBER
+        elif self.bot_status_var.get().startswith("Telegram bot: failed"):
+            text, color = self.bot_status_var.get(), _DOT_RED  # keep the reason
+        else:
+            text, color = "Telegram bot: stopped", _DOT_RED
+        self.bot_status_var.set(text)
+        self._bot_dot.configure(foreground=color)
+        if hasattr(self, "_status_bot_dot"):
+            self._status_bot_dot.configure(foreground=color)
 
     def confirm_hard_reset(self, from_tray: bool = False) -> None:
         self._post_to_ui(lambda: self._confirm_hard_reset(from_tray))
@@ -2010,7 +2185,7 @@ class DesktopApp:
         if update_status_only:
             self._set_status_text(result)
         else:
-            self._set_status_text(get_status())
+            self._load_ui_snapshot("action-status", get_status, self._set_status_text)
             self.refresh_requests()
             self.refresh_library_summary()
             self.refresh_library_metrics()
@@ -2696,25 +2871,51 @@ class DesktopApp:
         self._dl_history_tree = history_tree
 
     def _on_download_update(self, download_id: int) -> None:
-        # Called from download worker threads — marshal to the UI thread.
-        self._post_to_ui(self.refresh_downloads)
-        self._post_to_ui(self.refresh_activity_feed)
+        # Many downloads can report at once. One queued signal is sufficient:
+        # snapshots read current state, so replaying every progress event only
+        # makes the UI fall further behind.
+        with self._refresh_lock:
+            if self._quitting or self._download_refresh_queued:
+                return
+            self._download_refresh_queued = True
+        if not self._post_to_ui(self._refresh_download_views):
+            with self._refresh_lock:
+                self._download_refresh_queued = False
+
+    def _refresh_download_views(self) -> None:
+        with self._refresh_lock:
+            self._download_refresh_queued = False
+        self.refresh_downloads()
+        self.refresh_activity_feed()
 
     def refresh_activity_feed(self) -> None:
         """The Status tab's live feed: active downloads with progress on
         top, then the recent download/rename/move history, condensed."""
+        if getattr(self, "_activity_tree", None) is None:
+            return
+
+        def load():
+            import grab_queue
+            rows = downloads_store.list_downloads(limit=100)
+            history = downloads_store.list_history(limit=80)
+            counts = grab_queue.status_counts()
+            return rows, history, counts
+
+        self._load_ui_snapshot("activity-feed", load, self._render_activity_feed)
+
+    def _render_activity_feed(self, snapshot) -> None:
+        rows, history, counts = snapshot
         tree = getattr(self, "_activity_tree", None)
         if tree is None:
             return
         for iid in tree.get_children():
             tree.delete(iid)
 
-        rows = downloads_store.list_downloads(limit=100)
         active = [r for r in rows if r.status in ("downloading", "queued")]
         for r in active:
             marker = f"⬇ {r.progress * 100:.0f}%" if r.status == "downloading" else "⏳ queued"
             tree.insert("", "end", values=("now", marker, r.title))
-        for h in downloads_store.list_history(limit=80):
+        for h in history:
             icons = {"downloaded": "✔ done", "renamed": "✎ renamed",
                      "moved": "→ moved", "error": "✖ error",
                      "grabbed": "+ grabbed", "cancelled": "✖ cancelled",
@@ -2729,21 +2930,20 @@ class DesktopApp:
         queued = len(active) - downloading
         self._activity_summary_var.set(
             f"{downloading} downloading, {queued} queued" if active else "no active downloads")
-        self._refresh_needs_you()
+        self._refresh_needs_you(counts)
 
-    def _refresh_needs_you(self) -> None:
+    def _refresh_needs_you(self, counts=None) -> None:
         """The Status tab's 'Needs you' line: every user-actionable count plus
         what's waiting on the app. Amber when something needs the user."""
         var = getattr(self, "_needs_you_var", None)
         if var is None:
             return
-        try:
-            import grab_queue
-            counts = grab_queue.status_counts()
-            line = grab_queue.status_summary_line(counts)
-        except Exception:
-            logger.debug("needs-you refresh failed", exc_info=True)
+        import grab_queue
+        if counts is None:
+            self._load_ui_snapshot("needs-you", grab_queue.status_counts,
+                                   self._refresh_needs_you)
             return
+        line = grab_queue.status_summary_line(counts)
         var.set(line or "✓ All clear — nothing needs you")
         label = getattr(self, "_needs_you_label", None)
         if label is not None:
@@ -2908,30 +3108,41 @@ class DesktopApp:
     def refresh_downloads(self) -> None:
         if self._dl_downloads_tree is None:
             return
+
+        def load():
+            # Keep all active/unimported rows, even when newer history rows
+            # exceed the recent-row limit. No store lock is acquired by Tk.
+            visible = {
+                row.download_id: row
+                for row in downloads_store.list_downloads_by_status(
+                    ("queued", "downloading", "downloaded"))
+            }
+            for row in downloads_store.list_downloads(limit=150):
+                visible.setdefault(row.download_id, row)
+            dm = getattr(self, "download_manager", None)
+            rows = []
+            for row in sorted(visible.values(), key=self._download_row_order):
+                phase = dm.phase_for(row.download_id) if dm is not None else None
+                status_label = downloads_store.display_status(
+                    row.status, row.progress, error=row.error, phase=phase)
+                rows.append((row, status_label))
+            return rows, downloads_store.list_history(limit=200)
+
+        self._load_ui_snapshot("downloads", load, self._render_downloads)
+
+    def _render_downloads(self, snapshot) -> None:
+        rows, history = snapshot
+        if self._dl_downloads_tree is None:
+            return
         selected_id = self._selected_download_id()
         for item in self._dl_downloads_tree.get_children():
             self._dl_downloads_tree.delete(item)
-        # Always surface every active/complete-but-unimported payload, even if
-        # hundreds of newer error/history rows would push it past a newest-N
-        # query. Recent terminal rows are then merged in for context.
-        visible = {
-            row.download_id: row
-            for row in downloads_store.list_downloads_by_status(
-                ("queued", "downloading", "downloaded"))
-        }
-        for row in downloads_store.list_downloads(limit=150):
-            visible.setdefault(row.download_id, row)
-        for row in sorted(visible.values(), key=self._download_row_order):
+        self._download_rows_by_id = {row.download_id: row for row, _ in rows}
+        for row, status_label in rows:
             route = row.error if row.error else (
                 (f"{row.planned_dest or ''}" + (f" / {row.planned_name}" if row.planned_name else ""))
                 or row.route_reason or ""
             )
-            # Honest queue label (fetching metadata / no peers / stalled /
-            # waiting for slot / probing) instead of a bare status + 0%.
-            dm = getattr(self, "download_manager", None)
-            phase = dm.phase_for(row.download_id) if dm is not None else None
-            status_label = downloads_store.display_status(
-                row.status, row.progress, error=row.error, phase=phase)
             iid = str(row.download_id)
             self._dl_downloads_tree.insert(
                 "", "end", iid=iid,
@@ -2940,14 +3151,21 @@ class DesktopApp:
             )
             if selected_id is not None and row.download_id == selected_id:
                 self._dl_downloads_tree.selection_set(iid)
-        self.refresh_download_history()
+        self._render_download_history(history)
 
     def refresh_download_history(self) -> None:
         if self._dl_history_tree is None:
             return
+        self._load_ui_snapshot(
+            "download-history", lambda: downloads_store.list_history(limit=200),
+            self._render_download_history)
+
+    def _render_download_history(self, history) -> None:
+        if self._dl_history_tree is None:
+            return
         for item in self._dl_history_tree.get_children():
             self._dl_history_tree.delete(item)
-        for h in downloads_store.list_history(limit=200):
+        for h in history:
             self._dl_history_tree.insert(
                 "", "end",
                 values=(h.at, h.action, h.before_value or "", h.after_value or ""),
@@ -2978,8 +3196,9 @@ class DesktopApp:
             return
         tree.selection_set(iid)
         download_id = int(iid)
-        row = downloads_store.get_download(download_id)
+        row = self._download_rows_by_id.get(download_id)
         if row is None:
+            self.refresh_downloads()
             return
 
         def run(op, label: str) -> None:
@@ -3111,11 +3330,18 @@ class DesktopApp:
         if download_id is None:
             self._show_warning("No download selected", "Select a download first.")
             return
-        if self.download_manager.cancel(download_id):
-            self._dl_status_var.set(f"Cancelled download #{download_id}")
-        else:
-            self._dl_status_var.set(f"Download #{download_id} is not running.")
-        self.refresh_downloads()
+        def worker() -> None:
+            try:
+                cancelled = self.download_manager.cancel(download_id)
+                message = (f"Cancelled download #{download_id}" if cancelled
+                           else f"Download #{download_id} is not running.")
+            except Exception as exc:
+                logger.exception("Cancel download failed.")
+                message = f"Could not cancel download #{download_id}: {exc}"
+            self._post_to_ui(lambda: (self._dl_status_var.set(message),
+                                      self.refresh_downloads()))
+
+        threading.Thread(target=worker, name="ui-cancel-download", daemon=True).start()
 
     def open_staging_folder(self) -> None:
         staging = Path(config.TORRENT_DOWNLOAD_DIR)
@@ -3339,7 +3565,15 @@ class DesktopApp:
     def refresh_users_tab(self) -> None:
         if self._users_pending_tree is None or self._users_allowed_tree is None:
             return
-        pending = auth_store.list_access_requests(status="pending")
+        self._load_ui_snapshot(
+            "users", lambda: (auth_store.list_access_requests(status="pending"),
+                              auth_store.list_allowed_users()),
+            self._render_users_tab)
+
+    def _render_users_tab(self, snapshot) -> None:
+        if self._users_pending_tree is None or self._users_allowed_tree is None:
+            return
+        pending, allowed = snapshot
         for item in self._users_pending_tree.get_children():
             self._users_pending_tree.delete(item)
         for r in pending:
@@ -3351,7 +3585,7 @@ class DesktopApp:
 
         for item in self._users_allowed_tree.get_children():
             self._users_allowed_tree.delete(item)
-        for u in auth_store.list_allowed_users():
+        for u in allowed:
             self._users_allowed_tree.insert(
                 "", "end", iid=str(u.row_id),
                 values=(u.row_id, u.telegram_user_id or "—", u.display_name or "",
@@ -3455,6 +3689,63 @@ class DesktopApp:
             if pending is not None and not pending.done():
                 return
             self._refresh_futures[key] = self._refresh_pool.submit(fn)
+
+    def _load_ui_snapshot(self, key: str, load, apply, *, on_error=None) -> None:
+        """Read on a worker, render on Tk, with at most one pending rerun.
+
+        Store reads can wait for maintenance's lock. They must never run in
+        a Tk callback, and progress bursts must not queue unlimited copies.
+        A key remains busy until its result is rendered, not merely loaded.
+        """
+        with self._refresh_lock:
+            if self._quitting:
+                return
+            if key in self._snapshot_running:
+                self._snapshot_pending[key] = (load, apply, on_error)
+                return
+            self._snapshot_running.add(key)
+
+        def worker() -> None:
+            result = None
+            error = None
+            try:
+                result = load()
+            except Exception as exc:
+                logger.exception("%s refresh failed.", key)
+                error = str(exc)
+
+            def finish() -> None:
+                try:
+                    if not self._quitting:
+                        if error is None:
+                            apply(result)
+                        elif on_error is not None:
+                            on_error(error)
+                finally:
+                    with self._refresh_lock:
+                        self._snapshot_running.discard(key)
+                        pending = self._snapshot_pending.pop(key, None)
+                    if pending is not None and not self._quitting:
+                        reload, render, failed = pending
+                        self._load_ui_snapshot(key, reload, render, on_error=failed)
+
+            if not self._post_to_ui(finish):
+                with self._refresh_lock:
+                    self._snapshot_running.discard(key)
+                    self._snapshot_pending.pop(key, None)
+
+        with self._refresh_lock:
+            if self._quitting:
+                self._snapshot_running.discard(key)
+                self._snapshot_pending.pop(key, None)
+                return
+            try:
+                self._refresh_pool.submit(worker)
+            except RuntimeError:
+                self._snapshot_running.discard(key)
+                self._snapshot_pending.pop(key, None)
+                if not self._quitting:
+                    raise
 
     def _refresh_file_ledger_views(self) -> None:
         """Fill the File Changes / Missing Files trees from the ledger."""
@@ -4686,19 +4977,24 @@ class DesktopApp:
     def _idle_cache_tick(self) -> None:
         if self._quitting:
             return
+        # Checking for active downloads takes the same lock as retention.
+        # Schedule the next tick immediately and let a worker wait, not Tk.
+        self._load_ui_snapshot(
+            "idle-cache-check",
+            lambda: any(row.status in ("queued", "downloading")
+                        for row in downloads_store.list_downloads(limit=50)),
+            self._handle_idle_cache_check)
+        self.root.after(15 * 60 * 1000, self._idle_cache_tick)
+
+    def _handle_idle_cache_check(self, downloads_active: bool) -> None:
         now = datetime.datetime.now()
         today_str = now.date().isoformat()
-        downloads_active = any(
-            row.status in ("queued", "downloading")
-            for row in downloads_store.list_downloads(limit=50)
-        )
         if (config.IDLE_CACHE_ENABLED
                 and self._last_idle_cache_date != today_str
                 and now.hour >= config.IDLE_CACHE_HOUR
                 and not downloads_active):
             self._last_idle_cache_date = today_str
             self._run_idle_cache_pass()
-        self.root.after(15 * 60 * 1000, self._idle_cache_tick)
 
     def _run_idle_cache_pass(self) -> None:
         """Refresh every expensive scan overnight, popups suppressed, so each
@@ -7080,13 +7376,15 @@ class DesktopApp:
                 status_var.set(f"Token valid — bot is @{username}. Starting bot…")
                 self._update_telegram_setup_button()
                 if not self.bot_service.running:
-                    try:
-                        self.bot_service.start()
-                        self.bot_status_var.set("Telegram bot: running")
-                        self._bot_dot.configure(foreground=_DOT_GREEN)
-                        status_var.set(f"✔ Bot @{username} is up. Message it on Telegram to test!")
-                    except Exception as exc:
-                        status_var.set(f"Token saved, but the bot failed to start: {exc}")
+                    def finished(connected, error) -> None:
+                        if error is not None:
+                            status_var.set(f"Token saved, but the bot failed to start: {error}")
+                        elif connected:
+                            status_var.set(f"✔ Bot @{username} is up. Message it on Telegram to test!")
+                        else:
+                            status_var.set("Token saved. Telegram isn't answering yet; "
+                                           "the bot keeps trying in the background.")
+                    self._start_bot_async(finished)
             self._post_to_ui(apply)
 
         threading.Thread(target=worker, name="wizard-token", daemon=True).start()

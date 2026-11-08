@@ -294,6 +294,32 @@ def test_prune_run_with_no_chosen_deletes_all_details_keeps_run():
     assert json.loads(run.verdict_histogram_json) == {"cam_or_trash": 1}
 
 
+def test_prune_finishes_every_batch(monkeypatch):
+    # Batches commit and release the write lock between them; every old run
+    # must still be pruned, including the partial last batch.
+    monkeypatch.setattr(downloads_store, "_PRUNE_BATCH", 2)
+    old_runs = [downloads_store.record_selection_run(
+        _decision(created_at=_OLD, chosen_seed=f"winner{i}")) for i in range(5)]
+    fresh = downloads_store.record_selection_run(_decision(created_at=_NOW))
+
+    summary = downloads_store.prune_selection_run_details(days=90, now=_NOW)
+
+    assert summary["runs_pruned"] == 5 and summary["rows_deleted"] == 15
+    for run_id in old_runs:
+        assert len(downloads_store.list_candidate_decisions(run_id)) == 1
+    assert len(downloads_store.list_candidate_decisions(fresh)) == 4
+
+
+def test_candidate_decisions_lookups_use_the_run_index():
+    # Without the index every lookup scanned the whole table, and the nightly
+    # prune took 6+ hours on a ~1M row table (2026-10).
+    with db.connect() as conn:
+        plan = conn.execute(
+            "EXPLAIN QUERY PLAN DELETE FROM candidate_decisions"
+            " WHERE selection_run_id = 1").fetchall()
+    assert any("idx_candidate_decisions_run" in str(row) for row in plan)
+
+
 def test_export_selection_run_json_captures_everything():
     run_id = downloads_store.record_selection_run(
         _decision(created_at=_OLD), request_id=12)
@@ -424,6 +450,7 @@ def test_active_download_and_needs_placement_and_blocklist_rows():
         source="tpb", media_type="tv", request_id=None,
         staging_dir="C:/staging", planned_dest=None, planned_name=None,
         route_reason=None, auto_rename=False, auto_move=False)
+    downloads_store.set_status(stuck, "downloaded", completed=True)
     downloads_store.record_needs_placement(
         stuck, show_id=None, season=1, suggested_dir="D:/TV/Homeless/Season 01",
         reason="no tv root configured")

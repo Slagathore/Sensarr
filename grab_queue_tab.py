@@ -40,6 +40,7 @@ class GrabQueueTab:
     def __init__(self, parent: ttk.Frame, app) -> None:
         self.app = app
         self._rows: list[grab_queue.GrabQueueRow] = []
+        self._detail_generation = 0
         self._status_var = tk.StringVar(value="Refresh to load the grab queue.")
 
         parent.columnconfigure(0, weight=1)
@@ -116,14 +117,18 @@ class GrabQueueTab:
     # ------------------------------------------------------------------
 
     def refresh(self) -> None:
-        try:
-            self._rows = grab_queue.list_grab_queue_rows()
-        except Exception:
-            logger.exception("Grab queue refresh failed.")
+        def failed(_error) -> None:
             msg = "Refresh failed, see the log."
             self._status_var.set(msg)
             self.app.post_activity("Grab queue", msg, level="error", tab="Requests")
-            return
+
+        self.app._load_ui_snapshot(
+            "grab-queue", grab_queue.list_grab_queue_rows, self._apply_rows,
+            on_error=failed)
+
+    def _apply_rows(self, rows) -> None:
+        self._detail_generation += 1
+        self._rows = rows
         for item in self._tree.get_children():
             self._tree.delete(item)
         for idx, row in enumerate(self._rows):
@@ -139,6 +144,7 @@ class GrabQueueTab:
         self._status_var.set(
             f"{len(self._rows)} rows: {len(request_ids)} outstanding request(s)"
             f" + {operational} download/automation/blocklist row(s).")
+        self._render_detail()
 
     def _selected_row(self) -> grab_queue.GrabQueueRow | None:
         sel = self._tree.selection()
@@ -155,6 +161,27 @@ class GrabQueueTab:
 
     def _render_detail(self) -> None:
         row = self._selected_row()
+        self._detail_generation += 1
+        generation = self._detail_generation
+        if row is None or row.selection_run_id is None:
+            self._set_detail_text(self._detail_text(row, include_decision=False))
+            return
+        self._set_detail_text(self._detail_text(row, include_decision=False)
+                              + "\n\nLoading decision…")
+
+        def apply(text) -> None:
+            # A slow decision read must never overwrite a newer selection.
+            if generation == self._detail_generation:
+                self._set_detail_text(text)
+
+        self.app._load_ui_snapshot(
+            "grab-queue-detail", lambda: self._detail_text(row), apply,
+            on_error=lambda _error: apply(
+                self._detail_text(row, include_decision=False)
+                + "\n\nDecision unavailable. Select it again to retry."))
+
+    @staticmethod
+    def _detail_text(row, *, include_decision=True) -> str:
         text = ""
         if row is not None:
             lines = [f"{_TYPE_LABEL.get(row.row_type, row.row_type)}: "
@@ -170,10 +197,13 @@ class GrabQueueTab:
                 if value in (None, "", [], {}):
                     continue
                 lines.append(f"{key}: {value}")
-            if row.selection_run_id is not None:
+            if include_decision and row.selection_run_id is not None:
                 lines.append("")
-                lines.append(self._decision_text(row.selection_run_id))
+                lines.append(GrabQueueTab._decision_text(row.selection_run_id))
             text = "\n".join(lines)
+        return text
+
+    def _set_detail_text(self, text: str) -> None:
         self._detail.configure(state=tk.NORMAL)
         self._detail.delete("1.0", tk.END)
         self._detail.insert("1.0", text)
@@ -271,7 +301,6 @@ class GrabQueueTab:
     def _grab_now(self, row) -> None:
         if row.request_id is None:
             return
-        grab_queue.grab_now_request(row.request_id)
         working_msg = f"Request #{row.request_id} reopened, grabbing…"
         self._status_var.set(working_msg)
         self.app.post_activity("Grab queue", working_msg, level="working", tab="Requests")
@@ -279,6 +308,7 @@ class GrabQueueTab:
 
         def worker() -> None:
             try:
+                grab_queue.grab_now_request(row.request_id)
                 started = self.app.download_manager.auto_grab_open_requests()
                 msg = (f"Started {len(started)} download(s)."
                        if started else "No acceptable result this pass.")
@@ -300,11 +330,31 @@ class GrabQueueTab:
     def _defer(self, row) -> None:
         if row.request_id is None:
             return
-        grab_queue.defer_request(row.request_id)
-        msg = f"Request #{row.request_id} deferred 24 h."
-        self._status_var.set(msg)
-        self.app.post_activity("Grab queue", msg, level="success", tab="Requests")
-        self.refresh()
+        self._run_store_action(
+            "Deferring request…", lambda: grab_queue.defer_request(row.request_id),
+            f"Request #{row.request_id} deferred 24 h.")
+
+    def _run_store_action(self, working: str, action, message: str | None) -> None:
+        """Even a small write can wait on maintenance; keep it off Tk."""
+        self._status_var.set(working)
+
+        def worker() -> None:
+            try:
+                outcome = action()
+                result = message if message is not None else str(outcome)
+                level = "success"
+            except Exception as exc:
+                logger.exception("Grab queue action failed.")
+                result, level = f"Action failed: {exc}", "error"
+
+            def finish() -> None:
+                self._status_var.set(result)
+                self.app.post_activity("Grab queue", result, level=level, tab="Requests")
+                self.refresh()
+
+            self.app._post_to_ui(finish)
+
+        threading.Thread(target=worker, name="grabqueue-action", daemon=True).start()
 
     def _resolve(self, row) -> None:
         if row.request_id is None:
@@ -315,8 +365,16 @@ class GrabQueueTab:
     def _wrong_grab(self, row) -> None:
         download_id = row.download_id
         if download_id is None and row.request_id is not None:
-            dls = downloads_store.downloads_for_request(row.request_id)
-            download_id = dls[-1].download_id if dls else None
+            def load():
+                dls = downloads_store.downloads_for_request(row.request_id)
+                return dls[-1].download_id if dls else None
+            self.app._load_ui_snapshot(
+                "wrong-grab-download", load, self._confirm_wrong_grab,
+                on_error=lambda error: self.app._show_warning("Wrong grab", error))
+            return
+        self._confirm_wrong_grab(download_id)
+
+    def _confirm_wrong_grab(self, download_id) -> None:
         if download_id is None:
             self.app._show_warning("No download",
                                    "No download is linked to this row.")
@@ -330,11 +388,10 @@ class GrabQueueTab:
             "Recycle now?",
             "Also send the staged files to the recycle bin now?\n\n"
             "'No' keeps them quarantined in staging (default — reversible).")
-        outcome = self.app.download_manager.mark_wrong_grab(
-            download_id, recycle=recycle)
-        self._status_var.set(outcome)
-        self.app.post_activity("Grab queue", outcome, level="warning", tab="Requests")
-        self.refresh()
+        self._run_store_action(
+            "Marking wrong grab…",
+            lambda: self.app.download_manager.mark_wrong_grab(
+                download_id, recycle=recycle), None)
 
     def _create_placement(self, row) -> None:
         if row.download_id is None:
@@ -400,28 +457,23 @@ class GrabQueueTab:
                 "Remove blocklist entry",
                 f"Allow '{row.display_title}' again for {row.subject_key}?"):
             return
-        downloads_store.remove_blocklist_entry(int(blocklist_id))
-        msg = "Blocklist entry removed."
-        self._status_var.set(msg)
-        self.app.post_activity("Grab queue", msg, level="success", tab="Requests")
-        self.refresh()
+        self._run_store_action(
+            "Removing blocklist entry…",
+            lambda: downloads_store.remove_blocklist_entry(int(blocklist_id)),
+            "Blocklist entry removed.")
 
     def _keep_details(self, row) -> None:
         if row.selection_run_id is None:
             return
-        downloads_store.set_keep_details(row.selection_run_id, True)
-        msg = f"Run #{row.selection_run_id}: loser details kept forever."
-        self._status_var.set(msg)
-        self.app.post_activity("Grab queue", msg, level="success", tab="Requests")
+        self._run_store_action(
+            "Saving retention setting…",
+            lambda: downloads_store.set_keep_details(row.selection_run_id, True),
+            f"Run #{row.selection_run_id}: loser details kept forever.")
 
     def _export_decision(self, row) -> None:
         if row.selection_run_id is None:
             return
         from tkinter import filedialog
-        text = downloads_store.export_selection_run_json(row.selection_run_id)
-        if text is None:
-            self.app._show_warning("Export", "Selection run not found.")
-            return
         path = filedialog.asksaveasfilename(
             title="Export decision JSON",
             defaultextension=".json",
@@ -429,8 +481,12 @@ class GrabQueueTab:
             filetypes=[("JSON", "*.json")])
         if not path:
             return
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(text)
-        msg = f"Exported to {path}"
-        self._status_var.set(msg)
-        self.app.post_activity("Grab queue", msg, level="success", tab="Requests")
+
+        def export() -> None:
+            text = downloads_store.export_selection_run_json(row.selection_run_id)
+            if text is None:
+                raise LookupError("Selection run not found.")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(text)
+
+        self._run_store_action("Exporting decision…", export, f"Exported to {path}")

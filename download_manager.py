@@ -21,6 +21,7 @@
 import datetime as _dt
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -43,6 +44,7 @@ import queue_store
 import show_tracker
 import shows_store
 import size_match
+import staging_paths
 import torrent_routing
 import torrent_select
 import verification
@@ -1358,8 +1360,11 @@ class DownloadManager:
         requeued = 0
         reconciled = 0
         finish_moves: list[int] = []
+        resolved = downloads_store.reconcile_needs_placement()
+        if resolved:
+            logger.info("Recovery: resolved %d obsolete placement marker(s).", resolved)
         recovery_rows = downloads_store.list_downloads_by_status(
-            ("downloading", "queued", "downloaded"))
+            ("downloading", "queued", "downloaded", "moved"))
         for row in recovery_rows:
             if row.status == "downloading":
                 downloads_store.set_status(row.download_id, "queued")
@@ -1367,21 +1372,13 @@ class DownloadManager:
                     row.download_id, "recovered", before=None,
                     after="app restarted — requeued (existing data is kept)")
                 requeued += 1
-            elif row.status == "downloaded" and self._reconcile_prior_move(row):
-                # Old runners could emit a duplicate late `done` event after
-                # post-processing had already moved the payload.  That event
-                # overwrote `moved` with `downloaded`; the exact audit path is
-                # stronger evidence than the now-empty staging path.
-                reconciled += 1
-            elif (row.status == "downloaded" and not row.error
-                  and row.files_json and (row.auto_move or row.auto_rename)):
-                # Post-process was interrupted (a cross-drive move can leave
-                # a PARTIAL copy at the destination) — finish it now. Legacy
-                # rows without an exact engine file manifest are deliberately
-                # left for manual review; rows already carrying an actionable
-                # import/placement error also stay manual instead of repeating
-                # the same failed operation on every launch.
-                finish_moves.append(row.download_id)
+            elif (row.status == "downloaded" or
+                  (row.status == "moved" and row.verification_state == "partial")):
+                recovery = self._recover_completed_download(row)
+                if recovery == "reconciled":
+                    reconciled += 1
+                elif recovery == "retry":
+                    finish_moves.append(row.download_id)
         if requeued:
             logger.info("Recovery: requeued %d download(s) from the previous "
                         "session.", requeued)
@@ -1400,6 +1397,31 @@ class DownloadManager:
             threading.Thread(target=finisher, name="dl-recovery-finish",
                              daemon=True).start()
         self._maybe_start_next()
+
+    def _recover_completed_download(self, row: downloads_store.DownloadRow) -> str:
+        """Recover one completed job without guessing at other staged files."""
+        if row.removed_at:
+            return "manual"
+        if self._reconcile_prior_move(row):
+            return "reconciled"
+        if row.status == "moved" and row.verification_state == "partial":
+            # Old versions labelled a partially imported pack "moved", making
+            # its remaining members impossible to retry from Downloads.
+            downloads_store.set_status(
+                row.download_id, "downloaded", completed=True,
+                error="needs import: partial placement; remaining files need review")
+            row = downloads_store.get_download(row.download_id) or row
+        if not self._media_files_in_staging(row):
+            # This also checks exact receipts from another copy of the SAME
+            # torrent before declaring the completed payload unavailable.
+            self._finish_post_process(
+                row.download_id, request_title=_request_title_from_row(row))
+            latest = downloads_store.get_download(row.download_id)
+            return "reconciled" if latest and latest.status == "moved" else "manual"
+        if (not row.error and row.files_json
+                and (row.auto_move or row.auto_rename)):
+            return "retry"
+        return "manual"
 
     # ------------------------------------------------------------------
     # Built-in engine queue: cap concurrent downloads, rotate stalled ones
@@ -1724,6 +1746,13 @@ class DownloadManager:
         row = downloads_store.get_download(download_id)
         if row is None:
             return "Download not found."
+        if row.removed_at or row.verification_state == "quarantined":
+            return "Can't apply route to an archived or quarantined download."
+        if row.status == "moved" and row.verification_state == "partial":
+            downloads_store.set_status(
+                download_id, "downloaded", completed=True,
+                error="needs import: partial placement; retrying remaining files")
+            row = downloads_store.get_download(download_id) or row
         if request_title and request_title.strip():
             downloads_store.set_route_title(download_id, request_title)
             row = downloads_store.get_download(download_id) or row
@@ -2303,14 +2332,16 @@ class DownloadManager:
     def _placed_by_another_download(row) -> list:
         """Every staged VIDEO this download expected was already placed by
         another download (same relative staging path). [] otherwise."""
-        try:
-            manifest = json.loads(row.files_json or "[]")
-        except (TypeError, ValueError):
+        manifest = DownloadManager._manifest_paths(row)
+        root = staging_paths.staging_root(row.staging_dir or config.TORRENT_DOWNLOAD_DIR)
+        if manifest is None or root is None:
             return []
-        videos = [p for p in manifest if isinstance(p, str)
-                  and Path(p).suffix.lower() in torrent_routing.VIDEO_EXTENSIONS]
+        videos = [str(p.relative_to(root)) for p in manifest
+                  if p.suffix.lower() in torrent_routing.VIDEO_EXTENSIONS]
         if not videos:
             return []
+        if any(path.is_file() for path in manifest):
+            return []  # A reappeared source needs verification, not an old receipt.
         placed = downloads_store.placed_copies(videos, exclude_download=row.download_id)
         # Same relative path is not enough ("S01E01.mkv" is a common name):
         # the other download must have fetched the SAME torrent.
@@ -2926,7 +2957,7 @@ class DownloadManager:
                     request_id, include_removed=False))
             if show_id is not None:
                 rows.extend(downloads_store.list_downloads_by_status(
-                    ("queued", "downloading", "seeding", "verifying",
+                    ("queued", "downloading", "downloaded", "seeding", "verifying",
                      "completed", "moved")))
         except Exception:
             logger.exception("Season-pack in-flight check failed for show %s "
@@ -2972,6 +3003,15 @@ class DownloadManager:
         if ep.grab_download_id is not None:
             linked = downloads_store.get_download(ep.grab_download_id)
             if linked is not None and linked.status not in ("error", "cancelled"):
+                return []
+        # A completed season pack held for import/missing-file review also
+        # owns its episodes. Follow-new has no ep.grab_download_id for packs.
+        # Explicit restart/remove changes that job's state; automatic passes
+        # must not silently replace its bytes with new episode downloads.
+        for held in downloads_store.list_downloads_by_status(
+                ("queued", "downloading", "stopped", "downloaded")):
+            if (held.show_id == show.show_id and held.season == ep.season
+                    and held.episode is None):
                 return []
         key = f"ep:{show.show_id}:{ep.season}:{ep.episode}"
         # Episode cooldowns must stay episode-scoped even when several episode
@@ -4237,44 +4277,148 @@ class DownloadManager:
         self._notify(download_id)
         self._maybe_start_next()
 
-    def _reconcile_prior_move(self, row: downloads_store.DownloadRow) -> list[str]:
-        """Restore a stale ``downloaded`` row whose audited move still exists.
-
-        This deliberately accepts only exact final paths previously written by
-        Sensarr to download provenance/history.  Merely finding a similar title
-        somewhere in a library is not evidence that this payload was placed.
-        """
-        candidates: list[str] = []
-        for placed in downloads_store.list_download_files(row.download_id):
-            if (placed.final_path
-                    and placed.verification_state in ("verified", "duplicate")):
-                candidates.append(placed.final_path)
-        for history in downloads_store.history_for_download(row.download_id):
-            if history.action == "moved" and history.after_value:
-                candidates.append(history.after_value)
-
-        existing: list[str] = []
-        seen: set[str] = set()
-        for candidate in candidates:
-            path = Path(candidate)
-            key = str(path).casefold()
-            if (key in seen or not path.is_file()
-                    or path.suffix.lower() not in torrent_routing.VIDEO_EXTENSIONS):
-                continue
-            seen.add(key)
-            existing.append(str(path))
-        if not existing:
+    @staticmethod
+    def _manifest_paths(row: downloads_store.DownloadRow) -> list[Path] | None:
+        """Exact engine paths, or None for a legacy job without a manifest."""
+        if not row.files_json:
+            return None
+        try:
+            names = json.loads(row.files_json)
+        except (TypeError, ValueError):
+            return []  # A broken manifest is not permission to guess ownership.
+        if not isinstance(names, list):
             return []
+        staging = Path(row.staging_dir or config.TORRENT_DOWNLOAD_DIR)
+        paths: list[Path] = []
+        for name in names:
+            if not isinstance(name, str) or not name:
+                return []
+            path = staging_paths.owned_staging_path(staging, name)
+            if path is None:
+                return []  # Do not silently verify only the valid half of a manifest.
+            paths.append(path)
+        return paths
 
+    def _placement_evidence(self, row: downloads_store.DownloadRow
+                            ) -> tuple[int, int, list[str]]:
+        """Count expected/placed primary videos using exact source receipts.
+
+        A partial pack cannot become verified just because one final file
+        exists. A source that has reappeared must be processed again, and an
+        old move history cannot overrule a newer failed per-file receipt.
+        """
+        staging = Path(row.staging_dir or config.TORRENT_DOWNLOAD_DIR)
+        manifest = self._manifest_paths(row)
+        if row.files_json and not manifest:
+            return 0, 0, []
+        want = downloads_store.get_want(row.download_id)
+        identity = (verification.identity_from_want(want) if want
+                    else MediaIdentity(media_type=row.media_type))
+
+        def key(path: Path) -> str:
+            return os.path.abspath(str(path)).replace("\\", "/").casefold()
+
+        def gating(path: Path, *, single: bool = False) -> bool:
+            return (path.suffix.lower() in torrent_routing.VIDEO_EXTENSIONS
+                    and verification.classify_role(
+                        path, is_video=True, is_subtitle=False,
+                        single_video=single, want=identity)
+                    in verification._IDENTITY_GATING_ROLES)
+
+        videos = [p for p in (manifest or [])
+                  if p.suffix.lower() in torrent_routing.VIDEO_EXTENSIONS]
+        expected = {key(p) for p in videos if gating(p, single=len(videos) == 1)}
+        covered: dict[str, str] = {}
+        recorded: set[str] = set()
+        for receipt in downloads_store.list_download_files(row.download_id, include_removed=True):
+            source_entry = receipt.source_absolute_path or receipt.source_relative_path
+            source = (staging_paths.owned_staging_path(staging, source_entry)
+                      if source_entry else None)
+            if source is None:
+                continue
+            source_key = key(source)
+            recorded.add(source_key)
+            covered.pop(source_key, None)
+            is_gating = (receipt.media_role in verification._IDENTITY_GATING_ROLES
+                         or (receipt.media_role is None and gating(source)))
+            if not is_gating:
+                continue
+            expected.add(source_key)
+            if (receipt.removed_at or source.is_file() or not receipt.final_path
+                    or receipt.verification_state not in ("verified", "duplicate")):
+                continue
+            final = Path(receipt.final_path)
+            if (not final.is_file()
+                    or staging_paths.has_redirected_component(final)
+                    or final.suffix.lower() not in torrent_routing.VIDEO_EXTENSIONS):
+                continue
+            # Duplicate receipts can intentionally point to a differently
+            # encoded complete library copy. A direct move keeps its byte size.
+            if (receipt.verification_state == "verified"
+                    and receipt.size_bytes is not None
+                    and final.stat().st_size != receipt.size_bytes):
+                continue
+            covered[source_key] = str(final)
+
+        for history in downloads_store.history_for_download(row.download_id):
+            if (history.action != "moved" or not history.before_value
+                    or not history.after_value):
+                continue
+            source = staging_paths.owned_staging_path(staging, history.before_value)
+            if source is None:
+                continue
+            source_key = key(source)
+            if source_key in recorded or not gating(source):
+                continue
+            expected.add(source_key)
+            final = Path(history.after_value)
+            if (not source.is_file() and final.is_file()
+                    and not staging_paths.has_redirected_component(final)
+                    and final.suffix.lower() in torrent_routing.VIDEO_EXTENSIONS):
+                covered[source_key] = str(final)
+        paths = list(dict.fromkeys(covered[k] for k in sorted(expected & covered.keys())))
+        return len(expected), len(expected & covered.keys()), paths
+
+    def _reconcile_prior_move(self, row: downloads_store.DownloadRow) -> list[str]:
+        """Restore completion only when every primary file has an exact receipt."""
+        if (row.removed_at or row.verification_state == "quarantined"
+                or row.status not in ("downloaded", "moved")):
+            return []
+        total, placed, existing = self._placement_evidence(row)
+        if not total or placed != total:
+            return []
         downloads_store.set_status(row.download_id, "moved", completed=True)
         downloads_store.set_verification(
             row.download_id, "verified",
-            reason="reconciled from exact prior move audit path")
+            reason="reconciled from exact prior move audit paths")
         downloads_store.add_history(
-            row.download_id, "reconciled", before="downloaded",
-            after="exact prior move still exists: " + ", ".join(existing))
+            row.download_id, "reconciled", before=row.status,
+            after="all primary files have exact prior moves: " + ", ".join(existing))
         self._on_download_placed(row, existing)
         return existing
+
+    def _hold_missing_payload(self, row: downloads_store.DownloadRow) -> None:
+        """Keep a disappeared completed payload out of automatic download loops."""
+        message = ("missing staging payload: no owned media remains in staging "
+                   "and exact prior moves do not account for the whole download; "
+                   "review or restore the files before retrying")
+        if row.error != message:
+            # 'downloaded' records that the transfer finished. The explicit
+            # error renders as 'missing files'; keeping this completed job live
+            # also stops episode/pack auto-grab from silently replacing it.
+            downloads_store.set_status(
+                row.download_id, "downloaded", error=message, completed=True)
+            downloads_store.set_verification(
+                row.download_id, "partial" if self._placement_evidence(row)[1] else "failed",
+                reason=message)
+            downloads_store.add_history(
+                row.download_id, "import_error", before=None, after=message)
+        downloads_store.clear_needs_placement(row.download_id)
+        if row.request_id is not None:
+            req = queue_store.get_request(row.request_id)
+            if req is not None and req.status not in queue_store.TERMINAL_STATUSES:
+                queue_store.set_status(row.request_id, queue_store.STATUS_NEEDS_ATTENTION)
+        self._notify(row.download_id)
 
     @staticmethod
     def _runner_selection_options(
@@ -4335,8 +4479,11 @@ class DownloadManager:
             self._notify(download_id)
             return message
 
-        if (outcome.startswith("no media files found")
-                or "no primary/episode video" in outcome):
+        if outcome.startswith("no media files found"):
+            row = downloads_store.get_download(download_id)
+            if row is not None:
+                self._hold_missing_payload(row)
+        elif "no primary/episode video" in outcome:
             downloads_store.set_status(
                 download_id, "error", error=outcome, completed=True)
             downloads_store.add_history(
@@ -4378,32 +4525,27 @@ class DownloadManager:
         incident), so it survives only as a fallback for legacy rows, at a
         much higher similarity bar.
         """
-        staging = Path(row.staging_dir or config.TORRENT_DOWNLOAD_DIR)
+        staging = staging_paths.staging_root(row.staging_dir or config.TORRENT_DOWNLOAD_DIR)
         wanted_exts = torrent_routing.VIDEO_EXTENSIONS | torrent_routing.SUBTITLE_EXTENSIONS
-        if not staging.is_dir():
+        if staging is None or not staging.is_dir():
             return []
 
-        if row.files_json:
-            import json as _json
-            try:
-                rel_paths = _json.loads(row.files_json)
-            except ValueError:
-                rel_paths = []
-            exact = [staging / rel for rel in rel_paths]
-            exact = [p for p in exact
-                     if p.is_file() and p.suffix.lower() in wanted_exts]
-            if exact:
-                return exact
+        exact = self._manifest_paths(row)
+        if exact is not None:
+            return [p for p in exact if p.is_file() and p.suffix.lower() in wanted_exts]
 
         candidates: list[Path] = []
         entries = sorted(staging.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
         for entry in entries:
+            if staging_paths.owned_staging_path(staging, entry) is None:
+                continue
             name_match = torrent_routing._folder_similarity(entry.name, row.title) >= 0.8
             if entry.is_file() and entry.suffix.lower() in wanted_exts and name_match:
                 candidates.append(entry)
             elif entry.is_dir() and name_match:
                 for f in entry.rglob("*"):
-                    if f.is_file() and f.suffix.lower() in wanted_exts:
+                    if (f.is_file() and f.suffix.lower() in wanted_exts
+                            and staging_paths.owned_staging_path(staging, f) is not None):
                         candidates.append(f)
                 break
             if candidates and entry.is_file():
@@ -4454,6 +4596,9 @@ class DownloadManager:
         # vanished legacy file cannot masquerade forever as "needs placement".
         files = self._media_files_in_staging(row)
         if not files:
+            prior = self._reconcile_prior_move(row)
+            if prior:
+                return "moved to " + str(Path(prior[0]).parent)
             placed = self._placed_by_another_download(row)
             if placed:
                 # A pack and a single episode of the SAME torrent wrote the same
@@ -4522,13 +4667,13 @@ class DownloadManager:
 
         video_files = [f for f in files if f.suffix.lower() in torrent_routing.VIDEO_EXTENSIONS]
 
-        # Fresh provenance rows for this pass (idempotent re-runs).
-        downloads_store.clear_download_files(download_id)
+        # Rebuild only sources actually being retried. Other pack members may
+        # already be in the library; their receipts must survive this pass.
+        downloads_store.clear_download_files(
+            download_id, source_paths=[str(f) for f in files])
         dest_dir = Path(plan.dest_dir)
         moved_gating = 0          # gating (primary/episode) files placed
-        gating_total = 0
         skipped_gating = 0
-        moved_final_paths: list[str] = []
 
         # VobSub pairing (Task D2 item 4): a .sub/.idx track is only usable with
         # its partner. Move both or neither — a lone half is broken and skipped.
@@ -4583,13 +4728,15 @@ class DownloadManager:
             if roles[str(f)] in verification._IDENTITY_GATING_ROLES)
 
         for src in files:
+            if staging_paths.owned_staging_path(
+                    row.staging_dir or config.TORRENT_DOWNLOAD_DIR, src) != src:
+                raise OSError("staged source ownership changed before import")
             suffix = src.suffix.lower()
             is_video = suffix in torrent_routing.VIDEO_EXTENSIONS
             is_sub = suffix in torrent_routing.SUBTITLE_EXTENSIONS
             role = roles[str(src)]
             is_gating = role in verification._IDENTITY_GATING_ROLES
-            if is_gating:
-                gating_total += 1
+            source_size = src.stat().st_size
 
             def _record(state: str, *, final: str | None = None,
                         reason: str | None = None) -> None:
@@ -4608,7 +4755,7 @@ class DownloadManager:
                     parsed_year=pf.year,
                     parsed_season=(pf.seasons[0] if pf.seasons else None),
                     parsed_episode=(pf.episodes[0] if pf.episodes else None),
-                    size_bytes=(src.stat().st_size if src.exists() else None),
+                    size_bytes=source_size,
                     final_path=final, verification_state=state,
                     verification_reason=reason,
                     moved_at=(_dt.datetime.now(_dt.timezone.utc).isoformat()
@@ -4718,7 +4865,6 @@ class DownloadManager:
                                 reason="already in library — staged copy recycled")
                         if is_gating:
                             moved_gating += 1
-                            moved_final_paths.append(str(target))
                         continue
                     try:
                         source_size = src.stat().st_size
@@ -4753,7 +4899,6 @@ class DownloadManager:
                                        "— staged copy recycled")
                         if is_gating:
                             moved_gating += 1
-                            moved_final_paths.append(str(target))
                         continue
                     else:
                         downloads_store.add_history(
@@ -4783,7 +4928,6 @@ class DownloadManager:
                 _record("verified", final=str(target))
                 if is_gating:
                     moved_gating += 1
-                    moved_final_paths.append(str(target))
                 try:
                     from library_index import log_file_event
                     log_file_event("added", str(target),
@@ -4801,13 +4945,18 @@ class DownloadManager:
 
         moved_any = moved_gating > 0
         if moved_any:
-            # Per-file rollup: partial when a gating file could not be placed.
-            partial = skipped_gating > 0 or moved_gating < gating_total
+            # Roll up the whole pack, including receipts from earlier passes
+            # and manifest members that have since disappeared from staging.
+            total, placed, all_final_paths = self._placement_evidence(row)
+            partial = skipped_gating > 0 or not total or placed < total
             downloads_store.set_verification(
                 download_id, "partial" if partial else "verified",
-                reason=(f"{moved_gating}/{gating_total} gating files placed"
+                reason=(f"{placed}/{total} gating files placed"
                         if partial else None))
-            downloads_store.set_status(download_id, "moved", completed=True)
+            downloads_store.set_status(
+                download_id, "downloaded" if partial else "moved", completed=True,
+                error=(f"needs import: partial placement ({placed}/{total} primary files); "
+                       "remaining files need review" if partial else None))
             self._cleanup_staging_leftovers(row)
             try:
                 import staging_sweep
@@ -4910,15 +5059,22 @@ class DownloadManager:
             # Provenance link + AGGREGATE fulfillment (Task C item 4): the
             # download is placed; whether the REQUEST is fulfilled is decided by
             # the aggregate (a first episode never completes a season).
-            self._on_download_placed(row, moved_final_paths)
+            self._on_download_placed(row, all_final_paths)
+            if partial:
+                if row.request_id is not None:
+                    queue_store.set_status(row.request_id, queue_store.STATUS_NEEDS_ATTENTION)
+                return f"partial placement ({placed}/{total} primary files) — {dest_dir}"
             return f"moved to {dest_dir}"
 
         # Nothing placed. If a gating file existed but could not be moved (e.g.
         # a different larger file already sits at every target), the request
         # needs a human — surface it instead of silently succeeding.
         if skipped_gating > 0:
+            total, placed, _ = self._placement_evidence(row)
             downloads_store.set_verification(
-                download_id, "failed", reason="no gating file could be placed")
+                download_id, "partial" if placed else "failed",
+                reason=(f"{placed}/{total} gating files placed; remaining files blocked"
+                        if placed else "no gating file could be placed"))
             if row.request_id is not None:
                 queue_store.set_status(row.request_id,
                                        queue_store.STATUS_NEEDS_ATTENTION)
@@ -5094,6 +5250,13 @@ class DownloadManager:
         row = downloads_store.get_download(download_id)
         if row is None:
             return "row vanished"
+        if (row.status != "downloaded" or row.removed_at
+                or row.verification_state == "quarantined"):
+            return f"Can't create placement for an inactive download (status: {row.status})."
+        if not self._media_files_in_staging(row):
+            return self._finish_post_process(
+                download_id, request_title=_request_title_from_row(row),
+                force_move=True, force_rename=True)
         np = downloads_store.get_needs_placement(download_id)
         target = dest_dir or (np.suggested_dir if np else None)
         if not target:
@@ -5106,8 +5269,9 @@ class DownloadManager:
             show_dir = tp.parent if tp.name.lower().startswith("season") else tp
             shows_store.add_show_folder(row.show_id, str(show_dir))
             shows_store.set_season_target(row.show_id, row.season, str(tp))
-        downloads_store.clear_needs_placement(download_id)
-        out = self._post_process(download_id, force_move=True, force_rename=True)
+        out = self._finish_post_process(
+            download_id, force_move=True, force_rename=True,
+            request_title=_request_title_from_row(row))
         return f"created {target} — {out}"
 
     def _cleanup_staging_leftovers(self, row: downloads_store.DownloadRow) -> None:
@@ -5120,20 +5284,17 @@ class DownloadManager:
         for review and only exact junk plus empty parent directories are
         removed.
         """
-        staging = Path(row.staging_dir or config.TORRENT_DOWNLOAD_DIR)
-        if not staging.is_dir() or not row.files_json:
+        staging = staging_paths.staging_root(row.staging_dir or config.TORRENT_DOWNLOAD_DIR)
+        if staging is None or not staging.is_dir() or not row.files_json:
             return
-        try:
-            rel_paths = json.loads(row.files_json)
-        except (TypeError, ValueError):
+        paths = self._manifest_paths(row)
+        if not paths:
             return
         junk_exts = {".nfo", ".txt", ".jpg", ".png", ".sfv", ".exe", ".url"}
         parent_dirs: set[Path] = set()
-        for rel in rel_paths:
-            path = staging / str(rel)
-            try:
-                path.relative_to(staging)
-            except ValueError:
+        for candidate in paths:
+            path = staging_paths.owned_staging_path(staging, candidate)
+            if path is None:
                 continue
             parent_dirs.update(
                 parent for parent in path.parents if parent != staging
@@ -5146,6 +5307,8 @@ class DownloadManager:
                                  exc_info=True)
         for directory in sorted(parent_dirs, key=lambda value: len(value.parts),
                                 reverse=True):
+            if staging_paths.owned_staging_path(staging, directory) != directory:
+                continue
             try:
                 directory.rmdir()  # succeeds only when empty
             except OSError:

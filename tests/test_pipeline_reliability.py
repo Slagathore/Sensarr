@@ -156,7 +156,10 @@ def test_missing_payload_is_not_reported_as_needs_placement(tmp_path: Path):
 
     row = downloads_store.get_download(did)
     assert outcome == "no media files found in staging for this download"
-    assert row.status == "error"
+    assert row.status == "downloaded"
+    assert row.error.startswith("missing staging payload:")
+    assert downloads_store.display_status(row.status, row.progress,
+                                          error=row.error) == "missing files"
     assert "needs placement" not in (row.error or "")
 
 

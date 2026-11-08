@@ -3,6 +3,7 @@ import logging
 import threading
 
 from telegram import Update
+from telegram.error import BadRequest, NetworkError
 from telegram.ext import (Application, ApplicationBuilder, ApplicationHandlerStop,
                           CallbackQueryHandler, CommandHandler, ContextTypes,
                           MessageHandler, TypeHandler, filters)
@@ -90,6 +91,29 @@ async def _authorization_gate(update: Update, context: ContextTypes.DEFAULT_TYPE
     raise ApplicationHandlerStop
 
 
+async def _on_handler_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log a failed handler and tell the user, instead of going silent.
+
+    Without an error handler PTB only logs, so a request that hit a locked
+    database just never got a reply. A button press answered too late
+    (BadRequest "query is too old") has nobody left waiting on it.
+    """
+    error = context.error
+    if isinstance(error, BadRequest) and "query is too old" in str(error).lower():
+        logger.warning("Telegram button press arrived too late to answer: %s", error)
+        return
+    logger.error("Telegram handler failed.", exc_info=error)
+    if not isinstance(update, Update) or update.effective_chat is None:
+        return
+    try:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="⚠️ Something went wrong on my end. Please try that again in a minute.",
+        )
+    except Exception:
+        logger.exception("Failed to send the error reply.")
+
+
 def build_application() -> Application:
     auth_store.initialize_auth_db()
     app = ApplicationBuilder().token(config.TELEGRAM_BOT_TOKEN).build()
@@ -106,20 +130,25 @@ def build_application() -> Application:
     # -----------------------------------------------------------------------
     app.add_handler(REQUEST_CONV_HANDLER)
 
+    # Updates are processed one at a time, so a handler that waits on a slow
+    # job (a hard reset took 26 minutes on 2026-10-25) froze the bot for every
+    # user. block=False lets those run in the background; handlers inside the
+    # request conversation must stay blocking to keep its state in order.
     app.add_handler(CommandHandler("start", start_handler))
     app.add_handler(CommandHandler("help", help_handler))
-    app.add_handler(CommandHandler("launch", launch_handler))
+    app.add_handler(CommandHandler("launch", launch_handler, block=False))
     app.add_handler(CommandHandler("libraries", libraries_handler))
     app.add_handler(CommandHandler("metrics", metrics_handler))
     app.add_handler(CommandHandler("request", request_handler))   # legacy free-text add
     app.add_handler(CommandHandler("requests", requests_handler)) # shows queue (no names)
     app.add_handler(CommandHandler("detail", detail_handler))     # one request, file by file
     app.add_handler(CommandHandler("search", search_handler))
-    app.add_handler(CommandHandler("reindex", reindex_handler))
+    app.add_handler(CommandHandler("reindex", reindex_handler, block=False))
     app.add_handler(CommandHandler("hardreset", hardreset_handler))
     app.add_handler(CommandHandler("status", status_handler))
-    app.add_handler(CallbackQueryHandler(hardreset_confirm_handler, pattern="^hardreset_"))
-    app.add_handler(CallbackQueryHandler(cmd_button_handler, pattern="^cmd_"))
+    app.add_handler(CallbackQueryHandler(hardreset_confirm_handler, pattern="^hardreset_",
+                                         block=False))
+    app.add_handler(CallbackQueryHandler(cmd_button_handler, pattern="^cmd_", block=False))
 
     # Catch-all for any free-form text the user sends outside an active
     # conversation (REQUEST_CONV_HANDLER's per-state handlers consume their own
@@ -128,8 +157,14 @@ def build_application() -> Application:
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, welcome_fallback_handler)
     )
+    app.add_error_handler(_on_handler_error)
 
     return app
+
+
+# Backoff while Telegram is unreachable at startup: 5 s, doubling, capped.
+_CONNECT_RETRY_FIRST = 5.0
+_CONNECT_RETRY_MAX = 300.0
 
 
 class TelegramBotService:
@@ -145,9 +180,21 @@ class TelegramBotService:
     def running(self) -> bool:
         return self._thread is not None and self._thread.is_alive() and self._startup_error is None
 
-    def start(self, timeout: float = 20.0) -> None:
+    @property
+    def connected(self) -> bool:
+        """True once the bot reached Telegram and is polling for updates."""
+        return self.running and self._ready.is_set()
+
+    def start(self, timeout: float = 20.0) -> bool:
+        """Start the bot thread and wait up to `timeout` for it to connect.
+
+        Returns True when connected, False when Telegram is not reachable yet;
+        the thread keeps retrying in the background, so a slow network at
+        logon is not a failure. Raises only for errors a retry cannot fix,
+        such as a rejected token.
+        """
         if self.running:
-            return
+            return self.connected
 
         self._ready.clear()
         self._startup_error = None
@@ -158,10 +205,10 @@ class TelegramBotService:
         )
         self._thread.start()
 
-        if not self._ready.wait(timeout):
-            raise RuntimeError("Timed out while starting the Telegram bot service.")
+        self._ready.wait(timeout)
         if self._startup_error is not None:
             raise RuntimeError("Telegram bot service failed to start.") from self._startup_error
+        return self._ready.is_set()
 
     def stop(self, timeout: float = 20.0) -> None:
         if self._loop is not None and self._stop_event is not None:
@@ -187,7 +234,7 @@ class TelegramBotService:
         """
         loop = self._loop
         app = self._app
-        if loop is None or app is None or not self.running:
+        if loop is None or app is None or not self.connected:
             logger.warning("Cannot notify chat %s — bot service is not running.", chat_id)
             return False
         try:
@@ -231,7 +278,8 @@ class TelegramBotService:
         self._app = app
 
         try:
-            await app.initialize()
+            if not await self._initialize_with_retry(app):
+                return
             await app.start()
             if app.updater is None:
                 raise RuntimeError("Telegram updater was not created.")
@@ -240,8 +288,36 @@ class TelegramBotService:
             self._ready.set()
             await self._stop_event.wait()
         finally:
-            if app.updater is not None:
+            # Only undo what actually started: stopping an updater that never
+            # ran raised and hid the real startup error (2026-10-28).
+            if app.updater is not None and app.updater.running:
                 await app.updater.stop()
-            await app.stop()
+            if app.running:
+                await app.stop()
             await app.shutdown()
             logger.info("Telegram bot service stopped.")
+
+    async def _initialize_with_retry(self, app: Application) -> bool:
+        """Connect to Telegram, retrying while the network is unreachable.
+
+        At logon the network can lag behind Sensarr. A single getMe timeout
+        used to leave the bot off until the next app restart (2026-10-28 it
+        stayed off for a day). Returns False if stop() came first.
+        """
+        assert self._stop_event is not None
+        delay = _CONNECT_RETRY_FIRST
+        while True:
+            try:
+                await app.initialize()
+                return True
+            except NetworkError as exc:
+                logger.warning("Telegram is unreachable (%s); retrying in %.0f s.",
+                               exc, delay)
+                # The Bot marks itself initialized before getMe runs; shut it
+                # down so the next attempt checks the connection again.
+                await app.bot.shutdown()
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=delay)
+                return False
+            except asyncio.TimeoutError:
+                delay = min(delay * 2, _CONNECT_RETRY_MAX)

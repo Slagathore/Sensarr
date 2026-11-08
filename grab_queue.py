@@ -242,7 +242,11 @@ def needs_placement_rows() -> list[GrabQueueRow]:
     rows: list[GrabQueueRow] = []
     for np in downloads_store.list_needs_placement():
         dl = downloads_store.get_download(np.download_id)
-        title = dl.title if dl is not None else f"download #{np.download_id}"
+        # The download may have moved/cancelled since the list query ran.
+        if (dl is None or dl.status != "downloaded" or dl.removed_at
+                or dl.verification_state == "quarantined"):
+            continue
+        title = dl.title
         rows.append(GrabQueueRow(
             row_type=ROW_NEEDS_PLACEMENT,
             subject_key=None,

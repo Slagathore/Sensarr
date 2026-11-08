@@ -261,11 +261,11 @@ class _FakeVar:
 
 class _FakePickerApp:
     """Minimal stand-in for DesktopApp exercising the UNBOUND
-    _show_candidate_picker method. Stubs only _resolve_identity_dialog (the
-    one call that would otherwise open a real Tk Toplevel) with a canned
-    return value; everything downstream of that -- which candidate list and
-    index get hand to request_intake.add_picked_candidate, the status/last
-    -action text, refresh_requests() -- runs as the real method body."""
+    _show_candidate_picker method. The modal returns a canned pick, and the
+    snapshot scheduler queues work until complete_snapshot() is called.
+    The real method still chooses the full candidate list and index, files
+    the request, and renders its completion. Actual thread/Tk behavior is
+    covered by test_ui_responsiveness.py."""
 
     def __init__(self, dialog_result):
         self._dialog_result = dialog_result
@@ -273,12 +273,27 @@ class _FakePickerApp:
         self.last_action_var = _FakeVar()
         self.status_var = _FakeVar()
         self.refresh_called = False
+        self.pending_snapshots = []
 
     def _resolve_identity_dialog(self, *_args, **_kwargs):
         return self._dialog_result
 
     def refresh_requests(self) -> None:
         self.refresh_called = True
+
+    def _load_ui_snapshot(self, key, load, apply, *, on_error=None):
+        self.pending_snapshots.append((load, apply, on_error))
+
+    def complete_snapshot(self) -> None:
+        load, apply, on_error = self.pending_snapshots.pop(0)
+        try:
+            result = load()
+        except Exception as exc:
+            if on_error is None:
+                raise
+            on_error(str(exc))
+        else:
+            apply(result)
 
 
 def _mafs_pair(media_type: str = "movie"):
@@ -324,6 +339,8 @@ def test_show_candidate_picker_passes_full_sibling_list_and_correct_index(
 
     desktop_app.DesktopApp._show_candidate_picker(
         app, "Married At First Sight", "Admin", [au, us])  # type: ignore[arg-type]
+    assert not captured, "filing must wait for the worker instead of running in the picker"
+    app.complete_snapshot()
 
     assert captured["candidates"] == siblings, (
         "add_picked_candidate must receive the full sibling list, not a "
@@ -362,6 +379,7 @@ def test_show_candidate_picker_disambiguation_actually_builds_country_alias(
 
     desktop_app.DesktopApp._show_candidate_picker(
         app, "Married At First Sight", "Admin", [au, us])  # type: ignore[arg-type]
+    app.complete_snapshot()
 
     rows = [r for r in queue_store.list_requests(status="all", limit=50)
            if r.external_id == "200"]

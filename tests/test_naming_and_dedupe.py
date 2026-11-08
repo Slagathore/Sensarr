@@ -119,6 +119,7 @@ def _row(files, **kw):
         media_type="tv", request_id=None, staging_dir="x", planned_dest=None,
         planned_name=None, route_reason=None, auto_rename=True, auto_move=True, **kw)
     downloads_store.set_files(did, files)
+    downloads_store.set_status(did, "downloaded", completed=True)
     return downloads_store.get_download(did)
 
 
@@ -130,7 +131,7 @@ def test_second_finisher_finds_the_first_already_placed_it(tmp_path):
     downloads_store.add_download_file(
         pack.download_id, source_relative_path="Pack/S01/E05.mkv",
         source_absolute_path=None, media_role="episode", final_path=str(placed),
-        verification_state="verified")
+        verification_state="verified", size_bytes=1)
     got = DownloadManager._placed_by_another_download(single)
     assert [f.download_id for f in got] == [pack.download_id]
 
@@ -143,7 +144,7 @@ def test_not_a_duplicate_when_only_part_of_it_was_placed(tmp_path):
     downloads_store.add_download_file(
         single.download_id, source_relative_path="Pack/S01/E05.mkv",
         source_absolute_path=None, media_role="episode", final_path=str(placed),
-        verification_state="verified")
+        verification_state="verified", size_bytes=1)
     # The pack still needs E06 from staging: it is not a duplicate.
     assert DownloadManager._placed_by_another_download(pack) == []
 
@@ -154,7 +155,7 @@ def test_a_placed_copy_that_vanished_does_not_count(tmp_path):
     downloads_store.add_download_file(
         pack.download_id, source_relative_path="Pack/E05.mkv",
         source_absolute_path=None, media_role="episode",
-        final_path=str(tmp_path / "gone.mkv"), verification_state="verified")
+        final_path=str(tmp_path / "gone.mkv"), verification_state="verified", size_bytes=1)
     assert DownloadManager._placed_by_another_download(single) == []
 
 
@@ -272,7 +273,7 @@ def test_same_path_from_a_different_torrent_is_not_a_duplicate(tmp_path):
     downloads_store.set_files(did, ["S01E01.mkv"])
     downloads_store.add_download_file(
         a.download_id, source_relative_path="S01E01.mkv", source_absolute_path=None,
-        media_role="episode", final_path=str(placed), verification_state="verified")
+        media_role="episode", final_path=str(placed), verification_state="verified", size_bytes=1)
     assert DownloadManager._placed_by_another_download(
         downloads_store.get_download(did)) == []
 

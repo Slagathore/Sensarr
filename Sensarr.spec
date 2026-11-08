@@ -99,7 +99,8 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    uac_admin=True,
+    # Start as the current user; explicit Run as administrator remains supported.
+    uac_admin=False,
     icon="assets/sensarr.ico",
 )
 

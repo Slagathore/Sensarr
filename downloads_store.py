@@ -227,6 +227,19 @@ CREATE TABLE IF NOT EXISTS candidate_decisions (
 )
 """
 
+# Every read and the retention prune look decisions up by run. Without this
+# index each lookup scanned the whole table (~1M rows by 2026-10), and the
+# nightly prune did that per old run: 6+ hours holding the database write
+# lock, which stalled auto-grab and failed Telegram request filing.
+_INDEX_CANDIDATE_DECISIONS_RUN = """
+CREATE INDEX IF NOT EXISTS idx_candidate_decisions_run
+    ON candidate_decisions(selection_run_id)
+"""
+
+# Old runs the prune handles per transaction, so the write lock is released
+# between batches instead of being held for the whole pass.
+_PRUNE_BATCH = 500
+
 
 # ---------------------------------------------------------------------------
 # Blocklist (Task C item 2) — scoped, reason-coded. A release wrong for one
@@ -690,6 +703,7 @@ def initialize_downloads_db() -> None:
         conn.execute(_SCHEMA_DEFERRALS)
         conn.execute(_SCHEMA_SELECTION_RUNS)
         conn.execute(_SCHEMA_CANDIDATE_DECISIONS)
+        conn.execute(_INDEX_CANDIDATE_DECISIONS_RUN)
         conn.execute(_SCHEMA_BLOCKLIST)
         conn.execute(_SCHEMA_DOWNLOAD_FILES)
         conn.execute(_SCHEMA_REQUEST_DOWNLOADS)
@@ -787,6 +801,7 @@ def delete_download(download_id: int) -> None:
         conn.execute("DELETE FROM downloads WHERE id = ?", (download_id,))
         conn.execute("DELETE FROM download_history WHERE download_id = ?",
                      (download_id,))
+        _resolve_needs_placement(conn, download_id)
         conn.commit()
 
 
@@ -835,6 +850,7 @@ def tombstone_download(download_id: int, *, reason: str) -> None:
         conn.execute(
             "UPDATE downloads SET removed_at = CURRENT_TIMESTAMP,"
             " removed_reason = ? WHERE id = ?", (reason, download_id))
+        _resolve_needs_placement(conn, download_id)
         conn.commit()
 
 
@@ -847,6 +863,8 @@ def set_verification(download_id: int, state: str,
             "UPDATE downloads SET verification_state = ?,"
             " verification_reason = ? WHERE id = ?",
             (state, reason, download_id))
+        if state == "quarantined":
+            _resolve_needs_placement(conn, download_id)
         conn.commit()
 
 
@@ -882,6 +900,11 @@ def set_status(download_id: int, status: str, *, error: str | None = None,
                 "UPDATE downloads SET status = ?, error = ? WHERE id = ?",
                 (status, error, download_id),
             )
+        if status != "downloaded":
+            # A placement action belongs to a completed, staged download.
+            # Resolve it in the SAME transaction as a move/cancel/requeue so a
+            # stale UI action cannot survive the download's state change.
+            _resolve_needs_placement(conn, download_id)
         conn.commit()
     # A terminal download outcome (error OR cancel) must resolve its request
     # deterministically, never leave it silently stuck at 'grabbing' (which
@@ -972,6 +995,8 @@ def display_status(status: str, progress: float, *, error: str | None = None,
         return "waiting for slot"
     if status == "error" and (error or "").lower().startswith("stalled"):
         return "stalled"
+    if status == "downloaded" and (error or "").startswith("missing staging payload:"):
+        return "missing files"
     if status == "downloaded" and error:
         return "needs import"
     if status == "downloading":
@@ -1411,7 +1436,6 @@ def prune_selection_run_details(*, days: float = 90.0,
     stored BEFORE those rows are deleted.
     """
     import datetime as _dt
-    import json as _json
     if now is None:
         now_dt = _dt.datetime.now(_dt.timezone.utc)
     else:
@@ -1423,40 +1447,58 @@ def prune_selection_run_details(*, days: float = 90.0,
     initialize_downloads_db()
     runs_pruned = 0
     rows_deleted = 0
-    with _DL_LOCK, db.connect() as conn:
-        runs = conn.execute(
-            "SELECT id, chosen_infohash, verdict_histogram_json"
-            " FROM selection_runs"
-            " WHERE keep_details = 0 AND created_at != ''"
-            "   AND created_at < ?", (cutoff,)).fetchall()
-        for run_id, chosen_infohash, histogram_json in runs:
-            if not histogram_json:
-                # Pre-histogram run: preserve the aggregate before deleting
-                # the only place it can still be derived from.
-                hist: dict = {}
-                for (code,) in conn.execute(
-                        "SELECT reason_code FROM candidate_decisions"
-                        " WHERE selection_run_id = ?", (run_id,)).fetchall():
-                    hist[code or ""] = hist.get(code or "", 0) + 1
-                conn.execute(
-                    "UPDATE selection_runs SET verdict_histogram_json = ?"
-                    " WHERE id = ?", (_json.dumps(hist), run_id))
-            if chosen_infohash:
-                cursor = conn.execute(
-                    "DELETE FROM candidate_decisions"
-                    " WHERE selection_run_id = ?"
-                    "   AND (infohash IS NULL OR infohash != ?)",
-                    (run_id, chosen_infohash))
-            else:
-                cursor = conn.execute(
-                    "DELETE FROM candidate_decisions"
-                    " WHERE selection_run_id = ?", (run_id,))
-            if cursor.rowcount > 0:
-                runs_pruned += 1
-                rows_deleted += cursor.rowcount
-        conn.commit()
+    last_id = 0
+    while True:
+        with _DL_LOCK, db.connect() as conn:
+            runs = conn.execute(
+                "SELECT id, chosen_infohash, verdict_histogram_json"
+                " FROM selection_runs"
+                " WHERE keep_details = 0 AND created_at != ''"
+                "   AND created_at < ? AND id > ?"
+                " ORDER BY id LIMIT ?",
+                (cutoff, last_id, _PRUNE_BATCH)).fetchall()
+            if not runs:
+                break
+            deleted, pruned = _prune_run_batch(conn, runs)
+            conn.commit()
+        rows_deleted += deleted
+        runs_pruned += pruned
+        last_id = runs[-1][0]
     return {"runs_pruned": runs_pruned, "rows_deleted": rows_deleted,
             "cutoff": cutoff}
+
+
+def _prune_run_batch(conn, runs) -> tuple[int, int]:
+    """Prune one batch of old runs; returns (rows_deleted, runs_pruned)."""
+    import json as _json
+    rows_deleted = 0
+    runs_pruned = 0
+    for run_id, chosen_infohash, histogram_json in runs:
+        if not histogram_json:
+            # Pre-histogram run: preserve the aggregate before deleting
+            # the only place it can still be derived from.
+            hist: dict = {}
+            for (code,) in conn.execute(
+                    "SELECT reason_code FROM candidate_decisions"
+                    " WHERE selection_run_id = ?", (run_id,)).fetchall():
+                hist[code or ""] = hist.get(code or "", 0) + 1
+            conn.execute(
+                "UPDATE selection_runs SET verdict_histogram_json = ?"
+                " WHERE id = ?", (_json.dumps(hist), run_id))
+        if chosen_infohash:
+            cursor = conn.execute(
+                "DELETE FROM candidate_decisions"
+                " WHERE selection_run_id = ?"
+                "   AND (infohash IS NULL OR infohash != ?)",
+                (run_id, chosen_infohash))
+        else:
+            cursor = conn.execute(
+                "DELETE FROM candidate_decisions"
+                " WHERE selection_run_id = ?", (run_id,))
+        if cursor.rowcount > 0:
+            runs_pruned += 1
+            rows_deleted += cursor.rowcount
+    return rows_deleted, runs_pruned
 
 
 # ---------------------------------------------------------------------------
@@ -1622,25 +1664,60 @@ def add_download_file(download_id: int, *, source_relative_path: str | None,
 
 
 def placed_copies(rel_paths: list[str], *, exclude_download: int) -> list[DownloadFileRow]:
-    """download_files rows of OTHER downloads that placed one of these exact
-    staged paths (compared without regard to slash direction or case) and
-    whose placed file is still on disk."""
+    """Latest, unremoved receipts for other downloads' unchanged placed files.
+
+    A path alone is not enough: cross-download completion requires the known
+    byte size to still match. Unknown-size legacy receipts remain for review.
+    """
     from pathlib import Path as _Path
-    wanted = {p.replace("\\", "/").casefold() for p in rel_paths if p}
+    from os.path import normpath as _normpath
+    import config
+    import staging_paths
+    def relative_key(path: str) -> str:
+        return _normpath(path.replace("\\", "/")).replace("\\", "/").casefold()
+
+    wanted = {relative_key(p) for p in rel_paths if p}
     if not wanted:
         return []
     with _DL_LOCK, db.connect() as conn:
         rows = conn.execute(
             f"SELECT {_DOWNLOAD_FILE_COLS} FROM download_files"
-            " WHERE download_id != ? AND final_path IS NOT NULL"
-            " AND verification_state IN ('verified', 'duplicate')",
+            " WHERE download_id != ? ORDER BY id",
             (exclude_download,)).fetchall()
-    out = []
+    latest: dict[tuple[int, str], DownloadFileRow] = {}
     for r in rows:
         f = _row_to_download_file(r)
-        rel = (f.source_relative_path or "").replace("\\", "/").casefold()
-        if rel in wanted and _Path(f.final_path).is_file():
-            out.append(f)
+        rel = relative_key(f.source_relative_path) if f.source_relative_path else ""
+        if rel in wanted:
+            latest[(f.download_id, rel)] = f
+    out = []
+    owners: dict[int, DownloadRow | None] = {}
+    for f in latest.values():
+        if (f.removed_at or not f.final_path
+                or f.verification_state not in ("verified", "duplicate")
+                or f.size_bytes is None or f.size_bytes <= 0):
+            continue
+        if f.download_id not in owners:
+            owners[f.download_id] = get_download(f.download_id)
+        owner = owners[f.download_id]
+        if (owner is None or owner.removed_at
+                or owner.verification_state == "quarantined"
+                or owner.status not in ("downloaded", "moved")):
+            continue
+        source = staging_paths.owned_staging_path(
+            owner.staging_dir or config.TORRENT_DOWNLOAD_DIR,
+            f.source_absolute_path or f.source_relative_path)
+        manifest_source = staging_paths.owned_staging_path(
+            owner.staging_dir or config.TORRENT_DOWNLOAD_DIR, f.source_relative_path)
+        final = _Path(f.final_path)
+        if (source is None or source != manifest_source or source.is_file()
+                or staging_paths.has_redirected_component(final)):
+            continue
+        try:
+            if final.is_file() and final.stat().st_size == f.size_bytes:
+                out.append(f)
+        except OSError:
+            continue
     return out
 
 
@@ -1667,12 +1744,23 @@ def list_download_files(download_id: int, *,
     return [_row_to_download_file(r) for r in rows]
 
 
-def clear_download_files(download_id: int) -> None:
-    """Drop the per-file rows for a download (a fresh post-process pass rebuilds
-    them; keeps re-runs idempotent instead of duplicating file rows)."""
+def clear_download_files(download_id: int, *,
+                         source_paths: list[str] | None = None) -> None:
+    """Rebuild only files being retried, retaining other placement receipts.
+
+    With no source_paths the caller explicitly requests the historical full
+    reset. Import passes exact source paths so an already placed pack member
+    does not lose its provenance when a different member is retried.
+    """
     with _DL_LOCK, db.connect() as conn:
-        conn.execute("DELETE FROM download_files WHERE download_id = ?",
-                     (download_id,))
+        if source_paths is None:
+            conn.execute("DELETE FROM download_files WHERE download_id = ?",
+                         (download_id,))
+        else:
+            conn.executemany(
+                "DELETE FROM download_files WHERE download_id = ?"
+                " AND source_absolute_path = ?",
+                ((download_id, source) for source in source_paths))
         conn.commit()
 
 
@@ -1702,6 +1790,36 @@ class NeedsPlacementRow:
     created_at: str
 
 
+_ACTIONABLE_PLACEMENT_DOWNLOAD = (
+    "d.status = 'downloaded' AND d.removed_at IS NULL"
+    " AND COALESCE(d.verification_state, '') != 'quarantined'"
+)
+
+
+def _resolve_needs_placement(conn, download_id: int) -> None:
+    """Retain the marker as audit history; only its actionable state ends."""
+    conn.execute(
+        "UPDATE needs_placement SET resolved_at = CURRENT_TIMESTAMP"
+        " WHERE download_id = ? AND resolved_at IS NULL", (download_id,))
+
+
+def reconcile_needs_placement() -> int:
+    """Resolve obsolete markers left by older releases without touching media.
+
+    Readers also apply this predicate, so a stale marker is never actionable
+    while startup reconciliation is still pending.
+    """
+    initialize_downloads_db()
+    with _DL_LOCK, db.connect() as conn:
+        changed = conn.execute(
+            "UPDATE needs_placement SET resolved_at = CURRENT_TIMESTAMP"
+            " WHERE resolved_at IS NULL AND NOT EXISTS ("
+            " SELECT 1 FROM downloads d WHERE d.id = needs_placement.download_id"
+            f" AND {_ACTIONABLE_PLACEMENT_DOWNLOAD})").rowcount
+        conn.commit()
+    return changed
+
+
 def record_needs_placement(download_id: int, *, show_id: int | None,
                            season: int | None, suggested_dir: str | None,
                            reason: str | None) -> None:
@@ -1711,31 +1829,34 @@ def record_needs_placement(download_id: int, *, show_id: int | None,
     with _DL_LOCK, db.connect() as conn:
         conn.execute(
             "INSERT INTO needs_placement (download_id, show_id, season,"
-            " suggested_dir, reason, resolved_at) VALUES (?, ?, ?, ?, ?, NULL)"
+            " suggested_dir, reason, resolved_at)"
+            " SELECT d.id, ?, ?, ?, ?, NULL FROM downloads d"
+            f" WHERE d.id = ? AND {_ACTIONABLE_PLACEMENT_DOWNLOAD}"
             " ON CONFLICT(download_id) DO UPDATE SET show_id = excluded.show_id,"
             " season = excluded.season, suggested_dir = excluded.suggested_dir,"
             " reason = excluded.reason, resolved_at = NULL",
-            (download_id, show_id, season, suggested_dir, reason))
+            (show_id, season, suggested_dir, reason, download_id))
         conn.commit()
 
 
 def clear_needs_placement(download_id: int) -> None:
     """Mark a needs-placement row resolved (the download was placed)."""
     with _DL_LOCK, db.connect() as conn:
-        conn.execute(
-            "UPDATE needs_placement SET resolved_at = CURRENT_TIMESTAMP"
-            " WHERE download_id = ?", (download_id,))
+        _resolve_needs_placement(conn, download_id)
         conn.commit()
 
 
 def list_needs_placement() -> list[NeedsPlacementRow]:
-    """Unresolved needs-placement rows for the grab queue."""
+    """Unresolved markers whose download can still be placed."""
     initialize_downloads_db()
     with _DL_LOCK, db.connect() as conn:
         rows = conn.execute(
-            "SELECT download_id, show_id, season, suggested_dir, reason,"
-            " created_at FROM needs_placement WHERE resolved_at IS NULL"
-            " ORDER BY created_at DESC").fetchall()
+            "SELECT np.download_id, np.show_id, np.season, np.suggested_dir,"
+            " np.reason, np.created_at FROM needs_placement np"
+            " JOIN downloads d ON d.id = np.download_id"
+            " WHERE np.resolved_at IS NULL"
+            f" AND {_ACTIONABLE_PLACEMENT_DOWNLOAD}"
+            " ORDER BY np.created_at DESC").fetchall()
     return [NeedsPlacementRow(r[0], r[1], r[2], r[3], r[4], r[5]) for r in rows]
 
 
@@ -1743,9 +1864,11 @@ def get_needs_placement(download_id: int) -> NeedsPlacementRow | None:
     initialize_downloads_db()
     with _DL_LOCK, db.connect() as conn:
         r = conn.execute(
-            "SELECT download_id, show_id, season, suggested_dir, reason,"
-            " created_at FROM needs_placement WHERE download_id = ?"
-            " AND resolved_at IS NULL", (download_id,)).fetchone()
+            "SELECT np.download_id, np.show_id, np.season, np.suggested_dir,"
+            " np.reason, np.created_at FROM needs_placement np"
+            " JOIN downloads d ON d.id = np.download_id"
+            " WHERE np.download_id = ? AND np.resolved_at IS NULL"
+            f" AND {_ACTIONABLE_PLACEMENT_DOWNLOAD}", (download_id,)).fetchone()
     return NeedsPlacementRow(r[0], r[1], r[2], r[3], r[4], r[5]) if r else None
 
 

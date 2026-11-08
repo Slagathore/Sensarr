@@ -11,6 +11,7 @@ import psutil
 
 import config
 import platform_adapter
+from windows_desktop_launch import DesktopLaunch, DesktopLaunchError, prepare_desktop_launch
 
 logger = logging.getLogger(__name__)
 _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -31,8 +32,13 @@ _KNOWN_PLEX_PROCESS_NAMES = {
     "plex commercial skipper",
     "plex relay.exe",
     "plex relay",
-    "plex update service.exe",
-    "plex update service",
+}
+
+# The SYSTEM updater is independent of the user-owned media-server session.
+# Stopping it requires elevation and is unnecessary for a Plex restart.
+_PLEX_UPDATER_PROCESS_NAMES = {
+    "plex update service.exe", "plex update service",
+    "plex update service launcher.exe", "plex update service launcher",
 }
 
 
@@ -107,6 +113,8 @@ def _is_plex_process(proc: psutil.Process) -> bool:
     except (psutil.NoSuchProcess, psutil.AccessDenied):
         name = ""
 
+    if name in _PLEX_UPDATER_PROCESS_NAMES:
+        return False
     if name in _KNOWN_PLEX_PROCESS_NAMES:
         return True
 
@@ -120,6 +128,8 @@ def _is_plex_process(proc: psutil.Process) -> bool:
 
     if exe_path is not None:
         exe_name = exe_path.name.lower()
+        if exe_name in _PLEX_UPDATER_PROCESS_NAMES:
+            return False
         if exe_name in _KNOWN_PLEX_PROCESS_NAMES:
             return True
 
@@ -269,56 +279,88 @@ def _lingering_plex_processes() -> list[str]:
     return names
 
 
-def _wait_for_plex_start(previous_server_pids: set[int] | None = None) -> bool:
+def _wait_for_plex_start(previous_server_pids: set[int] | None = None, *,
+                         desktop: DesktopLaunch | None = None) -> bool:
     """Wait for the main Plex Media Server executable to appear or restart."""
     existing = previous_server_pids or set()
-    deadline = time.time() + config.PLEX_LAUNCH_WAIT
-    while time.time() < deadline:
-        current = _list_primary_plex_server_pids()
-        if current and (not existing or current != existing):
+    deadline = time.monotonic() + config.PLEX_LAUNCH_WAIT
+
+    def started() -> bool:
+        current = _list_primary_plex_server_pids() - existing
+        for pid in current:
+            try:
+                if desktop is None or desktop.process_matches(pid):
+                    return True
+            except OSError:
+                # A process can exit between enumeration and the token query.
+                continue
+        return False
+
+    while time.monotonic() < deadline:
+        if started():
             return True
         time.sleep(0.5)
-    current = _list_primary_plex_server_pids()
-    return bool(current and (not existing or current != existing))
+    return started()
 
 
-def _launch_plex_from_executable() -> str | None:
-    """Launch Plex directly from its configured Windows executable path."""
+def _launch_plex_from_executable(desktop: DesktopLaunch | None = None) -> str | None:
+    """Launch Plex in the desktop user's Windows profile, never the UAC account."""
     plex_path = Path(config.PLEX_MEDIA_SERVER_PATH)
     if not plex_path.is_file():
         logger.warning("Configured Plex executable does not exist: %s", plex_path)
         return None
 
+    if sys.platform == "win32" and desktop is None:
+        try:
+            with prepare_desktop_launch() as prepared:
+                return _launch_plex_from_executable(prepared)
+        except DesktopLaunchError as exc:
+            logger.error("Plex desktop-user launch refused: %s", exc)
+            return str(exc)
+
     existing_server_pids = _list_primary_plex_server_pids()
+    if existing_server_pids:
+        if desktop is not None:
+            try:
+                if not all(desktop.process_matches(pid) for pid in existing_server_pids):
+                    return (
+                        "Plex is running under a different Windows account or session. "
+                        "Use Hard Reset to restart it as your signed-in desktop user. "
+                        "A second server was not started.")
+            except OSError as exc:
+                logger.warning("Could not verify the running Plex account: %s", exc)
+                return (
+                    "Plex is already running, but Windows denied verification of its "
+                    "account. A second server was not started. Close that instance "
+                    "or run Sensarr as administrator to reset it.")
+        return "Plex is already running."
 
     try:
-        subprocess.Popen(
-            [str(plex_path)],
-            cwd=str(plex_path.parent),
-            creationflags=_CREATE_NO_WINDOW,
-        )
-    except OSError as exc:
+        if desktop is not None:
+            desktop.launch(plex_path)
+        else:
+            subprocess.Popen(
+                [str(plex_path)], cwd=str(plex_path.parent),
+                creationflags=_CREATE_NO_WINDOW,
+            )
+    except (OSError, DesktopLaunchError) as exc:
         logger.exception("Failed to launch Plex directly from %s", plex_path)
         return f"Could not launch Plex from '{plex_path}': {exc}"
 
-    logger.info("Launched Plex directly from %s", plex_path)
-    if _wait_for_plex_start(existing_server_pids):
+    logger.info("Launched Plex from %s%s", plex_path,
+                " as the signed-in desktop user" if desktop is not None else "")
+    if _wait_for_plex_start(existing_server_pids, desktop=desktop):
         return "Plex launched successfully."
-    if existing_server_pids:
-        return (
-            f"Sent a launch request to '{plex_path}'. "
-            "Some Plex server processes were already present, so startup could not be "
-            "positively confirmed."
-        )
     return (
-        f"Sent a launch request to '{plex_path}', but no Plex process appeared. "
+        f"Sent a launch request to '{plex_path}', but no Plex process appeared"
+        f"{' under the desktop user' if desktop is not None else ''}. "
         "Check that the path is correct and that Windows allows it to start."
     )
 
 
-def _launch_plex() -> str:
+def _launch_plex(desktop: DesktopLaunch | None = None) -> str:
     """Launch Plex from the configured executable path."""
-    direct_result = _launch_plex_from_executable()
+    direct_result = _launch_plex_from_executable(desktop)
     if direct_result is not None:
         return direct_result
     return (
@@ -376,6 +418,22 @@ def _run_exclusive_action(action_name: str, action) -> str:
 
 
 def _hard_reset_impl() -> str:
+    """Validate the relaunch identity BEFORE stopping a working Plex server."""
+    if not Path(config.PLEX_MEDIA_SERVER_PATH).is_file():
+        return (
+            f"Plex executable was not found at '{config.PLEX_MEDIA_SERVER_PATH}'. "
+            "The running server was not stopped. Update PLEX_MEDIA_SERVER_PATH.")
+    if sys.platform == "win32":
+        try:
+            with prepare_desktop_launch() as desktop:
+                return _hard_reset_with_desktop(desktop)
+        except DesktopLaunchError as exc:
+            logger.error("Plex reset could not prepare the desktop user: %s", exc)
+            return str(exc)
+    return _hard_reset_with_desktop()
+
+
+def _hard_reset_with_desktop(desktop: DesktopLaunch | None = None) -> str:
     """
     Hard reset: kill all Plex processes → verify stopped → relaunch.
     May interrupt active Plex sessions.
@@ -416,27 +474,20 @@ def _hard_reset_impl() -> str:
         permission_note = (
             "\n\nSome Plex processes initially resisted termination:\n- "
             + "\n- ".join(sorted(set(failed)))
-            + "\n\nThe reset still completed, but if this keeps happening, run the bot elevated."
+            + "\n\nIf Windows denies termination, run Sensarr as administrator. "
+            "Plex will still launch as the signed-in desktop user."
         )
-
-    result = _launch_plex()
-    if result == "Plex launched successfully.":
-        if lingering:
-            return (
-                "Plex relaunch was attempted after an incomplete hard reset."
-                "\n\nThese Plex processes were still running:\n- "
-                + "\n- ".join(lingering)
-                + permission_note
-            )
-        return "Plex force-restarted successfully." + permission_note
 
     if lingering:
         return (
-            result
-            + "\n\nPlex relaunch was attempted even though some processes were still running:\n- "
+            "Plex could not be fully stopped. No second server was launched."
+            + "\n\nThese Plex processes are still running:\n- "
             + "\n- ".join(lingering)
             + permission_note
         )
+    result = _launch_plex(desktop)
+    if result == "Plex launched successfully.":
+        return "Plex force-restarted successfully." + permission_note
     return result + permission_note
 
 

@@ -3,19 +3,15 @@
 # =============================================================================
 # Mission: Entry point for Sensarr, a Windows system-tray application
 # and Telegram bot that lets you remotely control Plex Media Server from your
-# phone. Goals: start the desktop app with sufficient OS privileges, ensure
+# phone. Goals: start the desktop app in the current Windows account, ensure
 # clean startup, and delegate all functionality to the desktop layer.
 #
-# This module is intentionally minimal — it owns the UAC elevation check and
+# This module is intentionally minimal — it owns launch-mode logging and
 # the top-level `main()` entry point. All real work lives in desktop_app.py.
 #
-# UAC elevation strategy:
-#   - When running as a PyInstaller EXE: the .spec sets uac_admin=True, so
-#     Windows automatically prompts for elevation at launch. No action needed.
-#   - When running as a Python script (development): this module uses
-#     ctypes.windll.shell32.ShellExecuteW("runas") to self-elevate. The
-#     original un-elevated instance exits immediately; a new elevated instance
-#     takes over.
+# Ordinary launches never request UAC or change accounts. Explicit Windows
+# "Run as administrator" remains supported for terminating a legacy elevated
+# Plex instance; the Plex launcher still uses the normal desktop user's token.
 # =============================================================================
 
 import ctypes
@@ -46,7 +42,6 @@ if "--smoke-test" in sys.argv:
     os.environ["APP_DB_PATH"] = os.path.join(_smoke_root, "data", "smoke.db")
     os.environ["TORRENT_DOWNLOAD_DIR"] = os.path.join(_smoke_root, "downloads")
     os.environ["TELEGRAM_BOT_TOKEN"] = ""   # never start the bot
-    os.environ["SENSARR_SKIP_ELEVATION"] = "1"
 
 from app_logging import configure_logging
 
@@ -56,7 +51,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Windows UAC elevation helpers
+# Launch mode diagnostics (no automatic elevation)
 # ---------------------------------------------------------------------------
 
 def _is_admin() -> bool:
@@ -70,49 +65,10 @@ def _is_admin() -> bool:
         return True  # Non-Windows: assume fine, skip elevation
 
 
-def _relaunch_as_admin() -> None:
-    """Trigger a UAC prompt and re-launch the current process with elevation.
-
-    Uses ShellExecuteW with the "runas" verb, which is the canonical Windows
-    approach. The return value > 32 indicates success; ≤ 32 means the user
-    cancelled or the operation failed.
-    """
-    params = " ".join(f'"{arg}"' for arg in sys.argv)
-    result = ctypes.windll.shell32.ShellExecuteW(  # type: ignore[attr-defined]
-        None, "runas", sys.executable, params, None, 1
-    )
-    if result <= 32:
-        logger.warning(
-            "UAC elevation via ShellExecuteW returned %s — "
-            "the user may have declined the prompt or elevation is unavailable.",
-            result,
-        )
-
-
-def _ensure_admin() -> None:
-    """Gate the application behind an admin check on Windows.
-
-    - Frozen EXE (PyInstaller): the spec already sets uac_admin=True, so
-      Windows handles the elevation before Python code even runs. Skip.
-    - Python script: check IsUserAnAdmin(); if not elevated, call
-      ShellExecuteW("runas") to spawn an elevated instance and exit this one.
-    - Non-Windows: no-op.
-    """
-    if sys.platform != "win32":
-        return
-    if os.environ.get("SENSARR_SKIP_ELEVATION") == "1":
-        return  # capture/dev run — admin-only actions degrade gracefully
-    if getattr(sys, "frozen", False):
-        # PyInstaller EXE is already running with the privileges the spec
-        # requested (uac_admin=True). Nothing to do here.
-        return
-    if not _is_admin():
-        logger.info(
-            "Sensarr requires administrator privileges to force-kill "
-            "Plex processes. Requesting UAC elevation now…"
-        )
-        _relaunch_as_admin()
-        sys.exit(0)  # Exit un-elevated instance; elevated instance takes over.
+def _log_launch_mode() -> None:
+    if sys.platform == "win32":
+        logger.info("Sensarr launch mode: %s; Plex launches use the desktop user's profile.",
+                    "administrator" if _is_admin() else "normal user")
 
 
 # ---------------------------------------------------------------------------
@@ -131,21 +87,33 @@ def _already_running() -> bool:
     import app_paths
 
     def _holds_live_instance(pid_file) -> bool:
+        import psutil
         try:
             if not pid_file.is_file():
                 return False
             old_pid = int(pid_file.read_text().strip() or 0)
             if not old_pid or old_pid == os.getpid():
                 return False
-            import psutil
             proc = psutil.Process(old_pid)
-            blob = ((proc.name() or "") + " "
-                    + " ".join(proc.cmdline())).lower()
-            # Frozen EXE under either name, or a source run of main.py.
-            return bool(proc.is_running() and (
-                "sensarr" in blob or "plexxarr" in blob
-                or "main.py" in blob))
-        except Exception:
+            if not proc.is_running():
+                return False
+            name = (proc.name() or "").lower()
+            # A standard user can identify the frozen process but may not
+            # inspect an administrator's command line. Check its name first
+            # so an unreadable live instance cannot spawn a second bot.
+            if name in {"sensarr.exe", "sensarr-portable.exe", "plexxarr.exe",
+                        "plexresetbutton.exe", "sensarr", "plexxarr"}:
+                return True
+            if name.startswith("python"):
+                return any(os.path.basename(arg).lower() == "main.py"
+                           for arg in proc.cmdline())
+            return False
+        except psutil.NoSuchProcess:
+            return False
+        except psutil.AccessDenied:
+            logger.warning("Existing Sensarr PID cannot be inspected; refusing a second instance.")
+            return True
+        except (OSError, ValueError):
             return False  # stale/undecodable lock — take it over
 
     lock = app_paths.PATHS.runtime_dir / "sensarr.pid"
@@ -306,7 +274,7 @@ def main() -> None:
     if "--smoke-test" in sys.argv:
         # os._exit: daemon threads (tray/psutil scans) must not block CI.
         os._exit(_run_smoke_test())
-    _ensure_admin()
+    _log_launch_mode()
     if _already_running():
         import platform_adapter
         platform_adapter.show_duplicate_instance_message(
@@ -332,7 +300,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-# #todo: add a --no-elevate CLI flag for CI/test environments where UAC is not available
-# #todo: log the Windows integrity level (low/medium/high) at startup for diagnostics
-# #todo: surface a user-friendly tkinter dialog if elevation is declined instead of silent exit

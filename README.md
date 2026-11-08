@@ -14,11 +14,19 @@
 
 ## Quick start
 
-1. Download the [latest release](../../releases/latest). The installer (`Sensarr-<ver>-Setup.exe`) is the easiest path: it installs to your user folder and adds Start Menu shortcuts. The zip has everything (unzip anywhere, run `Sensarr.exe`); the portable exe is a single file that fetches its anime database on first run. All three are code-signed (publisher: Charles Chambers; see [SIGNING.md](SIGNING.md)). Accept the UAC prompt; it needs that to manage Plex.
+1. Download the [latest release](../../releases/latest). The installer (`Sensarr-<ver>-Setup.exe`) is the easiest path: it installs to your user folder and adds Start Menu shortcuts. The zip has everything (unzip anywhere, run `Sensarr.exe`); the portable exe is a single file that fetches its anime database on first run. All three are code-signed (publisher: Charles Chambers; see [SIGNING.md](SIGNING.md)). Ordinary launches run without a UAC prompt.
 2. The Setup Wizard opens on first run and walks you through the annoying parts: it opens [@BotFather](https://t.me/BotFather) so you can create your Telegram bot (paste the token back and it validates it live), offers one-click winget installs of Node.js and Ollama, and won't save a config that doesn't work. Telegram is skippable; the desktop app works fine on its own.
 3. In Settings: add your library folders (tagged movie / tv / anime) and click **Get Plex Token**. A browser PIN page opens, you approve it, done.
 
 No Docker, no YAML, no reverse proxy. Message your bot from the couch.
+
+On Windows, Launch and Hard Reset start Plex as the signed-in desktop user,
+including when Sensarr is explicitly run as administrator using a different
+account. This keeps Plex's original registry settings, libraries, and AppData
+profile. A normal desktop session must be signed in; if its identity cannot be
+verified, Hard Reset stops before terminating Plex. No credentials are stored
+for this launch behavior. Administrator mode can still stop a legacy Plex
+instance that was started under the wrong account.
 
 ## What it does
 
@@ -42,6 +50,7 @@ No Docker, no YAML, no reverse proxy. Message your bot from the couch.
 - Size targets set as MB-per-minute sliders, anchored on each show's actual runtime (from the local anime database, TMDB, or ffprobe): a 24-minute anime and a 45-minute drama get different targets instead of the same guess. Defaults work out to 530 MB preferred and about 1.2 GB max for a half-hour episode
 - Grab discipline: cams and telesyncs are blocked by default, releases with no seeders are skipped and rechecked later instead of grabbed, and oversized-only results wait a day before one is taken
 - Renames and files everything into your library structure, keeps subtitles only in your language (multi-sub packs won't dump 30 `.srt` files on you), and recovers cleanly from crashes and interrupted moves
+- Placement prompts clear when a job finishes or is canceled. Partially imported packs stay retryable with their earlier placement records intact; missing staged files are held for review instead of triggering another download or borrowing a neighboring job's files
 - Every rename, replacement, move, and deletion is written to a ledger, with a missing-files view for things that vanished outside the app
 
 ### Library housekeeping
@@ -115,6 +124,14 @@ python main.py     # first run opens the Setup Wizard
 ```
 
 Build your own EXE with `build_exe.bat` (needs `pip install -r requirements-build.txt`, which is just PyInstaller). Output lands in `dist\<timestamp>\Sensarr\Sensarr.exe`. Register autostart-at-login with `setup_autostart.bat`; remove it with `remove_autostart.bat`.
+
+For a source checkout, point desktop shortcuts at `start_sensarr.bat`, the same
+launcher used by the logon task. It selects the newest timestamped build with
+both `Sensarr.exe` and a staged `.env`, so a rebuilt app is picked up without
+replacing the shortcut. Run `start_sensarr.bat --print` to check which build it
+will open. Autostart runs after the registered Windows user signs in.
+
+See [CHANGELOG.md](CHANGELOG.md) for the changes and validation notes.
 
 ### Linux
 
@@ -192,7 +209,7 @@ Copy `.env.example` to `.env`. Everything below is also editable from the Settin
 <summary><b>Architecture</b></summary>
 
 ```
-main.py              Entry point: UAC elevation gate → single-instance lock → app
+main.py              Entry point: launch-mode logging → single-instance lock → app
 desktop_app.py       Tkinter GUI + tray icon; owns the app lifecycle
 bot.py               Telegram command/callback handlers (async)
 telegram_service.py  Runs python-telegram-bot on a background thread

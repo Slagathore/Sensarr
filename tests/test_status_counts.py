@@ -64,6 +64,7 @@ def test_needs_placement_counted():
         media_type="tv", request_id=None, staging_dir="/tmp",
         planned_dest=None, planned_name=None, route_reason=None,
         auto_rename=True, auto_move=True, show_id=7, season=2)
+    downloads_store.set_status(did, "downloaded", completed=True)
     downloads_store.record_needs_placement(
         did, show_id=7, season=2, suggested_dir="/tv/Show/Season 02",
         reason="no confident route")
