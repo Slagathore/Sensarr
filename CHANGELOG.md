@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.6.7 - 2026-11-19
+
+- Run the Linux packaging smoke test on Ubuntu 24.04 with its system
+  Python and Tk packages so the pinned PyInstaller can build the app.
+
 ## 1.6.6 - 2026-11-19
 
 - Inspect completed files for archive headers, including Real-Debrid payloads

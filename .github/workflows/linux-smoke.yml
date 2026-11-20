@@ -23,7 +23,9 @@ on:
 
 jobs:
   smoke:
-    runs-on: ubuntu-latest
+    # Ubuntu 24.04 supplies Python 3.12 and its matching Tk packages.
+    # The pinned PyInstaller 6.11.1 does not support Python 3.14.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -41,7 +43,7 @@ jobs:
       # for the distro interpreter, which is exactly what a Linux user gets.
       - name: Install the Linux dependency contract
         run: |
-          python3 -m venv .venv
+          /usr/bin/python3 -m venv .venv
           .venv/bin/pip install --upgrade pip
           .venv/bin/pip install -r requirements.txt
           .venv/bin/pip install pyinstaller==6.11.1
