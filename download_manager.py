@@ -26,21 +26,26 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
 import urllib.request
+import weakref
 from dataclasses import dataclass
 from http.cookiejar import CookieJar
 from pathlib import Path
 from typing import Any, Callable
 
 import config
+from archive_signatures import detect_archive
 import downloads_store
 import presence_ledger
 import media_identity
 import media_quality
 import queue_store
+import rar_import
+import rar_tools
 import show_tracker
 import shows_store
 import size_match
@@ -261,6 +266,14 @@ def _file_pin(want_json: str | None) -> tuple[str | None, int | None]:
 # An existing library file counts as a complete copy of a staged download when
 # it plays at least this share of the staged file's runtime.
 _COMPLETE_COPY_RUNTIME_SHARE = 0.9
+
+
+def _readable_non_archive_header(path: Path) -> bool:
+    """An unreadable prior copy cannot serve as placement evidence."""
+    try:
+        return detect_archive(path) is None
+    except OSError:
+        return False
 
 
 def _library_copy_is_complete(existing: Path, staged: Path) -> bool:
@@ -1001,6 +1014,7 @@ class DownloadManager:
         # download_id → qBittorrent tag, for cancel when delegating to qBit.
         self._qbit_tags: dict[int, str] = {}
         self._lock = threading.Lock()
+        self._placement_locks = weakref.WeakValueDictionary()
         # Queue bookkeeping: last observed (progress, when) per active row,
         # and when a slow download was last rotated (sorts it to the back).
         self._progress_seen: dict[int, tuple[float, float]] = {}
@@ -2351,7 +2365,8 @@ class DownloadManager:
         same_torrent = []
         for f in placed:
             other = downloads_store.get_download(f.download_id)
-            if other is not None and _magnet_hash(other.magnet or "") == ours:
+            if (other is not None and _magnet_hash(other.magnet or "") == ours
+                    and f.final_path and _readable_non_archive_header(Path(f.final_path))):
                 same_torrent.append(f)
         placed = same_torrent
         covered = {(f.source_relative_path or "").replace("\\", "/").casefold()
@@ -3893,6 +3908,7 @@ class DownloadManager:
                 client, magnet, Path(staging),
                 want_file_name=want.get("file_name"),
                 want_file_idx=want.get("file_idx"),
+                archive_subdir=str(Path(".sensarr-rar") / str(download_id)),
                 chooser=(None if (want.get("file_name") or want.get("file_idx")
                                   is not None)
                          else _debrid_episode_chooser(
@@ -3946,6 +3962,10 @@ class DownloadManager:
             return True
 
         downloads_store.set_progress(download_id, 1.0)
+        if result.archive_members:
+            downloads_store.add_history(
+                download_id, "rar_expected", before=None,
+                after=json.dumps(result.archive_members))
         downloads_store.set_status(download_id, "downloaded", completed=True)
         if result.rel_paths:
             downloads_store.set_files(download_id, result.rel_paths)
@@ -4068,7 +4088,14 @@ class DownloadManager:
         files = client.files(torrent_hash)
         if len(files) < 2:
             return
-        keep_exts = torrent_routing.VIDEO_EXTENSIONS | torrent_routing.SUBTITLE_EXTENSIONS
+        video_exts = torrent_routing.VIDEO_EXTENSIONS
+        names = [Path(str(f.get("name") or "")) for f in files]
+        if (any(path.suffix.lower() == ".rar" for path in names)
+                and not any(path.suffix.lower() in video_exts
+                            and not re.search(r"(?<![a-z0-9])sample(?![a-z0-9])", path.name, re.I)
+                            for path in names)):
+            video_exts = {".rar"}
+        keep_exts = video_exts | torrent_routing.SUBTITLE_EXTENSIONS
         wanted_videos: list[int] = []
         video_rows: list[tuple[int, Any, bool]] = []
         skip: list[int] = []
@@ -4081,7 +4108,7 @@ class DownloadManager:
                 skip.append(file_id)
                 continue
             parsed = torrent_routing.parse_torrent_name(name)
-            if suffix in torrent_routing.VIDEO_EXTENSIONS:
+            if suffix in video_exts:
                 matches = True
                 if episode is not None:
                     matches = (parsed.episode == episode
@@ -4358,6 +4385,8 @@ class DownloadManager:
                     and receipt.size_bytes is not None
                     and final.stat().st_size != receipt.size_bytes):
                 continue
+            if not _readable_non_archive_header(final):
+                continue
             covered[source_key] = str(final)
 
         for history in downloads_store.history_for_download(row.download_id):
@@ -4374,7 +4403,8 @@ class DownloadManager:
             final = Path(history.after_value)
             if (not source.is_file() and final.is_file()
                     and not staging_paths.has_redirected_component(final)
-                    and final.suffix.lower() in torrent_routing.VIDEO_EXTENSIONS):
+                    and final.suffix.lower() in torrent_routing.VIDEO_EXTENSIONS
+                    and _readable_non_archive_header(final)):
                 covered[source_key] = str(final)
         paths = list(dict.fromkeys(covered[k] for k in sorted(expected & covered.keys())))
         return len(expected), len(expected & covered.keys()), paths
@@ -4387,6 +4417,7 @@ class DownloadManager:
         total, placed, existing = self._placement_evidence(row)
         if not total or placed != total:
             return []
+        self._remove_imported_rars(row)
         downloads_store.set_status(row.download_id, "moved", completed=True)
         downloads_store.set_verification(
             row.download_id, "verified",
@@ -4516,6 +4547,130 @@ class DownloadManager:
     # Post-processing: rename + move with full history
     # ------------------------------------------------------------------
 
+    def _hold_archive_payload(self, row: downloads_store.DownloadRow,
+                              path: Path, archive: str, detail: str) -> str:
+        """Keep owned files in staging for manual recovery or a later retry."""
+        message = (f"needs import: {path.name} contains a {archive} archive. "
+                   f"{detail}")
+        if row.error != message:
+            downloads_store.set_status(
+                row.download_id, "downloaded", error=message, completed=True)
+            _, placed, _ = self._placement_evidence(row)
+            downloads_store.set_verification(
+                row.download_id, "partial" if placed else "failed", reason=message)
+            downloads_store.add_history(
+                row.download_id, "import_error", before=str(path), after=message)
+        downloads_store.clear_needs_placement(row.download_id)
+        if row.request_id is not None:
+            req = queue_store.get_request(row.request_id)
+            if req is not None and req.status not in queue_store.TERMINAL_STATUSES:
+                queue_store.set_status(row.request_id, queue_store.STATUS_NEEDS_ATTENTION)
+        self._notify(row.download_id)
+        return message
+
+    @staticmethod
+    def _file_stamp(path: Path) -> list[int]:
+        info = path.stat()
+        return [info.st_size, info.st_mtime_ns, info.st_ino, info.st_dev]
+
+    def _expand_rars(self, row: downloads_store.DownloadRow, archives: list[Path],
+                     want: dict | None) -> downloads_store.DownloadRow:
+        """Publish the extracted members as the exact manifest, then route them."""
+        root = staging_paths.staging_root(row.staging_dir or config.TORRENT_DOWNLOAD_DIR)
+        manifest = self._manifest_paths(row)
+        if root is None or manifest is None or not all(path in manifest for path in archives):
+            raise rar_tools.RarError("the exact owning download manifest is unavailable")
+        parent = staging_paths.owned_staging_path(root, ".sensarr-unpacked")
+        if parent is None:
+            raise rar_tools.RarError("the unpack directory is unsafe")
+        parent.mkdir(exist_ok=True)
+        work = Path(tempfile.mkdtemp(prefix=f"{row.download_id}-", dir=parent))
+        identity = (verification.identity_from_want(want) if want
+                    else MediaIdentity(media_type=row.media_type))
+        replacements: dict[Path, list[Path]] = {}
+        audit: list[dict] = []
+        try:
+            expected = {}
+            for entry in downloads_store.history_for_download(row.download_id):
+                if entry.action == "rar_expected" and entry.after_value:
+                    expected = json.loads(entry.after_value)
+            for index, archive in enumerate(archives):
+                before = self._file_stamp(archive)
+                archive_members = rar_tools.list_rar_members(archive)
+                rar_import.verify_expected_members(
+                    archive_members, expected.get(str(archive.relative_to(root)), []))
+                members = rar_import.select_members(
+                    archive_members, want_data=want,
+                    identity=identity, show_id=row.show_id,
+                    season=row.season, episode=row.episode)
+                if sum(member.size for member in members) > shutil.disk_usage(work).free:
+                    raise rar_tools.RarError("staging has insufficient space for the unpacked media")
+                folder = work / str(index)
+                folder.mkdir()
+                outputs = []
+                records = []
+                for member in members:
+                    path = staging_paths.owned_staging_path(root, folder / rar_import.output_name(member))
+                    if path is None or path.parent != folder:
+                        raise rar_tools.RarError("an extracted media name is unsafe")
+                    rar_tools.extract_rar_member(archive, member, path)
+                    if path.suffix.lower() in torrent_routing.VIDEO_EXTENSIONS:
+                        rar_import.verify_extracted_video(path)
+                    outputs.append(path)
+                    records.append({"member": member.path, "output": str(path.relative_to(root))})
+                if self._file_stamp(archive) != before:
+                    raise rar_tools.RarError("archive changed during extraction")
+                replacements[archive] = outputs
+                audit.append({"path": str(archive.relative_to(root)), "stamp": before,
+                              "members": records})
+            expanded = [str(item.relative_to(root)) for path in manifest
+                        for item in replacements.get(path, [path])]
+            downloads_store.record_rar_expansion(row.download_id, expanded, audit)
+        except Exception:
+            if staging_paths.owned_staging_path(root, work) == work:
+                shutil.rmtree(work, ignore_errors=True)
+            raise
+        return downloads_store.get_download(row.download_id) or row
+
+    def _remove_imported_rars(self, row: downloads_store.DownloadRow) -> None:
+        """Delete source wrappers after the expanded videos are accounted for."""
+        archives = downloads_store.rar_expansions(row.download_id)
+        if not archives:
+            return
+        import staging_sweep
+        root = staging_paths.staging_root(row.staging_dir or config.TORRENT_DOWNLOAD_DIR)
+        if root is None:
+            return
+        for archive in archives:
+            try:
+                path = staging_paths.owned_staging_path(root, archive["path"])
+                if path is None or not path.is_file() or self._file_stamp(path) != archive["stamp"]:
+                    continue
+                rows = downloads_store.list_downloads(limit=10**9, include_removed=True)
+                ownership = staging_sweep._neighbour_ownership(rows, root)
+                if (staging_sweep._key(path) in ownership.paths
+                        or ownership.unnamed_writers - {row.download_id}
+                        or ownership.live_hashes.get(_magnet_hash(row.magnet or ""), set())
+                        - {row.download_id}):
+                    continue
+                if (staging_paths.owned_staging_path(root, path) != path
+                        or self._file_stamp(path) != archive["stamp"]
+                        or detect_archive(path) not in ("RAR", "RAR5")):
+                    continue
+                path.unlink()
+                downloads_store.add_history(row.download_id, "rar_removed",
+                                            before=str(path), after=None)
+                for parent in path.parents:
+                    if parent == root or staging_paths.owned_staging_path(root, parent) != parent:
+                        break
+                    try:
+                        parent.rmdir()
+                    except OSError:
+                        break
+            except (OSError, KeyError, TypeError, ValueError):
+                logger.warning("Could not remove the imported archive for #%s",
+                               row.download_id, exc_info=True)
+
     def _media_files_in_staging(self, row: downloads_store.DownloadRow) -> list[Path]:
         """Locate this download's media files inside the staging dir.
 
@@ -4526,13 +4681,17 @@ class DownloadManager:
         much higher similarity bar.
         """
         staging = staging_paths.staging_root(row.staging_dir or config.TORRENT_DOWNLOAD_DIR)
-        wanted_exts = torrent_routing.VIDEO_EXTENSIONS | torrent_routing.SUBTITLE_EXTENSIONS
+        wanted_exts = (torrent_routing.VIDEO_EXTENSIONS | torrent_routing.SUBTITLE_EXTENSIONS
+                       | {".rar"})
         if staging is None or not staging.is_dir():
             return []
 
         exact = self._manifest_paths(row)
         if exact is not None:
-            return [p for p in exact if p.is_file() and p.suffix.lower() in wanted_exts]
+            # The link provider can give a RAR any member's extension, even
+            # .png or .nfo. Only inspect such paths when directly attributed.
+            return [p for p in exact if p.is_file() and (
+                p.suffix.lower() in wanted_exts or detect_archive(p) in ("RAR", "RAR5"))]
 
         candidates: list[Path] = []
         entries = sorted(staging.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -4555,6 +4714,20 @@ class DownloadManager:
     def _post_process(
         self, download_id: int, *, force_move: bool = False,
         force_rename: bool = False, request_title: str | None = None,
+    ) -> str:
+        with self._lock:
+            lock = self._placement_locks.get(download_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._placement_locks[download_id] = lock
+        with lock:
+            return self._place_download(
+                download_id, force_move=force_move, force_rename=force_rename,
+                request_title=request_title)
+
+    def _place_download(
+        self, download_id: int, *, force_move: bool, force_rename: bool,
+        request_title: str | None,
     ) -> str:
         row = downloads_store.get_download(download_id)
         if row is None:
@@ -4629,6 +4802,28 @@ class DownloadManager:
             self._record_needs_placement(row, plan)
             return f"left in staging — route not confident: {plan.reason}"
 
+        archives: dict[Path, str] = {}
+        for path in files:
+            suffix = path.suffix.lower()
+            archive = detect_archive(path)
+            if archive in ("RAR", "RAR5"):
+                archives[path] = archive
+            elif archive or suffix == ".rar":
+                return self._hold_archive_payload(
+                    row, path, archive or "damaged RAR", "This archive could not be unpacked.")
+        if archives:
+            first = next(iter(archives))
+            if not do_move:
+                return self._hold_archive_payload(
+                    row, first, archives[first], "Apply Route to unpack and move its media.")
+            try:
+                row = self._expand_rars(row, list(archives), want_dict)
+            except (rar_tools.RarError, OSError, ValueError) as exc:
+                return self._hold_archive_payload(row, first, archives[first], str(exc))
+            files = self._media_files_in_staging(row)
+        video_files = [f for f in files
+                       if f.suffix.lower() in torrent_routing.VIDEO_EXTENSIONS]
+
         # -- IDENTITY GATE (verify BEFORE any move; Design stance 5) ----------
         # Compare the ACTUAL staged files against the immutable want_json via
         # media_identity. A contradictory identity-gating file (a sequel payload,
@@ -4665,8 +4860,6 @@ class DownloadManager:
             show_name = torrent_routing.episode_name_base(
                 Path(plan.show_folder).name, plan.show_folder, plan.dest_dir)
 
-        video_files = [f for f in files if f.suffix.lower() in torrent_routing.VIDEO_EXTENSIONS]
-
         # Rebuild only sources actually being retried. Other pack members may
         # already be in the library; their receipts must survive this pass.
         downloads_store.clear_download_files(
@@ -4674,6 +4867,7 @@ class DownloadManager:
         dest_dir = Path(plan.dest_dir)
         moved_gating = 0          # gating (primary/episode) files placed
         skipped_gating = 0
+        blocked_archive_reason = None
 
         # VobSub pairing (Task D2 item 4): a .sub/.idx track is only usable with
         # its partner. Move both or neither — a lone half is broken and skipped.
@@ -4847,6 +5041,15 @@ class DownloadManager:
                         after="old low-quality copy recycled to make room "
                               "for its replacement")
                 if target.exists():
+                    if is_video and (archive := detect_archive(target)):
+                        reason = f"existing library file contains a {archive} archive: {target}"
+                        downloads_store.add_history(
+                            download_id, "import_error", before=str(src), after=reason)
+                        _record("failed", reason=reason)
+                        if is_gating:
+                            skipped_gating += 1
+                            blocked_archive_reason = reason
+                        continue
                     try:
                         same_size = target.stat().st_size == src.stat().st_size
                     except OSError:
@@ -4949,6 +5152,8 @@ class DownloadManager:
             # and manifest members that have since disappeared from staging.
             total, placed, all_final_paths = self._placement_evidence(row)
             partial = skipped_gating > 0 or not total or placed < total
+            if not partial:
+                self._remove_imported_rars(row)
             downloads_store.set_verification(
                 download_id, "partial" if partial else "verified",
                 reason=(f"{placed}/{total} gating files placed"
@@ -4956,7 +5161,8 @@ class DownloadManager:
             downloads_store.set_status(
                 download_id, "downloaded" if partial else "moved", completed=True,
                 error=(f"needs import: partial placement ({placed}/{total} primary files); "
-                       "remaining files need review" if partial else None))
+                       f"{blocked_archive_reason or 'remaining files need review'}"
+                       if partial else None))
             self._cleanup_staging_leftovers(row)
             try:
                 import staging_sweep
@@ -5078,6 +5284,8 @@ class DownloadManager:
             if row.request_id is not None:
                 queue_store.set_status(row.request_id,
                                        queue_store.STATUS_NEEDS_ATTENTION)
+        if blocked_archive_reason:
+            return f"processed (no move) — {blocked_archive_reason}"
         return f"processed (no move) — planned: {plan.describe()}"
 
     def _record_quality_labels(self, row: downloads_store.DownloadRow,

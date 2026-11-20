@@ -28,9 +28,11 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Iterator
+
+from archive_signatures import ARCHIVE_SUFFIXES, detect_archive
 
 logger = logging.getLogger(__name__)
 
@@ -238,6 +240,9 @@ def choose_files(files: list[dict], *, want_file_name: str | None = None,
             if f.get("id") == want_file_idx + 1 and is_video(f):
                 return [f["id"]]
     videos = [f for f in files if is_video(f)]
+    rars = [f for f in files if _basename(str(f.get("path", ""))).lower().endswith(".rar")]
+    if rars and not any(not _is_sample(str(f.get("path", ""))) for f in videos):
+        return [f["id"] for f in rars]
     if not videos:
         return [f["id"] for f in files]
     stems = [_stem(_basename(str(v["path"]))).lower() for v in videos]
@@ -264,6 +269,11 @@ class FetchResult:
     torrent_id: str
     cached: bool
     total_bytes: int
+    archive_members: dict[str, list[tuple[str, int]]] = field(default_factory=dict)
+
+
+def _is_sample(path: str) -> bool:
+    return bool(re.search(r"(?<![a-z0-9])sample(?![a-z0-9])", _basename(path), re.I))
 
 
 def _default_download(url: str, start: int) -> tuple[int, Iterator[bytes]]:
@@ -305,6 +315,7 @@ def fetch(client: RealDebridClient, magnet: str, dest_dir: Path, *,
           stall_timeout_s: float = 900, poll_s: float = 5,
           max_total_s: float | None = None, delete_after: bool = True,
           chooser: Callable[[list[dict]], list[int]] | None = None,
+          archive_subdir: str | None = None,
           on_files: Callable[[list[str]], None] | None = None,
           download: Callable[[str, int], tuple[int, Iterable[bytes]]] | None = None,
           sleep: Callable[[float], None] = time.sleep,
@@ -387,6 +398,12 @@ def fetch(client: RealDebridClient, magnet: str, dest_dir: Path, *,
             f"Real-Debrid served {served[:160] or 'nothing'} instead of "
             f"{want_file_name}")
     links = info.get("links") or []
+    grouped = len(chosen) > 1 and len(links) == 1 and archive_subdir is not None
+    if not chosen or (len(chosen) != len(links) and not grouped):
+        drop(tid)
+        raise RealDebridError(
+            f"Real-Debrid returned {len(links)} download links for "
+            f"{len(chosen)} selected files")
     # The torrent's own name is the root folder webtorrent would create. RD's
     # "filename" becomes the SELECTED file's name when only part of a pack is
     # selected (seen live 2026-10-10), so prefer "original_filename".
@@ -395,11 +412,41 @@ def fetch(client: RealDebridClient, magnet: str, dest_dir: Path, *,
 
     # Resolve every link first so the local progress total is known.
     plan = []
-    for f, link in zip(chosen, links):
+    archive_members: dict[str, list[tuple[str, int]]] = {}
+    for number, (f, link) in enumerate(zip(chosen, links)):
         un = client.unrestrict(link)
-        plan.append((_safe_rel(str(f.get("path", "")) or un.get("filename", ""),
-                               folder),
-                     str(un["download"]), int(un.get("filesize") or f.get("bytes") or 0)))
+        member = str(f.get("path") or "")
+        filename = str(un.get("filename") or "")
+        link_ext = Path(_basename(filename)).suffix.lower()
+        member_size = int(f.get("bytes") or 0)
+        link_size = int(un.get("filesize") or 0)
+        different_size = member_size > 0 and link_size > 0 and link_size != member_size
+        archive = archive_subdir is not None and (
+            grouped or link_ext == ".rar" or member.lower().endswith(".rar")
+            or (different_size and member.lower().endswith(VIDEO_EXTS)))
+        if (member.lower().endswith(VIDEO_EXTS + SUBTITLE_EXTS)
+                and link_ext in ARCHIVE_SUFFIXES and (link_ext != ".rar" or not archive)):
+            drop(tid)
+            raise RealDebridError(
+                "Real-Debrid returned an archive link for a selected media file")
+        if different_size and not archive:
+            drop(tid)
+            raise RealDebridError(
+                f"Real-Debrid link size ({link_size}) differs from the selected "
+                f"torrent file ({member_size})")
+        if grouped and link_size <= 0:
+            drop(tid)
+            raise RealDebridError("Real-Debrid grouped link did not provide its size")
+        rel = (str(Path(archive_subdir) / f"{number}.rar") if archive
+               else _safe_rel(member or filename, folder))
+        plan.append((rel, str(un["download"]), link_size or member_size, archive))
+        if archive:
+            expected = [(path, int(item.get("bytes") or 0))
+                        for item in (chosen if grouped else [f])
+                        if (path := str(item.get("path") or "")).lower().endswith(VIDEO_EXTS)
+                        and not _is_sample(path)]
+            if expected:
+                archive_members[rel] = expected
     total = sum(p[2] for p in plan)
     done = 0
     rel_paths: list[str] = []
@@ -408,10 +455,11 @@ def fetch(client: RealDebridClient, magnet: str, dest_dir: Path, *,
         # cleanup elsewhere knows these paths are taken.
         on_files([p[0] for p in plan])
 
-    for rel, url, size in plan:
+    for rel, url, size, archive in plan:
         target = dest_dir / rel
         target.parent.mkdir(parents=True, exist_ok=True)
-        if target.exists() and target.stat().st_size == size:
+        if (target.exists() and target.stat().st_size == size
+                and (not archive or detect_archive(target) in ("RAR", "RAR5"))):
             done += size
             rel_paths.append(rel)
             continue
@@ -479,6 +527,10 @@ def fetch(client: RealDebridClient, magnet: str, dest_dir: Path, *,
             part.unlink(missing_ok=True)
             raise RealDebridError(
                 f"Size mismatch for {rel}: got {have}, expected {size}")
+        if archive and detect_archive(part) not in ("RAR", "RAR5"):
+            part.unlink(missing_ok=True)
+            drop(tid)
+            raise RealDebridError("Real-Debrid returned different bytes than the selected media")
         part.replace(target)
         done += size
         rel_paths.append(rel)
@@ -487,4 +539,4 @@ def fetch(client: RealDebridClient, magnet: str, dest_dir: Path, *,
     if delete_after:
         drop(tid)
     return FetchResult(rel_paths=rel_paths, torrent_id=tid, cached=cached,
-                       total_bytes=total)
+                       total_bytes=total, archive_members=archive_members)

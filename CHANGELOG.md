@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.6.6 - 2026-11-19
+
+- Inspect completed files for archive headers, including Real-Debrid payloads
+  labeled as a video or screenshot. Unpack the intended video and matching
+  subtitles from a single-volume RAR, verify the video stream, and remove the
+  wrapper after successful placement.
+- Download Real-Debrid's grouped RAR response as its own file. WebTorrent
+  and qBittorrent can select RAR payloads when no video file is listed.
+- Retry temporary Manami download errors and fall back to the final dated
+  release when the latest release URL is unavailable.
+
+## 1.6.5 - 2026-11-19
+
+- Local validation build for RAR import and Manami download recovery.
+
 ## 1.6.4 - 2026-11-07
 
 ### Plex and Windows startup

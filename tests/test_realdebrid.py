@@ -112,6 +112,63 @@ def test_delete_after_false_keeps_torrent(tmp_path):
     assert fake.deleted == []
 
 
+def test_archive_link_is_rejected_before_assigning_a_video_path(tmp_path):
+    fake = FakeRD([single_file_info()], {
+        "L1": {"filename": "Movie.2020.RAR", "filesize": 8, "download": "https://dl/1"},
+    })
+    transfers = []
+
+    with pytest.raises(rd.RealDebridError, match="archive link"):
+        rd.fetch(client(fake), MAGNET, tmp_path, download=downloader({}, transfers))
+
+    assert transfers == []
+    assert list(tmp_path.iterdir()) == []
+    assert fake.deleted == ["TID1"]
+
+
+def test_grouped_link_does_not_get_assigned_to_first_member(tmp_path):
+    info = single_file_info()
+    info["files"].append({"id": 2, "path": "/Movie.2020.srt", "bytes": 1, "selected": 1})
+    fake = FakeRD([info], LINKS)
+
+    with pytest.raises(rd.RealDebridError, match="1 download links for 2 selected files"):
+        rd.fetch(client(fake), MAGNET, tmp_path, download=downloader(BLOBS))
+
+    assert list(tmp_path.iterdir()) == []
+    assert fake.deleted == ["TID1"]
+
+
+def test_link_with_video_name_but_wrong_size_is_rejected(tmp_path):
+    fake = FakeRD([single_file_info()], {
+        "L1": {"filename": "Movie.2020.mkv", "filesize": 11, "download": "https://dl/1"},
+    })
+    transfers = []
+
+    with pytest.raises(rd.RealDebridError, match="differs from the selected torrent file"):
+        rd.fetch(client(fake), MAGNET, tmp_path, download=downloader({}, transfers))
+
+    assert transfers == []
+    assert fake.deleted == ["TID1"]
+
+
+def test_grouped_rar_uses_its_own_exact_manifest_path(tmp_path):
+    info = single_file_info()
+    info["files"].append({"id": 2, "path": "/Movie.2020.srt", "bytes": 3, "selected": 1})
+    blob = b"Rar!\x1a\x07\x00archive content"
+    fake = FakeRD([info], {
+        "L1": {"filename": "Movie.2020.mkv", "filesize": len(blob), "download": "https://dl/1"},
+    })
+    manifests = []
+    result = rd.fetch(client(fake), MAGNET, tmp_path, archive_subdir="job-1",
+                      download=downloader({"https://dl/1": blob}), on_files=manifests.append)
+    expected = str(rd.Path("job-1") / "0.rar")
+    assert result.rel_paths == [expected]
+    assert result.archive_members == {expected: [("/Movie.2020.mkv", 10)]}
+    assert manifests == [[expected]]
+    assert (tmp_path / expected).read_bytes() == blob
+    assert fake.deleted == ["TID1"]
+
+
 def test_not_cached_then_downloaded_and_multi_file_folder(tmp_path):
     info_dl = {"status": "downloading", "progress": 40}
     done = {"id": "TID1", "filename": "Show.S01", "status": "downloaded", "progress": 100,
@@ -168,6 +225,9 @@ def test_choose_files_pure_edges():
     files = [{"id": 1, "path": "/a.txt"}, {"id": 2, "path": "/b.mkv"}]
     assert rd.choose_files(files, want_file_idx=0) == [2]
     assert rd.choose_files([]) == []
+    assert rd.choose_files([
+        {"id": 1, "path": "/Movie.Sample.mkv"}, {"id": 2, "path": "/Movie.rar"},
+    ]) == [2]
 
 
 def test_remote_stall_deletes_and_raises(tmp_path):

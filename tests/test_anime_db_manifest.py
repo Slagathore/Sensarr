@@ -8,6 +8,7 @@ import gzip
 import hashlib
 import json
 import sqlite3
+import urllib.error
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -76,6 +77,32 @@ def _mock_downloads(monkeypatch, url_map: dict[str, bytes]) -> None:
             raise payload
         return payload
     monkeypatch.setattr(anime_db, "_download", fake_download)
+
+
+@pytest.mark.parametrize(("primary_result", "expected_requests"), [
+    (504, 2),
+    (404, 1),
+    (b'{"data":[]}', 1),
+])
+def test_manami_falls_back_to_dated_release(monkeypatch, primary_result, expected_requests):
+    primary, fallback = anime_db._MANAMI_URLS
+    calls = []
+    waits = []
+
+    def download(url, timeout):
+        calls.append(url)
+        if url == fallback:
+            return json.dumps(SAMPLE_MANAMI).encode()
+        if isinstance(primary_result, int):
+            raise urllib.error.HTTPError(url, primary_result, "error", None, None)
+        return primary_result
+
+    monkeypatch.setattr(anime_db, "_download", download)
+    monkeypatch.setattr(anime_db.time, "sleep", waits.append)
+
+    assert anime_db.fetch_manami() == SAMPLE_MANAMI
+    assert calls == [primary] * expected_requests + [fallback]
+    assert waits == [2] * (expected_requests - 1)
 
 
 # ---------------------------------------------------------------------------

@@ -148,8 +148,7 @@ def test_missing_payload_is_not_reported_as_needs_placement(tmp_path: Path):
         route_reason=None, auto_rename=True, auto_move=True)
     downloads_store.set_files(did, ["missing.mkv"])
     downloads_store.set_status(did, "downloaded", completed=True)
-    manager = object.__new__(DownloadManager)
-    manager._on_update = None
+    manager = DownloadManager()
 
     outcome = manager._finish_post_process(
         did, request_title="Unknown Show S01E01")

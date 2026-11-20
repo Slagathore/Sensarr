@@ -178,7 +178,13 @@ const pinnedVideo = (videos, videoExts) => {
 const chooseFiles = () => {
   const videoExts = new Set(selection.videoExtensions || []);
   const subtitleExts = new Set(selection.subtitleExtensions || []);
-  const videos = torrent.files.filter((file) => videoExts.has(extension(file.path)));
+  let videos = torrent.files.filter((file) => videoExts.has(extension(file.path)));
+  const archives = torrent.files.filter((file) => extension(file.path) === ".rar");
+  const hasPrimaryVideo = videos.some((file) => !/(^|[^a-z0-9])sample([^a-z0-9]|$)/i.test(baseName(file.path)));
+  if (archives.length && !hasPrimaryVideo) {
+    videoExts.add(".rar");
+    videos = archives;
+  }
   const wantedSeason = Number.isInteger(selection.season) ? selection.season : null;
   const wantedEpisode = Number.isInteger(selection.episode) ? selection.episode : null;
   const pinned = pinnedVideo(videos, videoExts);
@@ -230,7 +236,7 @@ torrent.on("ready", () => {
     .map((f) => [Math.floor(f.offset / torrent.pieceLength),
       Math.floor((f.offset + f.length - 1) / torrent.pieceLength)]);
   const videoExts = new Set(selection.videoExtensions || []);
-  if (!selectedFiles.some((file) => videoExts.has(extension(file.path)))) {
+  if (!selectedFiles.some((file) => videoExts.has(extension(file.path)) || extension(file.path) === ".rar")) {
     emit({ event: "error", message: "torrent metadata contains no selectable video file" });
     die(1);
     return;

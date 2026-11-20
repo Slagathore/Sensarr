@@ -885,6 +885,32 @@ def set_files(download_id: int, relative_paths: list[str]) -> None:
         conn.commit()
 
 
+def record_rar_expansion(download_id: int, relative_paths: list[str],
+                         archives: list[dict]) -> None:
+    """Commit the new manifest together with the provenance of its inputs."""
+    import json
+    with _DL_LOCK, db.connect() as conn:
+        updated = conn.execute(
+            "UPDATE downloads SET files_json = ?, error = NULL "
+            "WHERE id = ? AND status = 'downloaded' AND removed_at IS NULL",
+            (json.dumps(relative_paths), download_id))
+        if not updated.rowcount:
+            raise ValueError("The download changed while the archive was being extracted.")
+        conn.execute(
+            "INSERT INTO download_history (download_id, action, after_value) VALUES (?, ?, ?)",
+            (download_id, "rar_unpacked", json.dumps(archives)))
+        conn.commit()
+
+
+def rar_expansions(download_id: int) -> list[dict]:
+    import json
+    with _DL_LOCK, db.connect() as conn:
+        rows = conn.execute(
+            "SELECT after_value FROM download_history WHERE download_id = ? AND action = ?",
+            (download_id, "rar_unpacked")).fetchall()
+    return [archive for (raw,) in rows for archive in json.loads(raw)]
+
+
 def set_status(download_id: int, status: str, *, error: str | None = None,
                completed: bool = False) -> None:
     if status == "error":

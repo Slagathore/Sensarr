@@ -30,6 +30,7 @@ import argparse
 import gzip
 import hashlib
 import json
+import logging
 import sqlite3
 import sys
 from datetime import datetime, timezone
@@ -69,21 +70,6 @@ redistribution.
 
 Built by: Sensarr (https://github.com/{repo})
 """
-
-
-def fetch_manami(timeout: int = 180) -> dict:
-    """Download the manami dump (same URL ladder anime_db.refresh() uses)."""
-    manami = None
-    for url in anime_db._MANAMI_URLS:
-        try:
-            print(f"Downloading anime-offline-database from {url} …")
-            manami = json.loads(anime_db._download(url, timeout=timeout).decode("utf-8"))
-            break
-        except Exception as exc:
-            print(f"  failed: {exc}", file=sys.stderr)
-    if not isinstance(manami, dict) or not manami.get("data"):
-        raise RuntimeError("anime-offline-database download failed from every URL")
-    return manami
 
 
 def _checkpoint_and_vacuum(db_path: Path) -> None:
@@ -172,9 +158,10 @@ def main() -> int:
     parser.add_argument("--repo", default=DEFAULT_REPO,
                         help=f"owner/repo the manifest URL points at (default: {DEFAULT_REPO}).")
     args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     try:
-        manami = fetch_manami()
+        manami = anime_db.fetch_manami()
         package_artifact(manami, args.output_dir, tag=args.tag, repo=args.repo)
     except Exception as exc:
         print(f"publish_anime_db failed: {exc}", file=sys.stderr)

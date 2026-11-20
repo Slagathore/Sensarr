@@ -12,6 +12,7 @@ import download_manager
 import downloads_store
 import grab_queue
 import queue_store
+import rar_tools
 import shows_store
 import torrent_routing
 from download_manager import DownloadManager
@@ -83,6 +84,102 @@ def manager(monkeypatch, tmp_path):
                             confident=True, dest_dir=str(tmp_path / "library"),
                             reason="exact test destination"))
     return manager
+
+
+@pytest.mark.parametrize(("payload", "kind"), [
+    (b"Rar!\x1a\x07\x00sample", "RAR"),
+    (b"Rar!\x1a\x07\x01\x00sample", "RAR5"),
+    (b"PK\x03\x04sample", "ZIP"),
+    (b"7z\xbc\xaf\x27\x1csample", "7-Zip"),
+])
+def test_video_named_archive_holds_entire_pack_before_any_move(
+        tmp_path, manager, payload, kind):
+    names = ("Show.S01E01.mkv", "Show.S01E02.mkv")
+    did, staging = make_download(tmp_path, names=names)
+    marker(did, tmp_path / "library")
+    (staging / names[0]).write_bytes(b"\x1a\x45\xdf\xa3matroska")
+    (staging / names[1]).write_bytes(payload)
+
+    outcome = manager.apply_route(did)
+
+    assert f"contains a {kind} archive" in outcome
+    assert not (tmp_path / "library").exists()
+    assert (staging / names[0]).is_file()
+    assert (staging / names[1]).read_bytes() == payload
+    row = downloads_store.get_download(did)
+    assert row.status == "downloaded"
+    assert row.verification_state == "failed"
+    assert row.error == outcome
+    assert downloads_store.get_needs_placement(did) is None
+    assert manager.apply_route(did) == outcome
+    assert [h.action for h in downloads_store.history_for_download(did)].count(
+        "import_error") == 1
+
+    (staging / names[1]).write_bytes(b"\x1a\x45\xdf\xa3replacement")
+    assert manager.apply_route(did).startswith("moved to ")
+    assert downloads_store.get_download(did).verification_state == "verified"
+
+
+def test_archive_at_target_is_not_accepted_as_same_size_duplicate(tmp_path, manager):
+    name = "Show.S01E01.mkv"
+    did, staging = make_download(tmp_path, names=(name,))
+    valid = b"\x1a\x45\xdf\xa3video"
+    archive = b"PK\x03\x04stuff"
+    assert len(valid) == len(archive)
+    (staging / name).write_bytes(valid)
+    library = tmp_path / "library"
+    library.mkdir()
+    final = library / name
+    final.write_bytes(archive)
+
+    assert manager.apply_route(did).startswith("processed (no move)")
+    assert (staging / name).read_bytes() == valid
+    assert final.read_bytes() == archive
+    row = downloads_store.get_download(did)
+    assert row.verification_state == "failed"
+    assert "existing library file contains a ZIP archive" in row.error
+    receipt, = downloads_store.list_download_files(did)
+    assert "existing library file contains a ZIP archive" in receipt.verification_reason
+
+
+@pytest.mark.parametrize("archive_name", ["Show.S01E01.rar", "Show.S01E01.mkv", "screenshot.png"])
+def test_rar_import_selects_episode_and_subtitle_and_removes_wrapper(
+        tmp_path, manager, monkeypatch, archive_name):
+    did, staging = make_download(tmp_path, names=(archive_name,), episode=1)
+    payload = staging / archive_name
+    payload.write_bytes(b"Rar!\x1a\x07\x00wrapper")
+    members = tuple(rar_tools.RarMember(f"nested/{name}", 9) for name in (
+        "Show.S01E01.mkv", "Show.S01E01.en.srt", "Show.S01E02.mkv", "notice.txt"))
+    monkeypatch.setattr(rar_tools, "list_rar_members", lambda path: members)
+    monkeypatch.setattr(rar_tools, "extract_rar_member",
+                        lambda _archive, _member, path: path.write_bytes(b"extracted"))
+    monkeypatch.setattr(download_manager.rar_import, "verify_extracted_video", lambda path: None)
+
+    assert manager.apply_route(did).startswith("moved to ")
+    assert downloads_store.get_download(did).verification_state == "verified"
+    assert not payload.exists()
+    assert not any(path.is_file() for path in staging.rglob("*"))
+    assert {path.suffix for path in (tmp_path / "library").iterdir()} == {".mkv", ".srt"}
+    assert [h.action for h in downloads_store.history_for_download(did)].count("rar_removed") == 1
+    assert [m["member"] for m in downloads_store.rar_expansions(did)[0]["members"]] == [
+        "nested/Show.S01E01.mkv", "nested/Show.S01E01.en.srt"]
+
+
+def test_realdebrid_rar_missing_selected_pack_member_stays_in_staging(
+        tmp_path, manager, monkeypatch):
+    did, staging = make_download(tmp_path, names=("pack.rar",))
+    archive = staging / "pack.rar"
+    archive.write_bytes(b"Rar!\x1a\x07\x00wrapper")
+    downloads_store.add_history(did, "rar_expected", before=None, after=json.dumps({
+        "pack.rar": [["/Show.S01E01.mkv", 9], ["/Show.S01E02.mkv", 9]],
+    }))
+    monkeypatch.setattr(rar_tools, "list_rar_members",
+                        lambda path: (rar_tools.RarMember("Show.S01E01.mkv", 9),))
+
+    assert "missing an unambiguous selected video member" in manager.apply_route(did)
+    assert archive.is_file()
+    assert not (tmp_path / "library").exists()
+    assert downloads_store.rar_expansions(did) == []
 
 
 @pytest.mark.parametrize("status", ["queued", "downloading", "moved", "cancelled", "error", "stopped"])
@@ -246,6 +343,24 @@ def test_reappeared_source_prevents_historical_receipt_from_completing_job(tmp_p
     downloads_store.add_history(did, "moved", before=str(source), after=str(final))
     assert manager._reconcile_prior_move(downloads_store.get_download(did)) == []
     assert source.read_bytes() == b"different current payload"
+
+
+@pytest.mark.parametrize("with_receipt", [True, False])
+def test_archive_at_old_destination_cannot_reconcile_move(tmp_path, manager, with_receipt):
+    did, staging = make_download(tmp_path)
+    source = staging / "Show.S01E01.mkv"
+    final = tmp_path / "placed.mkv"
+    archive = b"Rar!\x1a\x07\x00wrapped"
+    final.write_bytes(archive)
+    downloads_store.add_history(did, "moved", before=str(source), after=str(final))
+    if with_receipt:
+        downloads_store.add_download_file(
+            did, source_relative_path=source.name, source_absolute_path=str(source),
+            final_path=str(final), media_role="episode", size_bytes=len(archive),
+            verification_state="verified")
+
+    assert manager._reconcile_prior_move(downloads_store.get_download(did)) == []
+    assert downloads_store.get_download(did).status == "downloaded"
 
 
 @pytest.mark.parametrize("receipt_state,size", [("failed", 4), ("verified", 99)])

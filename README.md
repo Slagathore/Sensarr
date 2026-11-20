@@ -113,7 +113,7 @@ Sensarr is an unofficial tool, not affiliated with or endorsed by Plex, Inc. (or
 
 ## Running from source
 
-Packaged builds need nothing installed. From source: Python 3.11+, plus Node.js if you use the built-in download engine (`npm install` inside `torrent_runner/`; the wizard can do this for you).
+The packaged desktop app includes Python. From source, install Python 3.11+. The built-in download engine uses Node.js (`npm install` inside `torrent_runner/`; the wizard can do this for you). Automatic RAR import uses 7-Zip and FFmpeg's `ffprobe`. On Linux, put `7zz` or `7z` and `ffprobe` on PATH. On Windows, Sensarr also finds a standard 7-Zip installation.
 
 ```powershell
 git clone https://github.com/Slagathore/Sensarr.git

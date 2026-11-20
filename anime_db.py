@@ -23,6 +23,7 @@
 
 import gzip
 import hashlib
+import http.client
 import json
 import logging
 import os
@@ -30,6 +31,7 @@ import re
 import sqlite3
 import threading
 import time
+import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -45,9 +47,10 @@ _MAX_AGE_S = 7 * 24 * 3600  # weekly, matching manami's release cadence
 _SCHEMA_VERSION = 2  # bump when columns change: forces a rebuild of old DBs
 
 _MANAMI_URLS = [
-    # Release asset (current layout) first, then legacy in-repo path.
+    # Data lives in release assets. The final dated release also bypasses
+    # the /releases/latest redirect when that endpoint is unavailable.
     "https://github.com/manami-project/anime-offline-database/releases/latest/download/anime-offline-database-minified.json",
-    "https://raw.githubusercontent.com/manami-project/anime-offline-database/master/anime-offline-database-minified.json",
+    "https://github.com/manami-project/anime-offline-database/releases/download/2026-27/anime-offline-database-minified.json",
 ]
 _FRIBB_URL = "https://raw.githubusercontent.com/Fribb/anime-lists/master/anime-list-full.json"
 _ANIME_LISTS_XML_URL = "https://raw.githubusercontent.com/Anime-Lists/anime-lists/master/anime-list-master.xml"
@@ -122,6 +125,32 @@ def _download(url: str, timeout: int = 180) -> bytes:
     })
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read()
+
+
+def fetch_manami(timeout: int = 180) -> dict:
+    """Fetch a usable Manami dataset with a bounded retry per release URL."""
+    for url in _MANAMI_URLS:
+        for attempt in range(2):
+            try:
+                logger.info("Downloading anime-offline-database from %s", url)
+                manami = json.loads(_download(url, timeout=timeout))
+                entries = manami.get("data") if isinstance(manami, dict) else None
+                if not isinstance(entries, list) or not entries:
+                    raise ValueError("dataset has no anime entries")
+                return manami
+            except urllib.error.HTTPError as exc:
+                retry = exc.code in (408, 429) or 500 <= exc.code < 600
+                logger.warning("Manami download failed from %s: %s", url, exc)
+            except (OSError, http.client.HTTPException) as exc:
+                retry = True
+                logger.warning("Manami download failed from %s: %s", url, exc)
+            except ValueError as exc:
+                logger.warning("Invalid Manami dataset from %s: %s", url, exc)
+                break
+            if not retry or attempt == 1:
+                break
+            time.sleep(2)
+    raise RuntimeError("anime-offline-database download failed from every release URL")
 
 
 def _fetch_fribb(timeout: int = 180) -> list:
@@ -645,17 +674,7 @@ def refresh(force: bool = False) -> str:
                 return summary
             logger.info("Anime DB artifact unavailable or refused — building locally.")
 
-        manami = None
-        for url in _MANAMI_URLS:
-            try:
-                logger.info("Downloading anime-offline-database from %s …", url)
-                manami = json.loads(_download(url).decode("utf-8"))
-                break
-            except Exception as exc:
-                logger.warning("manami download failed from %s: %s", url, exc)
-        if not isinstance(manami, dict) or not manami.get("data"):
-            raise RuntimeError("anime-offline-database download failed — kept previous data")
-
+        manami = fetch_manami()
         fribb = _fetch_fribb()
         xml_root = _fetch_anime_lists_xml()
 
